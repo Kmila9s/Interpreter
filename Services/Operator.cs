@@ -24,6 +24,7 @@ public class Operator : IOperation{
             OperatorType.LOGIC_OPERATION :
             OperatorType.UNKNOWN;
     public object Execute() => throw new NotImplementedException();
+    public object Execute(object[] array, int index) => throw new NotImplementedException();
     public object Execute(Variable leftSideOperator, Variable rightSideOperator){
         if(leftSideOperator.Type != rightSideOperator.Type)
             throw new ParserException("Datatypes do not match");
