@@ -1,11 +1,14 @@
+using System.Collections;
 using System.Text.RegularExpressions;
 using Interpreter.Interfaces;
+using Interpreter.Models;
 using Parser.Models;
 using static Parser.Models.Constants;
 
 namespace Interpreter.Services;
-public class Operator : IOperation{
+public class Operator : IOperation, ILogicOperation, IArithOperation{
     public OperatorType OperatorType { get; private set; }
+    public object Precedence { get; private set; } = new();
     private readonly Regex _assignationRegex, _arithRegex, _logicRegex;
     public string OperatorName { get; private set; } = string.Empty;
     public Operator(string Operator){
@@ -14,6 +17,68 @@ public class Operator : IOperation{
         _arithRegex = new(ARITH_OPERATORS);
         _logicRegex = new(LOGIC_OPERATORS);
         this.OperatorType = DefineOperatorType(Operator);
+        DefinePrecedence(Operator);
+    }
+    private void DefinePrecedence(string Operator){
+        switch(this.OperatorType){
+            case OperatorType.LOGIC_OPERATION:
+                Operator = Operator.ToLower();
+                switch(Operator){
+                    case "and":
+                        Precedence = PrecedencesLogicOperators.AND;
+                    break;
+                    case "nand":
+                        Precedence = PrecedencesLogicOperators.NAND;
+                    break;
+                    case "xor":
+                        Precedence = PrecedencesLogicOperators.XOR;
+                    break;
+                    case "xnor":
+                        Precedence = PrecedencesLogicOperators.XNOR;
+                    break;
+                    case "or":
+                        Precedence = PrecedencesLogicOperators.OR;
+                    break;
+                    case "nor":
+                        Precedence = PrecedencesLogicOperators.NOR;
+                    break;
+                    case "abs":
+                        Precedence = PrecedencesLogicOperators.ABS;
+                    break;
+                    case "not":
+                        Precedence = PrecedencesLogicOperators.NOT;
+                    break;
+                }
+            break;
+            case OperatorType.ARITH_OPERATION:
+                Operator = Operator.ToLower();
+                switch(Operator){
+                    case "+":
+                        Precedence = PrecedencesArithOperators.ADD;
+                    break;
+                    case "-":
+                        Precedence = PrecedencesArithOperators.SUBSTRACTION;
+                    break;
+                    case "*":
+                        Precedence = PrecedencesArithOperators.MULTIPLICATION;
+                    break;
+                    case "/":
+                        Precedence = PrecedencesArithOperators.DIVISION;
+                    break;
+                    case "mod":
+                        Precedence = PrecedencesArithOperators.UNARY;
+                    break;
+                }
+            break;
+            case OperatorType.UNKNOWN:
+                Precedence = PrecedencesLogicOperators.PARENTHESIS;
+            break;
+            case OperatorType.ASSIGNATION:
+                Precedence = PrecedencesLogicOperators.ASSIGNATION;
+            break;
+            default:
+                throw new NotImplementedException();
+        }
     }
     private OperatorType DefineOperatorType(string Operator) =>
         _assignationRegex.IsMatch(Operator) ? 
@@ -25,6 +90,10 @@ public class Operator : IOperation{
             OperatorType.UNKNOWN;
     public object Execute() => throw new NotImplementedException();
     public object Execute(object[] array, int index) => throw new NotImplementedException();
+    public object Execute(Variable variable) =>
+        (PrecedencesLogicOperators)Precedence == PrecedencesLogicOperators.NOT ?
+            SolveLogicOperation(variable) :
+            new NotImplementedException();
     public object Execute(Variable leftSideOperator, Variable rightSideOperator){
         if(leftSideOperator.Type != rightSideOperator.Type)
             throw new ParserException("Datatypes do not match");
@@ -49,7 +118,7 @@ public class Operator : IOperation{
         }
         return result;
     }
-    private object SolveLogicOperation(Variable var1, Variable var2){
+    public object SolveLogicOperation(Variable var1, Variable var2){
         char a = Convert.ToChar(var1.Value);
         char b = Convert.ToChar(var2.Value);
         char result;
@@ -71,6 +140,21 @@ public class Operator : IOperation{
                 break;
             default:
                 result = 'U';
+            break;
+        }
+        return result;
+    }
+    public object SolveArithOperation(Variable variable) => throw new NotImplementedException();
+    public object SolveArithOperation(Variable leftVariable, Variable rightVariable){
+        
+        return new();
+    }
+    public object SolveLogicOperation(Variable variable){
+        object result = new();
+        char item = Convert.ToChar(variable.Value);
+        switch(OperatorName.ToLower()){
+            case "not":
+                result = item == '1' ? '0' : '1';
             break;
         }
         return result;
