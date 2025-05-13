@@ -146,8 +146,58 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     }
     public object SolveArithOperation(Variable variable) => throw new NotImplementedException();
     public object SolveArithOperation(Variable leftVariable, Variable rightVariable){
-        
-        return new();
+        object result = new();
+        if(leftVariable.Type != rightVariable.Type){
+            if(
+                (leftVariable.Type == DATATYPES.INTEGER || leftVariable.Type == DATATYPES.NATURAL) &&
+                (rightVariable.Type == DATATYPES.INTEGER || rightVariable.Type == DATATYPES.NATURAL)
+            ){
+                result = SolveIntOperation((int)leftVariable.Value, (int)rightVariable.Value);
+            }else
+                throw new InvalidOperationException("The datatypes do not match");
+        }else{
+            switch(leftVariable.Type){
+                case DATATYPES.INTEGER:
+                    result = SolveIntOperation((int)leftVariable.Value, (int)rightVariable.Value);
+                break;
+                case DATATYPES.NATURAL:
+                    result = SolveRealOperation((double)leftVariable.Value, (double)rightVariable.Value);
+                break;
+            }
+        }
+        return result;
+    }
+    public int SolveIntOperation(int leftVariable, int rightVariable){
+        switch(OperatorName){
+            case "+":
+                return leftVariable + rightVariable;
+            case "-":
+                return leftVariable - rightVariable;
+            case "*":
+                return leftVariable * rightVariable;
+            case "/":
+                return leftVariable / rightVariable;
+            case "mod":
+                return leftVariable % rightVariable;
+            default:
+                return 0;
+        }
+    }
+    public double SolveRealOperation(double leftVariable, double rightVariable){
+        switch(OperatorName){
+            case "+":
+                return leftVariable + rightVariable;
+            case "-":
+                return leftVariable - rightVariable;
+            case "*":
+                return leftVariable * rightVariable;
+            case "/":
+                return leftVariable / rightVariable;
+            case "mod":
+                return leftVariable % rightVariable;
+            default:
+                return 0;
+        }
     }
     public object SolveLogicOperation(Variable variable){
         object result = new();

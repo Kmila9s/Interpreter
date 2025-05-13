@@ -7,50 +7,63 @@ class Program
 {
     static void Main(string[] args)
     {
-        HashSet<Variable> Variables = new(){
-            new("A", '1', Constants.DATATYPES.STD_LOGIC),
-            new("Sum", "U", Constants.DATATYPES.STD_LOGIC),
-            new("B", '1', Constants.DATATYPES.STD_LOGIC),
-            new("Cin", '1', Constants.DATATYPES.STD_LOGIC),
-            new("Cout", "U", Constants.DATATYPES.STD_LOGIC),
-        };
-        /*string operations = @"
-            Sum <= A and B;,1
-            Sum <= A or B;,1
-            Sum <= A nand B;,0
-            Sum <= A nor B;,0
-            Sum <= not A;,0
-            Sum <= A xor B;,0
-            Sum <= A xnor B;,1
-            Sum <= Cin and (A xor B);,0
-            Sum <= (A and B) or (Cin and (A xor B));,1
-            Sum <= A xor B xor Cin;,1
-            Sum <= (A nand B) xor Cin;,1
-            Sum <= not (A and B);,0
-            Sum <= not (A xor B);,1
-            Sum <= (A nor B) and Cin;,0
-            Sum <= A and not (B or Cin);,0
-        ";*/
-        string operations = @"
-            Sum <= Cin and (A xor B);,0
-            Sum <= (A and B) or (Cin and (A xor B));,1
-            Sum <= A xor B xor Cin;,1
-            Sum <= (A nand B) xor Cin;,1
-            Sum <= not (A and B);,0
-            Sum <= not (A xor B);,1
-            Sum <= (A nor B) and Cin;,0
-            Sum <= A and not (B or Cin);,0
+        string raw = @"
+entity UART_TX is
+    generic (
+        CLK_FREQ : integer := 50_000_000;
+        BAUD     : integer := 9600
+    );
+    port (
+        Clk     : in std_logic;
+        TxStart : in std_logic;
+        Data    : in std_logic_vector(7 downto 0);
+        Tx      : out std_logic;
+        Busy    : out std_logic
+    );
+end entity UART_TX;
+entity TrafficController is
+    port (
+        Clk   : in std_logic;
+        Reset : in std_logic;
+        R, Y, G : out std_logic
+    );
+end entity TrafficController;
+
+architecture rtl of TrafficController is
+begin
+end architecture rtl;
+
+
         ";
-        var items = operations.Split("\n")
-                    .Where(p => !String.IsNullOrEmpty(p.Trim()))
-                    .ToList();
-        foreach(var item in items){
-            var splitted = item.Trim().Split(",");
-            Operation operation= new(splitted[0], Variables);
-            var result = operation.Execute() as Variable;
-            Console.WriteLine($"Ecuation: {splitted[0]}\nSyntetized Result: {result?.Value} - {splitted[1]}");
+        var prev = raw.Split("\n").Where(p => !String.IsNullOrEmpty(p.Trim()) && p != " ").ToList().ToArray();
+        List<Entity> Entities = new();
+        List<string> rawEntity = new();
+        int it = 0;
+        foreach(var item in prev){
+            string comparer = item.Trim().ToLower();
+            if(comparer.StartsWith("entity")){
+                it = 1;
+            }else if(comparer.StartsWith("architecture")){
+                it = 2;
+            }
+            if(it == 1){
+                if(comparer.StartsWith("end entity")){
+                    rawEntity.Add(item.Trim());
+                    Entity entity = new(rawEntity.ToArray());
+                    Entities.Add(entity);
+                    rawEntity = new();
+                    it = 0;
+                }else
+                    rawEntity.Add(item);
+            }else if(it == 2){
+                if(comparer.StartsWith("end architecture")){
+                    rawEntity.Add(item);
+                    Architecture arch = new(rawEntity.ToArray());
+                    it = 0;
+                }else
+                    rawEntity.Add(item);
+            }
+            
         }
-        
-        
     }
 }
