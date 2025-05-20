@@ -24,7 +24,7 @@ public class Operation : IOperation {
         Tokenizer tokenizer = new(string.Empty);
         if(RawData.Contains("<=")){
             var splitted = RawData.Trim().Split("<=");
-            Result = Variables.First(p => p.Name.Equals(splitted[0].Trim()));
+            Result = this.Variables.First(p => p.Name.Equals(splitted[0].Trim()));
             RawData = splitted[1].Trim();
         }
         _data = tokenizer.TokenizeLineReturn(RawData);
@@ -70,7 +70,8 @@ public class Operation : IOperation {
                 item = new Operator(currentItem);
             }else if(_arithOperators.IsMatch(currentItem)){
                 item = new Operator(currentItem);
-            }else if(_variableRegex.IsMatch(currentItem) && Variables.Contains(currentItem)){
+            }else if(_variableRegex.IsMatch(currentItem)){
+                if(!Variables.Contains(currentItem)) throw new ParserException(Constants.ParseExceptions.MISSING_DECLARATION);
                 item = Variables.First(p => p.Name.ToLower().Equals(currentItem.ToLower()));
             }else if(_finder.IsLiteral(currentItem)){
                 Constants.DATATYPES type = _finder.GetDataType(currentItem);

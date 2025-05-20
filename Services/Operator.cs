@@ -13,9 +13,10 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     public string OperatorName { get; private set; } = string.Empty;
     public Operator(string Operator){
         this.OperatorName = Operator;
-        _assignationRegex = new(ASSIGNATION_OPERATORS);
-        _arithRegex = new(ARITH_OPERATORS);
-        _logicRegex = new(LOGIC_OPERATORS);
+        RegexOptions options = RegexOptions.Compiled | RegexOptions.IgnoreCase;
+        _assignationRegex = new(ASSIGNATION_OPERATORS, options);
+        _arithRegex = new(ARITH_OPERATORS, options);
+        _logicRegex = new(LOGIC_OPERATORS, options);
         this.OperatorType = DefineOperatorType(Operator);
         DefinePrecedence(Operator);
     }
@@ -119,8 +120,8 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         return result;
     }
     public object SolveLogicOperation(Variable var1, Variable var2){
-        char a = Convert.ToChar(var1.Value);
-        char b = Convert.ToChar(var2.Value);
+        char a = Convert.ToChar(var1.Value?.ToString()?.Replace("'", "") ?? throw new Exception("Malformed data"));
+        char b = Convert.ToChar(var2.Value?.ToString()?.Replace("'", "") ?? throw new Exception("Malformed data"));
         char result;
         switch (OperatorName.ToLower()) {
             case "and":

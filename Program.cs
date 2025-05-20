@@ -1,5 +1,6 @@
 ﻿using Interpreter.Services;
 using Parser.Models;
+using Parser.Repositories;
 
 namespace Interpreter;
 
@@ -31,19 +32,26 @@ end entity TrafficController;
 
 architecture rtl of TrafficController is
 begin
+    G <= '1';
+    R <= '1';
+    Reset <= '0';
+    Y <= G and R XOr (R OR G AND (NOT Reset)) ;
 end architecture rtl;
 
 
         ";
+        Tokenizer tok = new("");
         var prev = raw.Split("\n").Where(p => !String.IsNullOrEmpty(p.Trim()) && p != " ").ToList().ToArray();
         List<Entity> Entities = new();
         List<string> rawEntity = new();
         int it = 0;
+        string currentEntityArchName = string.Empty;
         foreach(var item in prev){
             string comparer = item.Trim().ToLower();
             if(comparer.StartsWith("entity")){
                 it = 1;
             }else if(comparer.StartsWith("architecture")){
+                currentEntityArchName = item.Split(' ')[3];
                 it = 2;
             }
             if(it == 1){
@@ -58,12 +66,20 @@ end architecture rtl;
             }else if(it == 2){
                 if(comparer.StartsWith("end architecture")){
                     rawEntity.Add(item);
-                    Architecture arch = new(rawEntity.ToArray());
+                    Entity entity = Entities.FirstOrDefault(p => p.Name.Equals(currentEntityArchName)) ?? default!;
+                    if(entity == null) throw new Exception("Entity not found");
+                    Architecture arch = new(entity.Ports, entity.Generics);
+                    arch.Syntetize(rawEntity.ToArray());
+                    entity.SetArchitecture(arch);
                     it = 0;
                 }else
                     rawEntity.Add(item);
             }
-            
+        }
+        foreach(var entity in Entities){
+            Console.WriteLine(entity);
+            entity.Execute();
+            Console.WriteLine(entity);
         }
     }
 }

@@ -1,4 +1,7 @@
 namespace Interpreter.Interfaces;
-public interface IControl{
+
+public interface IControl
+{
     void SyntetizeBehaviour(string[] Behaviour);
+    void SyntetizeBehaviour();
 }

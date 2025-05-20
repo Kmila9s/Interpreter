@@ -10,16 +10,18 @@ public class Entity : ISControl, IControl{
     public HashSet<Variable> Generics { get; private set; } = new();
     public Architecture Architecture { get; private set; } = default!;
     private readonly Tokenizer _tokenizer = new(string.Empty);
-    private readonly Regex _variableRegex = new(Constants.IDENTIFIERS, RegexOptions.Compiled);
     public Entity() { }
     public Entity(string[] RawEntity) { Syntetize(RawEntity); }
     public Entity(string Name) { this.Name = Name; }
-    public void Execute(){
-        
+    public void Execute() {
+        if(Architecture != null){
+            Architecture.Execute();
+        }
     }
     public void Syntetize(){
         
     }
+    public void SetArchitecture(Architecture architecture) => Architecture = architecture;
     public void Syntetize(string[] RawEntity){
         int offset = 0;
         Name = RawEntity[offset++].Split(" ")[1];
@@ -92,13 +94,18 @@ public class Entity : ISControl, IControl{
     public void SyntetizeBehaviour(string[] Behaviour){
 
     }
+    public void SyntetizeBehaviour(){
+
+    }
     public override string ToString()
     {
         string info = $"Entity Name: {Name}\n";
-        foreach(var variable in Ports){
+        foreach (var variable in Ports)
+        {
             info += $"Port: {variable.Name}\nPort Type: {variable.PortType}\nValue: {variable.Value}\nType: {variable.Type}\n";
         }
-        foreach(var variable in Generics){
+        foreach (var variable in Generics)
+        {
             info += $"Generic: {variable.Name}\nGeneric Type: {variable.PortType}\nValue: {variable.Value}\nType: {variable.Type}\n";
         }
         return info;

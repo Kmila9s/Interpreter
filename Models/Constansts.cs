@@ -17,5 +17,11 @@ public enum PrecedencesArithOperators : int {
     DIVISION = 1,
     ADD = 2,
     SUBSTRACTION = 2,
-    
+}
+public enum OperationType : int {
+    ASSIGNATION,
+    UNKNOWN
+}
+public class OperationsRegex {
+    public static string ASSIGNATION = @"[A-Za-z_]+[_a-zA-Z0-9]*\s?\<\=\s?.+";
 }
