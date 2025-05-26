@@ -22,6 +22,8 @@ public class LiteralsFinder : IFinder{
             (
                 _stdLogic.IsMatch(item) ?
                     DATATYPES.STD_LOGIC :
+                _stdLogicVector.IsMatch(item) ?
+                    DATATYPES.STD_LOGIC_VECTOR :
                 _decimalOrInteger.IsMatch(item) ?
                 (
                     item.Contains('.') ?
@@ -32,7 +34,7 @@ public class LiteralsFinder : IFinder{
                     DATATYPES.BOOLEAN :
                 _hex.IsMatch(item) ?
                     DATATYPES.HEX :
-                    DATATYPES.STD_LOGIC_VECTOR 
+                    DATATYPES.UNKNOWN 
             ):
         DATATYPES.UNKNOWN;
 }

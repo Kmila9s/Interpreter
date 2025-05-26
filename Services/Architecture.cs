@@ -79,12 +79,15 @@ public class Architecture : ISControl, IControl
             }
             else
             {
-                // FOR NO SIMPLE ASSIGNATIONS
+                // FOR SIMPLE ASSIGNATIONS
                 string operation = "";
                 while (_streamer.Current?.Value.ToLower() != ";")
                 {
                     operation += _streamer.Current?.Value + " ";
+                    _streamer.MoveNext();
                 }
+                _streamer.MoveNext(); // ;
+                operation = operation.Trim();
                 var type = _detector.GetOperationType(operation);
                 switch (type)
                 {

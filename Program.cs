@@ -15,9 +15,8 @@ entity UART_TX is
         BAUD     : integer := 9600
     );
     port (
-        Clk     : in std_logic;
-        TxStart : in std_logic;
-        Data    : in std_logic_vector(7 downto 0);
+        Clk, Reset     : in std_logic;
+        TxStart, asdf : in std_logic;
         Tx      : out std_logic;
         Busy    : out std_logic
     );
@@ -26,12 +25,14 @@ entity TrafficController is
     port (
         Clk   : in std_logic;
         Reset : in std_logic;
+        Data    : in std_logic_vector(7 downto 0);
         R, Y, G : out std_logic
     );
 end entity TrafficController;
 
 architecture rtl of TrafficController is
 begin
+    Data <= '00000000';
     G <= '1';
     R <= '1';
     Reset <= '0';
