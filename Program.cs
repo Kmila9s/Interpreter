@@ -9,35 +9,66 @@ class Program
     static void Main(string[] args)
     {
         string raw = @"
-entity UART_TX is
-    generic (
-        CLK_FREQ : integer := 50_000_000;
-        BAUD     : integer := 9600
-    );
-    port (
-        Clk, Reset     : in std_logic;
-        TxStart, asdf : in std_logic;
-        Tx      : out std_logic;
-        Busy    : out std_logic
-    );
-end entity UART_TX;
-entity TrafficController is
-    port (
-        Clk   : in std_logic;
-        Reset : in std_logic;
-        Data    : in std_logic_vector(7 downto 0);
-        R, Y, G : out std_logic
-    );
-end entity TrafficController;
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
 
-architecture rtl of TrafficController is
+-- ENTITY
+entity SimpleALU is
+    Port (
+        clk     : in  STD_LOGIC;
+        op_sel  : in  STD_LOGIC_VECTOR(1 downto 0);  -- 00:add, 01:sub, 10:and, 11:or
+        a       : in  STD_LOGIC_VECTOR(3 downto 0);
+        b       : in  STD_LOGIC_VECTOR(3 downto 0);
+        result  : out STD_LOGIC_VECTOR(3 downto 0)
+    );
+end SimpleALU;
+
+-- ARCHITECTURE
+architecture Behavioral of SimpleALU is
+
+    -- VARIED SIGNAL DECLARATIONS
+    signal a_u       : unsigned(3 downto 0);
+    signal b_u       : unsigned(3 downto 0);
+    signal a_s       : signed(3 downto 0);
+    signal b_s       : signed(3 downto 0);
+    signal op_code   : std_logic_vector(1 downto 0);
+    signal res_temp  : std_logic_vector(3 downto 0);
+    signal add_res   : unsigned(3 downto 0);
+    signal sub_res   : signed(3 downto 0);
+    signal and_res   : std_logic_vector(3 downto 0);
+    signal or_res    : std_logic_vector(3 downto 0);
+    signal valid_op  : boolean := false;
+
 begin
-    Data <= '00000000';
-    G <= '1';
-    R <= '1';
-    Reset <= '0';
-    Y <= G and R XOr (R OR G AND (NOT Reset)) ;
-end architecture rtl;
+
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            -- Cast inputs
+            a_u <= unsigned(a);
+            b_u <= unsigned(b);
+            a_s <= signed(a);
+            b_s <= signed(b);
+            op_code <= op_sel;
+
+            -- Precompute all operations (still sequential)
+            add_res <= a_u + b_u;
+            sub_res <= a_s - b_s;
+            and_res <= a and b;
+            or_res  <= a or b;
+
+            -- Basic operation select (sequential assignment)
+            valid_op <= true;
+        end if;
+    end process;
+
+    result <= res_temp;
+
+end Behavioral;
+
+
+
 
 
         ";
@@ -56,7 +87,7 @@ end architecture rtl;
                 it = 2;
             }
             if(it == 1){
-                if(comparer.StartsWith("end entity")){
+                if(comparer.StartsWith("end ") && comparer.EndsWith(";")){
                     rawEntity.Add(item.Trim());
                     Entity entity = new(rawEntity.ToArray());
                     Entities.Add(entity);
@@ -65,7 +96,7 @@ end architecture rtl;
                 }else
                     rawEntity.Add(item);
             }else if(it == 2){
-                if(comparer.StartsWith("end architecture")){
+                if(comparer.StartsWith("end ")){
                     rawEntity.Add(item);
                     Entity entity = Entities.FirstOrDefault(p => p.Name.Equals(currentEntityArchName)) ?? default!;
                     if(entity == null) throw new Exception("Entity not found");

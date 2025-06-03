@@ -10,7 +10,7 @@ public class Architecture : ISControl, IControl
 {
     public string Name { get; private set; } = string.Empty;
     public string EntityName { get; private set; } = string.Empty;
-    private readonly HashSet<Variable> _ports = new(), _generics = new();
+    private readonly HashSet<Variable> _ports = new(), _generics = new(), _signals = new();    
     public List<object> Tasks { get; private set; } = new();
     private Tokenizer _tokenizer = new(string.Empty);
     private TokenStream _streamer = default!;
@@ -58,16 +58,82 @@ public class Architecture : ISControl, IControl
         EntityName = _streamer.Current?.Value ?? string.Empty;
         _streamer.Expect(IDENTIFIERS);
         _streamer.Expect(KEYWORDS); // is
-        string item = _streamer.Current?.Value ?? string.Empty;
-        if (!item.ToLower().Equals("begin"))
-        {
-            // SIGNALS, ETC...
+        var item = _streamer.Current?.Value ?? string.Empty;
+        while (!item.Equals("begin")) {
+            switch (item.ToLower())
+            {
+                case "signal":
+                    SyntetizeSignal();
+                    break;
+            }
         }
-        else
+        _streamer.Expect(KEYWORDS); // begin
+        SyntetizeBehaviour();
+    }
+    public void SyntetizeSignal()
+    {
+        List<Variable> localSignals = new();
+        _streamer.Expect(KEYWORDS);
+        string varName = _streamer.Current?.Value ?? string.Empty;
+        while (varName != ":")
         {
-            _streamer.Expect(KEYWORDS); // begin
-            SyntetizeBehaviour();
+            localSignals.Add(new()
+            {
+                Name = varName
+            });
+            _streamer.Expect(IDENTIFIERS);
+            if (_streamer.Current?.Value == ",")
+                _streamer.MoveNext();
+            varName = _streamer.Current?.Value ?? string.Empty;
         }
+        _streamer.Expect(OPERATORS); // :
+        Constants.DATATYPES dataType = Variable.GetDatatype(_streamer.Current?.Value ?? string.Empty);
+        _streamer.Expect(KEYWORDS);
+        int VectorSize = 0;
+        if (dataType == Constants.DATATYPES.STD_LOGIC_VECTOR || dataType == Constants.DATATYPES.RANGE)
+        {
+            if (dataType == Constants.DATATYPES.STD_LOGIC_VECTOR)
+            {
+                _streamer.Expect(PARENTHESIS);
+                int initial = Convert.ToInt32(_streamer.Current?.Value);
+                _streamer.Expect(LITERALS);
+                string vecType = _streamer.Current?.Value ?? string.Empty;
+                _streamer.Expect(KEYWORDS);
+                int end = Convert.ToInt32(_streamer.Current?.Value);
+                _streamer.Expect(LITERALS);
+                _streamer.Expect(PARENTHESIS);
+                VectorSize = vecType == "downto" ? initial - end : end - initial;
+            }
+            else
+            {
+                int initial = Convert.ToInt32(_streamer.Current?.Value);
+                _streamer.Expect(LITERALS);
+                _streamer.Expect(KEYWORDS);
+                int end = Convert.ToInt32(_streamer.Current?.Value);
+                _streamer.Expect(LITERALS);
+                VectorSize = Math.Abs(end - initial);
+            }
+        }
+        object value = new();
+        if (_streamer.Current?.Value == ":=")
+        {
+            _streamer.Expect(OPERATORS);
+            value = _streamer.Current?.Value ?? string.Empty;
+            _streamer.Expect(LITERALS);
+        }
+        _streamer.Expect(OPERATORS); // ;
+        localSignals.ForEach(p =>
+        {
+            _signals.Add(new()
+            {
+                Name = p.Name,
+                Type = dataType,
+                Size = VectorSize,
+                IsPort = false,
+                PortType = Constants.PortType.OUT,
+                Value = value,
+            });
+        });
     }
     public void SyntetizeBehaviour()
     {
@@ -93,6 +159,8 @@ public class Architecture : ISControl, IControl
                 {
                     case OperationType.ASSIGNATION:
                         Operation op;
+                        // NEEDS CHANGE UP FOR AVOIDING OR SILENT EXCEPTIONS
+                        // LIKE OUT OF INDEX ON VECTORS
                         try
                         {
                             op = new(operation, _ports);

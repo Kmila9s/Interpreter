@@ -112,7 +112,9 @@ public class Entity : ISControl, IControl{
                         Name = p.Name,
                         Type = dataType,
                         IsPort = true,
-                        Size = VectorSize
+                        Size = VectorSize,
+                        PortType = type,
+                        Value = null!
                     }
                 )
             );
