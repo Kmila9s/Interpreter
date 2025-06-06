@@ -33,10 +33,9 @@ public class Operation : IOperation {
     }
     public object Execute(){
         Stack<Variable> variables = new();
-        if (Result.PortType == Constants.PortType.IN && Result.IsPort)
-        {
+        if (Result.PortType == Constants.PortType.IN)
             throw new InvalidOperationException("Input ports are not elegible for assignations");
-        }
+
         foreach(var item in Items){
             if(item is Variable newVar){
                 variables.Push(newVar);

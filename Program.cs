@@ -15,6 +15,10 @@ use IEEE.NUMERIC_STD.ALL;
 
 -- ENTITY
 entity SimpleALU is
+    Generic (
+        width : integer := 8;  -- Ancho de datos
+        depth : integer := 16  -- Profundidad de memoria
+    );
     Port (
         clk     : in  STD_LOGIC;
         op_sel  : in  STD_LOGIC_VECTOR(1 downto 0);  -- 00:add, 01:sub, 10:and, 11:or
