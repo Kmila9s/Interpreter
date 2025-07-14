@@ -1,4 +1,5 @@
 using Interpreter.Interfaces;
+using Interpreter.Repositories;
 using Parser.Models;
 using Parser.Repositories;
 using static Parser.Models.Constants.TYPE;
@@ -8,6 +9,7 @@ public class Process : ISControl, IControl
 {
     public HashSet<Variable> SensitiveList { get; private set; } = new();
     public HashSet<Variable> SignalsPorts { get; private set; } = new();
+    public List<object> Tasks { get; private set; } = new();
     private HashSet<Variable> _variables = new();
     private readonly TokenStream _streamer;
     public Process(HashSet<Variable> SignalsPorts, TokenStream Streamer)
@@ -17,7 +19,8 @@ public class Process : ISControl, IControl
     }
     public void Execute()
     {
-        
+        Executer executer = new(Tasks);
+        executer.Execute();
     }
     public void Syntetize()
     {
@@ -26,8 +29,10 @@ public class Process : ISControl, IControl
         if (_streamer.Current?.Value != "begin")
         {
             syntetizer.Syntetize();
+            _variables = syntetizer.Variables;
         }
         _streamer.Expect(KEYWORDS); // begin
+        SyntetizeBehaviour();
     }
     public void Syntetize(string[] rawProcess) => throw new NotImplementedException();
     private void SyntentizeSensitiveList()

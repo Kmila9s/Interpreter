@@ -20,7 +20,7 @@ entity SimpleALU is
         depth : integer := 16  -- Profundidad de memoria
     );
     Port (
-        clk     : in  STD_LOGIC;
+        clk     :   STD_LOGIC;
         op_sel  : in  STD_LOGIC_VECTOR(1 downto 0);  -- 00:add, 01:sub, 10:and, 11:or
         a       : in  STD_LOGIC_VECTOR(3 downto 0);
         b       : in  STD_LOGIC_VECTOR(3 downto 0);

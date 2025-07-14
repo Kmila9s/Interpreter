@@ -1,3 +1,4 @@
+using System.Text;
 using Interpreter.Interfaces;
 using Interpreter.Models;
 using Interpreter.Repositories;
@@ -37,13 +38,8 @@ public class Architecture : ISControl, IControl
 
     public void Execute()
     {
-        foreach (var task in Tasks)
-        {
-            if (task is Operation operation)
-            {
-                operation.Execute();
-            }
-        }
+        Executer executer = new(Tasks);
+        executer.Execute();
     }
     public void Syntetize() => throw new NotImplementedException();
     public void Syntetize(string[] RawArchitecture)
@@ -75,10 +71,7 @@ public class Architecture : ISControl, IControl
                 switch (_streamer.Current.Value.ToLower())
                 {
                     case "process":
-                        List<Variable> comparators = new();
-                        comparators.AddRange(_ports);
-                        comparators.AddRange(_generics);
-                        comparators.AddRange(_signals);
+                        List<Variable> comparators = [.. _ports, .. _generics, .. _signals];
                         Process process = new(comparators.ToHashSet(), _streamer);
                         process.Syntetize();
                         break;
@@ -101,14 +94,14 @@ public class Architecture : ISControl, IControl
     }
     public void SyntetizeAssingations()
     {
-        string operation = "";
-        while (_streamer.Current?.Value.ToLower() != ";")
+        var rawDataBuilder = new StringBuilder();
+        while (_streamer.Current?.Value != "then")
         {
-            operation += _streamer.Current?.Value + " ";
+            rawDataBuilder.Append(_streamer.Current?.Value + " ");
             _streamer.MoveNext();
         }
+        string operation = rawDataBuilder.ToString().Trim();
         _streamer.MoveNext(); // ;
-        operation = operation.Trim();
         var type = _detector.GetOperationType(operation);
         switch (type)
         {
@@ -116,10 +109,7 @@ public class Architecture : ISControl, IControl
                 Operation op;
                 // NEEDS CHANGE UP FOR AVOIDING OR SILENT EXCEPTIONS
                 // LIKE OUT OF INDEX ON VECTORS
-                List<Variable> variables = new();
-                variables.AddRange(_ports);
-                variables.AddRange(_signals);
-                variables.AddRange(_generics);
+                List<Variable> variables = [.. _ports, .. _signals, .. _generics];
                 op = new(operation, variables.ToHashSet());
                 Tasks.Add(op);
                 break;
