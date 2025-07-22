@@ -9,13 +9,14 @@ namespace Interpreter.Services;
 public class Operator : IOperation, ILogicOperation, IArithOperation{
     public OperatorType OperatorType { get; private set; }
     public object Precedence { get; private set; } = new();
-    private readonly Regex _assignationRegex, _arithRegex, _logicRegex;
+    private readonly Regex _assignationRegex, _arithRegex, _logicRegex, _comparationRegex;
     public string OperatorName { get; private set; } = string.Empty;
     public Operator(string Operator){
         this.OperatorName = Operator;
         RegexOptions options = RegexOptions.Compiled | RegexOptions.IgnoreCase;
         _assignationRegex = new(ASSIGNATION_OPERATORS, options);
         _arithRegex = new(ARITH_OPERATORS, options);
+        _comparationRegex = new(COMPARATION_OPERATORS, options);
         _logicRegex = new(LOGIC_OPERATORS, options);
         this.OperatorType = DefineOperatorType(Operator);
         DefinePrecedence(Operator);
@@ -71,6 +72,9 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                     break;
                 }
             break;
+            case OperatorType.COMPARATION:
+                Precedence = PrecedencesLogicOperators.COMPARATION;
+            break;
             case OperatorType.UNKNOWN:
                 Precedence = PrecedencesLogicOperators.PARENTHESIS;
             break;
@@ -82,12 +86,15 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         }
     }
     private OperatorType DefineOperatorType(string Operator) =>
-        _assignationRegex.IsMatch(Operator) ? 
-            OperatorType.ASSIGNATION : 
+        _comparationRegex.IsMatch(Operator) ?
+            OperatorType.COMPARATION :
+        _assignationRegex.IsMatch(Operator) ?
+            OperatorType.ASSIGNATION :
         _arithRegex.IsMatch(Operator) ?
             OperatorType.ARITH_OPERATION :
         _logicRegex.IsMatch(Operator) ?
             OperatorType.LOGIC_OPERATION :
+        
             OperatorType.UNKNOWN;
     public object Execute() => throw new NotImplementedException();
     public object Execute(object[] array, int index) => throw new NotImplementedException();
@@ -102,6 +109,9 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         switch(OperatorType){
             case OperatorType.ASSIGNATION:
                 result = rightSideOperator.Value;
+            break;
+            case OperatorType.COMPARATION:
+                result = SolveComparation(leftSideOperator, rightSideOperator);
             break;
             case OperatorType.LOGIC_OPERATION:
                 switch(leftSideOperator.Type){
@@ -119,11 +129,49 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         }
         return result;
     }
-    public object SolveLogicOperation(Variable var1, Variable var2){
+    public object SolveComparation(Variable var1, Variable var2)
+    {
+        switch (var1.Type)
+        {
+            case DATATYPES.BOOLEAN:
+                switch (OperatorName.ToLower())
+                {
+                    case "=":
+                        return bool.Parse((string)var1.Value) == bool.Parse((string)var2.Value);
+                    case "!=":
+                        return bool.Parse((string)var1.Value) != bool.Parse((string)var2.Value);
+                    default:
+                        throw new Exception($"Operator type do not detected or even supported: {OperatorName}");
+                }
+            case DATATYPES.STD_LOGIC:
+            case DATATYPES.INTEGER:
+            case DATATYPES.BIT:
+            case DATATYPES.NATURAL:
+                switch (OperatorName.ToLower())
+                {
+                    case "=":
+                        return int.Parse((string)var1.Value) == int.Parse((string)var2.Value);
+                    case "!=":
+                        return int.Parse((string)var1.Value) != int.Parse((string)var2.Value);
+                    case ">":
+                        return int.Parse((string)var1.Value) > int.Parse((string)var2.Value);
+                    case "<":
+                        return int.Parse((string)var1.Value) == int.Parse((string)var2.Value);
+                    default:
+                        throw new Exception($"Operator type do not detected or even supported: {OperatorName}");
+                }
+            default:
+                throw new Exception($"Datatype do not detected or even supported: {OperatorName}");
+        }
+    }
+
+    public object SolveLogicOperation(Variable var1, Variable var2)
+    {
         char a = Convert.ToChar(var1.Value?.ToString()?.Replace("'", "") ?? throw new Exception("Malformed data"));
         char b = Convert.ToChar(var2.Value?.ToString()?.Replace("'", "") ?? throw new Exception("Malformed data"));
         char result;
-        switch (OperatorName.ToLower()) {
+        switch (OperatorName.ToLower())
+        {
             case "and":
                 result = (a == '1' && b == '1') ? '1' : '0';
                 break;
@@ -141,7 +189,7 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                 break;
             default:
                 result = 'U';
-            break;
+                break;
         }
         return result;
     }
@@ -210,14 +258,16 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         }
         return result;
     }
-    private object SolveVectorLogicOperation(Variable v1, Variable v2){
-        if(v1.Size != v2.Size)
+    private object SolveVectorLogicOperation(Variable v1, Variable v2)
+    {
+        if (v1.Size != v2.Size)
             throw new ParserException("Vectors do not match in size");
-        string result = "", 
+        string result = "",
         vectorString1 = (string)v1.Value,
         vectorString2 = (string)v2.Value;
-        for(int i = 0; i < v1.Size; i++){
-            Variable valueA = new("tempA", vectorString1[i], DATATYPES.STD_LOGIC), 
+        for (int i = 0; i < v1.Size; i++)
+        {
+            Variable valueA = new("tempA", vectorString1[i], DATATYPES.STD_LOGIC),
             valueB = new("tempB", vectorString2[i], DATATYPES.STD_LOGIC);
             result += (string)SolveLogicOperation(valueA, valueB);
         }

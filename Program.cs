@@ -20,7 +20,7 @@ entity SimpleALU is
         depth : integer := 16  -- Profundidad de memoria
     );
     Port (
-        clk     :   STD_LOGIC;
+        clk     : in  STD_LOGIC;
         op_sel  : in  STD_LOGIC_VECTOR(1 downto 0);  -- 00:add, 01:sub, 10:and, 11:or
         a       : in  STD_LOGIC_VECTOR(3 downto 0);
         b       : in  STD_LOGIC_VECTOR(3 downto 0);
@@ -46,35 +46,27 @@ architecture Behavioral of SimpleALU is
 
 begin
 
-    process(clk)
-    begin
-        if rising_edge(clk) then
-            -- Cast inputs
-            a_u <= unsigned(a);
-            b_u <= unsigned(b);
-            a_s <= signed(a);
-            b_s <= signed(b);
-            op_code <= op_sel;
+    if '1' = '1' then
+        -- Cast inputs
+        --a_u <= unsigned(a);
+        --b_u <= unsigned(b);
+        --a_s <= signed(a);
+        --b_s <= signed(b);
+        op_code <= op_sel;
 
-            -- Precompute all operations (still sequential)
-            add_res <= a_u + b_u;
-            sub_res <= a_s - b_s;
-            and_res <= a and b;
-            or_res  <= a or b;
+        -- Precompute all operations (still sequential)
+        add_res <= a_u + b_u;
+        sub_res <= a_s - b_s;
+        and_res <= a and b;
+        or_res  <= a or b;
 
-            -- Basic operation select (sequential assignment)
-            valid_op <= true;
-        end if;
-    end process;
+        -- Basic operation select (sequential assignment)
+        valid_op <= true;
+    end if;
 
     result <= res_temp;
 
 end Behavioral;
-
-
-
-
-
         ";
         Tokenizer tok = new("");
         var prev = raw.Split("\n").Where(p => !String.IsNullOrEmpty(p.Trim()) && p != " ").ToList().ToArray();

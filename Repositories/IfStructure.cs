@@ -22,7 +22,8 @@ public class IfStructure : ISControl
     }
     public void Execute()
     {
-        if (_baseCondition.Execute() is bool condition && condition)
+        var result = _baseCondition.Execute() as Variable;
+        if (result?.Value is bool condition && condition)
         {
             Executer executer = new(Tasks);
             executer.Execute();
@@ -64,7 +65,7 @@ public class IfStructure : ISControl
     public void SyntetizeAssingations()
     {
         var rawDataBuilder = new StringBuilder();
-        while (_streamer.Current?.Value != "then")
+        while (_streamer.Current?.Value != ";")
         {
             rawDataBuilder.Append(_streamer.Current?.Value + " ");
             _streamer.MoveNext();

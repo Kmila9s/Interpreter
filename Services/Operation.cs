@@ -1,5 +1,6 @@
 using System.Text.RegularExpressions;
 using Interpreter.Interfaces;
+using Interpreter.Models;
 using Interpreter.Repositories;
 using Parser.Models;
 using Parser.Repositories;
@@ -47,7 +48,14 @@ public class Operation : IOperation {
                 } else {
                     var right = variables.Pop();
                     var left = variables.Pop();
-                    variables.Push(new("Temp", op.Execute(left, right), left.Type));
+                    Variable vari = new("Temp", op.Execute(left, right), left.Type);
+                    if (op.OperatorType == Constants.OperatorType.COMPARATION)
+                    {
+                        vari.IsPort = false;
+                        vari.Type = Constants.DATATYPES.BOOLEAN;
+                        vari.Value = bool.Parse((string)vari.Value);
+                    }
+                    variables.Push(vari);
                 }
             }
         }
@@ -62,28 +70,52 @@ public class Operation : IOperation {
     
     public object[] Syntetize(){
         List<object> items = new();
-        while(_currentSyntetizeIndex < _data.Length){
+        bool isComparation = false;
+        while (_currentSyntetizeIndex < _data.Length)
+        {
             var currentItem = _data[_currentSyntetizeIndex];
             object item = new();
-            if(currentItem == ";"){
-                _currentSyntetizeIndex ++;
+            if (currentItem == ";")
+            {
+                _currentSyntetizeIndex++;
                 continue;
             }
-            if(_operators.IsMatch(currentItem.ToLower()) || _logicOperators.IsMatch(currentItem.ToLower())){
+            if (_operators.IsMatch(currentItem.ToLower()))
+            {
+                isComparation = true;
                 item = new Operator(currentItem);
-            }else if(_arithOperators.IsMatch(currentItem)){
+            }
+            else if (_arithOperators.IsMatch(currentItem) || _logicOperators.IsMatch(currentItem.ToLower()))
+            {
                 item = new Operator(currentItem);
-            }else if(_variableRegex.IsMatch(currentItem)){
-                if(!Variables.Contains(currentItem)) throw new ParserException(Constants.ParseExceptions.MISSING_DECLARATION);
-                item = Variables.First(p => p.Name.ToLower().Equals(currentItem.ToLower()));
-            }else if(_finder.IsLiteral(currentItem)){
+            }
+            else if (_finder.IsLiteral(currentItem))
+            {
                 Constants.DATATYPES type = _finder.GetDataType(currentItem);
                 item = new Variable($"Literal-{Guid.NewGuid()}", currentItem, type);
-            }else
+            }
+            else if (_variableRegex.IsMatch(currentItem))
+            {
+                if (!Variables.Contains(currentItem)) throw new ParserException(Constants.ParseExceptions.MISSING_DECLARATION);
+                item = Variables.First(p => p.Name.ToLower().Equals(currentItem.ToLower()));
+            }
+            else
                 item = new Operator(currentItem);
-                
+
             items.Add(item);
             _currentSyntetizeIndex++;
+        }
+        if (isComparation)
+        {
+            Result.PortType = Constants.PortType.OUT;
+            List<object> newItems = new();
+            foreach (var item in items)
+            {
+                if (item is Variable vari && vari.Name.Contains("Literal"))
+                    vari.PortType = Constants.PortType.OUT;
+                newItems.Add(item);
+            }
+            items = newItems;
         }
         return items.ToArray();
     }

@@ -62,7 +62,9 @@ public class Entity : ISControl, IControl{
             _streamer.Expect(OPERATORS); // ;
         }
 
-    }public void SyntetizeBehaviour(string[] Behaviour){
+    }
+    public void SyntetizeBehaviour(string[] Behaviour)
+    {
 
     }
     public override string ToString()

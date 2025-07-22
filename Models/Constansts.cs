@@ -1,5 +1,6 @@
 namespace Interpreter.Models;
 public enum PrecedencesLogicOperators : int {
+    COMPARATION = 5,
     ASSIGNATION = 5, // LOWEST PRECEDENCE
     PARENTHESIS = 4,
     XOR = 3, 

@@ -67,14 +67,20 @@ public class Architecture : ISControl, IControl
         {
             if (_streamer.Current?.Type == KEYWORDS)
             {
+                List<Variable> comparators = [.. _ports, .. _generics, .. _signals];
                 // FOR COMPLEX BEHAVIOURS
                 switch (_streamer.Current.Value.ToLower())
                 {
                     case "process":
-                        List<Variable> comparators = [.. _ports, .. _generics, .. _signals];
                         Process process = new(comparators.ToHashSet(), _streamer);
                         process.Syntetize();
-                        break;
+                        Tasks.Add(process);
+                    break;
+                    case "if":
+                        IfStructure ifStructure = new(comparators.ToHashSet(), _streamer);
+                        ifStructure.Syntetize();
+                        Tasks.Add(ifStructure);
+                    break;
                 }
             }
             else
