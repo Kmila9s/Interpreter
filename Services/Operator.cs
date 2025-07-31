@@ -124,6 +124,9 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                 }
                 
             break;
+            case OperatorType.ARITH_OPERATION:
+                result = SolveArithOperation(leftSideOperator, rightSideOperator);
+                break;
             default:
                 throw new NotImplementedException();
         }
@@ -269,7 +272,7 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         {
             Variable valueA = new("tempA", vectorString1[i], DATATYPES.STD_LOGIC),
             valueB = new("tempB", vectorString2[i], DATATYPES.STD_LOGIC);
-            result += (string)SolveLogicOperation(valueA, valueB);
+            result += Convert.ToString(SolveLogicOperation(valueA, valueB));
         }
         return result;
     }
