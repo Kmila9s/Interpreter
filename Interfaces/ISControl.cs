@@ -1,6 +1,6 @@
 namespace Interpreter.Interfaces;
 public interface ISControl {
-    void Execute();
+    Task ExecuteAsync();
     void Syntetize();
     void Syntetize(string[] RawData);
     

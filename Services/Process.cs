@@ -17,10 +17,10 @@ public class Process : ISControl, IControl
         _streamer = Streamer;
         this.SignalsPorts = SignalsPorts;
     }
-    public void Execute()
+    public async Task ExecuteAsync()
     {
         Executer executer = new(Tasks);
-        executer.Execute();
+        await executer.ExecuteAsync();
     }
     public void Syntetize()
     {

@@ -36,10 +36,10 @@ public class Architecture : ISControl, IControl
         _generics = Generics;
     }
 
-    public void Execute()
+    public async Task ExecuteAsync()
     {
         Executer executer = new(Tasks);
-        executer.Execute();
+        await executer.ExecuteAsync();
     }
     public void Syntetize() => throw new NotImplementedException();
     public void Syntetize(string[] RawArchitecture)
