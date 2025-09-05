@@ -204,16 +204,16 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                 (leftVariable.Type == DATATYPES.INTEGER || leftVariable.Type == DATATYPES.NATURAL) &&
                 (rightVariable.Type == DATATYPES.INTEGER || rightVariable.Type == DATATYPES.NATURAL)
             ){
-                result = SolveIntOperation((int)leftVariable.Value, (int)rightVariable.Value);
+                result = SolveIntOperation(int.Parse((string)leftVariable.Value), int.Parse((string)rightVariable.Value));
             }else
                 throw new InvalidOperationException("The datatypes do not match");
         }else{
             switch(leftVariable.Type){
                 case DATATYPES.INTEGER:
-                    result = SolveIntOperation((int)leftVariable.Value, (int)rightVariable.Value);
+                    result = SolveIntOperation(int.Parse((string)leftVariable.Value), int.Parse((string)rightVariable.Value));
                 break;
                 case DATATYPES.NATURAL:
-                    result = SolveRealOperation((double)leftVariable.Value, (double)rightVariable.Value);
+                    result = SolveRealOperation(double.Parse((string)leftVariable.Value), double.Parse((string)rightVariable.Value));
                 break;
             }
         }

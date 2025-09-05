@@ -44,18 +44,18 @@ public class Architecture : ISControl, IControl
     public void Syntetize() => throw new NotImplementedException();
     public void Syntetize(string[] RawArchitecture)
     {
-        RawArchitecture.ToList().ForEach(p => _tokenizer.TokenizeLine(p));
+        RawArchitecture.ToList().ForEach(_tokenizer.TokenizeLine);
         _tokenizer.Evaluate();
         _streamer = new(_tokenizer.GetDictionaryType());
         var tokens = _tokenizer.GetDictionaryType();
         _streamer.Expect(KEYWORDS);
         Name = _streamer.Current?.Value ?? string.Empty;
         _streamer.Expect(IDENTIFIERS);
-        _streamer.Expect(KEYWORDS); // off
+        _streamer.Expect(KEYWORDS); // of
         EntityName = _streamer.Current?.Value ?? string.Empty;
         _streamer.Expect(IDENTIFIERS);
         _streamer.Expect(KEYWORDS); // is
-        VariableSyntetizer syntetizer = new(_streamer, new());
+        VariableSyntetizer syntetizer = new(_streamer, [.._ports, .._generics], IsSignal: true);
         syntetizer.Syntetize();
         _signals = syntetizer.Variables;
         _streamer.Expect(KEYWORDS); // begin

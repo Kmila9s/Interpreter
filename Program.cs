@@ -106,7 +106,7 @@ end Behavioral;
         }
         foreach(var entity in Entities){
             Console.WriteLine(entity);
-            entity.Execute();
+            //entity.Execute();
             Console.WriteLine(entity);
         }
     }

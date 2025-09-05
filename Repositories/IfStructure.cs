@@ -20,13 +20,13 @@ public class IfStructure : ISControl
         _variables = Variables;
         _streamer = Tokenizer;
     }
-    public void Execute()
+    public async Task ExecuteAsync()
     {
         var result = _baseCondition.Execute() as Variable;
         if (result?.Value is bool condition && condition)
         {
             Executer executer = new(Tasks);
-            executer.Execute();
+            await executer.ExecuteAsync();
         }   
     }
     public void Syntetize()

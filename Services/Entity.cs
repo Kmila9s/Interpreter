@@ -15,9 +15,9 @@ public class Entity : ISControl, IControl{
     public Entity() { }
     public Entity(string[] RawEntity) { Syntetize(RawEntity); }
     public Entity(string Name) { this.Name = Name; }
-    public void Execute() {
+    public async Task ExecuteAsync() {
         if(Architecture != null){
-            Architecture.Execute();
+            await Architecture.ExecuteAsync();
         }
     }
     public void Syntetize(){
@@ -46,12 +46,12 @@ public class Entity : ISControl, IControl{
             switch (type)
             {
                 case "generic":
-                    syntetizer = new(_streamer, new(), false, true);
+                    syntetizer = new(_streamer, Ports, false, true);
                     syntetizer.Syntetize();
                     Generics = syntetizer.Variables;
                     break;
                 case "port":
-                    syntetizer = new(_streamer, new(), true, false);
+                    syntetizer = new(_streamer, Generics, true, false);
                     syntetizer.Syntetize();
                     Ports = syntetizer.Variables;
                     break;
