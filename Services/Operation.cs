@@ -14,7 +14,9 @@ public class Operation : IOperation {
     public HashSet<Variable> Variables { get; private set; }
     private readonly Regex _variableRegex, _operators, _logicOperators, _arithOperators;
     private readonly LiteralsFinder _finder;
-    public Operation(string RawData, HashSet<Variable> Variables){
+    private string _rawData = string.Empty;
+    public Operation(string RawData, HashSet<Variable> Variables)
+    {
         RegexOptions optionsCompiled = RegexOptions.Compiled;
         this.Variables = Variables;
         _variableRegex = new(Constants.IDENTIFIERS, optionsCompiled);
@@ -22,8 +24,10 @@ public class Operation : IOperation {
         _logicOperators = new(Constants.LOGIC_OPERATORS, optionsCompiled);
         _arithOperators = new(Constants.ARITH_OPERATORS, optionsCompiled);
         _finder = new();
+        RawData = _rawData;
         Tokenizer tokenizer = new(string.Empty);
-        if(RawData.Contains("<=")){
+        if (RawData.Contains("<="))
+        {
             var splitted = RawData.Trim().Split("<=");
             Result = this.Variables.First(p => p.Name.Equals(splitted[0].Trim()));
             RawData = splitted[1].Trim();
@@ -35,7 +39,7 @@ public class Operation : IOperation {
     public object Execute(){
         Stack<Variable> variables = new();
         if (Result.PortType == Constants.PortType.IN)
-            throw new InvalidOperationException("Input ports are not elegible for assignations");
+            throw new InvalidOperationException($"Input ports are not elegible for assignations: {Result.Name}");
 
         foreach(var item in Items){
             if(item is Variable newVar){
@@ -60,7 +64,7 @@ public class Operation : IOperation {
             }
         }
         if (variables.Count != 1)
-            throw new InvalidOperationException("Malformed expression: stack not reduced to a single result.");
+            throw new InvalidOperationException($"Malformed expression: stack not reduced to a single result: {_rawData}");
         Result.Value = variables.Pop().Value;
         return Result;
     }

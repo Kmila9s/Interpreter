@@ -38,11 +38,11 @@ public class VariableSyntetizer : ISControl
                     _streamer.MoveNext();
                 if (Variables.Contains(varName))
                 {
-                    throw new ParserException(Constants.ParseExceptions.DUPLICATE_DECLARATION);
+                    throw new ParserException(Constants.ParseExceptions.DUPLICATE_DECLARATION, (int)_streamer.Current?.Line + 1, (int)_streamer.Current?.Line + 1);
                 }
                 if (_comparator.Count > 0 && !_comparator.Contains(varName) && !_isPort && !_isSignal)
                 {
-                    throw new Exception($"Variable: {varName} not found in this scope");
+                    throw new Exception($"Variable: {varName} not found in this scope - {_streamer.Current?.Line + 1} : {_streamer.Current?.Col + 1}");
                 }
                 variables.Add(new() { Name = varName });
             }
@@ -140,7 +140,7 @@ public class VariableSyntetizer : ISControl
             varValue = _comparator.FirstOrDefault(p => p.Name == _streamer.Current?.Value!)?.Value!;
             if (varValue == null)
             {
-                throw new Exception($"Variable not found at: {_streamer.Current.Line} - {_streamer.Current.Col}");
+                throw new Exception($"Variable {_streamer.Current.Value} not found {_streamer.Current.Line + 1} : {_streamer.Current.Col + 1}");
             }
             _streamer.Expect(IDENTIFIERS);
         }

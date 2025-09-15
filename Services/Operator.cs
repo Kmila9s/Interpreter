@@ -206,7 +206,7 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             ){
                 result = SolveIntOperation(int.Parse((string)leftVariable.Value), int.Parse((string)rightVariable.Value));
             }else
-                throw new InvalidOperationException("The datatypes do not match");
+                throw new InvalidOperationException($"The datatypes do not match: {leftVariable.Name}:{leftVariable.Type} - {rightVariable.Name}:{rightVariable.Name}");
         }else{
             switch(leftVariable.Type){
                 case DATATYPES.INTEGER:
@@ -264,7 +264,7 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     private object SolveVectorLogicOperation(Variable v1, Variable v2)
     {
         if (v1.Size != v2.Size)
-            throw new ParserException("Vectors do not match in size");
+            throw new ParserException($"Vectors do not match in size: {v1.Name}:{v1.Size} - {v2.Name}{v1.Size}");
         string result = "",
         vectorString1 = (string)v1.Value,
         vectorString2 = (string)v2.Value;
