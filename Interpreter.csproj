@@ -3,15 +3,19 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFrameworks>net9.0;net9.0-android</TargetFrameworks>
-    <RuntimeIdentifiers>android-x64;android-arm64</RuntimeIdentifiers>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <AndroidUseAndroidX>true</AndroidUseAndroidX>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateRuntimeConfigDevFile>false</GenerateRuntimeConfigDevFile>
   </PropertyGroup>
-  <ItemGroup>
-    <ProjectReference Include="../Parser/Parser.csproj" />  
-  </ItemGroup>
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net9.0-android'">
+    <OutputType>Library</OutputType>
+    <UseAndroidX>true</UseAndroidX>
+  </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="../Parser/Parser.csproj" />  
     <ProjectReference Include="../TimeMachine/TimeMachine.csproj" />
   </ItemGroup>
 </Project>
