@@ -6,15 +6,36 @@ using Parser.Models;
 using Parser.Repositories;
 
 namespace Interpreter.Services;
+
+/// <summary>
+/// Represents an operation.
+/// </summary>
 public class Operation : IOperation {
+    /// <summary>
+    /// Gets the result of the operation.
+    /// </summary>
     public Variable Result { get; private set; } = new();
+
+    /// <summary>
+    /// Gets the items of the operation.
+    /// </summary>
     public object[] Items { get; private set; }
     private string[] _data;
     private int _currentSyntetizeIndex = 0;
+
+    /// <summary>
+    /// Gets the variables of the operation.
+    /// </summary>
     public HashSet<Variable> Variables { get; private set; }
     private readonly Regex _variableRegex, _operators, _logicOperators, _arithOperators;
     private readonly LiteralsFinder _finder;
     private string _rawData = string.Empty;
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="Operation"/> class.
+    /// </summary>
+    /// <param name="RawData">The raw data of the operation.</param>
+    /// <param name="Variables">The variables of the operation.</param>
     public Operation(string RawData, HashSet<Variable> Variables)
     {
         RegexOptions optionsCompiled = RegexOptions.Compiled;
@@ -36,6 +57,11 @@ public class Operation : IOperation {
         ShuntingYard shuntingYard = new(Syntetize().ToList());
         Items = shuntingYard.Result.ToArray();
     }
+
+    /// <summary>
+    /// Executes the operation.
+    /// </summary>
+    /// <returns>The result of the operation.</returns>
     public object Execute(){
         Stack<Variable> variables = new();
         if (Result.PortType == Constants.PortType.IN)
@@ -69,9 +95,26 @@ public class Operation : IOperation {
         return Result;
     }
 
+    /// <summary>
+    /// Executes the operation.
+    /// </summary>
+    /// <param name="Items">The items of the operation.</param>
+    /// <param name="CurrentIndex">The current index of the operation.</param>
+    /// <returns>The result of the operation.</returns>
     public object Execute(object[] Items, int CurrentIndex = 0) => throw new NotImplementedException();
+
+    /// <summary>
+    /// Executes the operation.
+    /// </summary>
+    /// <param name="leftSideOperator">The left side operator of the operation.</param>
+    /// <param name="rightSideOperator">The right side operator of the operation.</param>
+    /// <returns>The result of the operation.</returns>
     public object Execute(Variable leftSideOperator, Variable rightSideOperator) => throw new NotImplementedException();
     
+    /// <summary>
+    /// Synthesizes the operation.
+    /// </summary>
+    /// <returns>The synthesized operation.</returns>
     public object[] Syntetize(){
         List<object> items = new();
         bool isComparation = false;

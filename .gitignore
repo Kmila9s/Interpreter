@@ -5,3 +5,4 @@ bin/
 launch.json
 task.json
 *.cs.*
+.codeviz/

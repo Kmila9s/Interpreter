@@ -7,27 +7,62 @@ using Parser.Repositories;
 using static Parser.Models.Constants.TYPE;
 namespace Interpreter.Services;
 
+/// <summary>
+/// Represents a VHDL architecture.
+/// </summary>
 public class Architecture : ISControl, IControl
 {
+    /// <summary>
+    /// Gets the name of the architecture.
+    /// </summary>
     public string Name { get; private set; } = string.Empty;
+
+    /// <summary>
+    /// Gets the name of the entity.
+    /// </summary>
     public string EntityName { get; private set; } = string.Empty;
     private readonly HashSet<Variable> _ports = new(), _generics = new();
     private HashSet<Variable> _signals = new();
+
+    /// <summary>
+    /// Gets the list of tasks.
+    /// </summary>
     public List<object> Tasks { get; private set; } = new();
     private Tokenizer _tokenizer = new(string.Empty);
     private TokenStream _streamer = default!;
     private readonly OperationDetector _detector = new();
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="Architecture"/> class.
+    /// </summary>
+    /// <param name="Ports">The ports of the entity.</param>
+    /// <param name="Generics">The generics of the entity.</param>
     public Architecture(HashSet<Variable> Ports, HashSet<Variable> Generics)
     {
         _ports = Ports;
         _generics = Generics;
     }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="Architecture"/> class.
+    /// </summary>
+    /// <param name="Name">The name of the architecture.</param>
+    /// <param name="Ports">The ports of the entity.</param>
+    /// <param name="Generics">The generics of the entity.</param>
     public Architecture(string Name, HashSet<Variable> Ports, HashSet<Variable> Generics)
     {
         this.Name = Name;
         _ports = Ports;
         _generics = Generics;
     }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="Architecture"/> class.
+    /// </summary>
+    /// <param name="EntityName">The name of the entity.</param>
+    /// <param name="Name">The name of the architecture.</param>
+    /// <param name="Ports">The ports of the entity.</param>
+    /// <param name="Generics">The generics of the entity.</param>
     public Architecture(string EntityName, string Name, HashSet<Variable> Ports, HashSet<Variable> Generics)
     {
         this.EntityName = EntityName;
@@ -36,12 +71,25 @@ public class Architecture : ISControl, IControl
         _generics = Generics;
     }
 
+    /// <summary>
+    /// Executes the architecture asynchronously.
+    /// </summary>
+    /// <returns>A task representing the asynchronous operation.</returns>
     public async Task ExecuteAsync()
     {
         Executer executer = new(Tasks);
         await executer.ExecuteAsync();
     }
+
+    /// <summary>
+    /// Synthesizes the architecture.
+    /// </summary>
     public void Syntetize() => throw new NotImplementedException();
+
+    /// <summary>
+    /// Synthesizes the architecture from raw data.
+    /// </summary>
+    /// <param name="RawArchitecture">The raw data of the architecture.</param>
     public void Syntetize(string[] RawArchitecture)
     {
         RawArchitecture.ToList().ForEach(_tokenizer.TokenizeLine);
@@ -61,6 +109,10 @@ public class Architecture : ISControl, IControl
         _streamer.Expect(KEYWORDS); // begin
         SyntetizeBehaviour();
     }
+
+    /// <summary>
+    /// Synthesizes the behavior of the architecture.
+    /// </summary>
     public void SyntetizeBehaviour()
     {
         while (_streamer.Current?.Value.ToLower() != "end")
@@ -90,6 +142,10 @@ public class Architecture : ISControl, IControl
             }
         }
     }
+
+    /// <summary>
+    /// Synthesizes a process.
+    /// </summary>
     public void SyntetizeProcess()
     {
         _streamer.Expect(KEYWORDS); // process
@@ -98,6 +154,10 @@ public class Architecture : ISControl, IControl
             
         }
     }
+
+    /// <summary>
+    /// Synthesizes the assignations.
+    /// </summary>
     public void SyntetizeAssingations()
     {
         var rawDataBuilder = new StringBuilder();
@@ -121,5 +181,10 @@ public class Architecture : ISControl, IControl
                 break;
         }
     }
+
+    /// <summary>
+    /// Synthesizes the behavior of the architecture from raw data.
+    /// </summary>
+    /// <param name="Behaviour">The raw data of the behavior.</param>
     public void SyntetizeBehaviour(string[] Behaviour) => throw new NotImplementedException();
 }

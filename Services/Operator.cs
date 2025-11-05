@@ -6,11 +6,31 @@ using Parser.Models;
 using static Parser.Models.Constants;
 
 namespace Interpreter.Services;
+
+/// <summary>
+/// Represents an operator.
+/// </summary>
 public class Operator : IOperation, ILogicOperation, IArithOperation{
+    /// <summary>
+    /// Gets the type of the operator.
+    /// </summary>
     public OperatorType OperatorType { get; private set; }
+
+    /// <summary>
+    /// Gets the precedence of the operator.
+    /// </summary>
     public object Precedence { get; private set; } = new();
     private readonly Regex _assignationRegex, _arithRegex, _logicRegex, _comparationRegex;
+
+    /// <summary>
+    /// Gets the name of the operator.
+    /// </summary>
     public string OperatorName { get; private set; } = string.Empty;
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="Operator"/> class.
+    /// </summary>
+    /// <param name="Operator">The name of the operator.</param>
     public Operator(string Operator){
         this.OperatorName = Operator;
         RegexOptions options = RegexOptions.Compiled | RegexOptions.IgnoreCase;
@@ -21,6 +41,11 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         this.OperatorType = DefineOperatorType(Operator);
         DefinePrecedence(Operator);
     }
+
+    /// <summary>
+    /// Defines the precedence of the operator.
+    /// </summary>
+    /// <param name="Operator">The name of the operator.</param>
     private void DefinePrecedence(string Operator){
         switch(this.OperatorType){
             case OperatorType.LOGIC_OPERATION:
@@ -85,6 +110,12 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                 throw new NotImplementedException();
         }
     }
+
+    /// <summary>
+    /// Defines the type of the operator.
+    /// </summary>
+    /// <param name="Operator">The name of the operator.</param>
+    /// <returns>The type of the operator.</returns>
     private OperatorType DefineOperatorType(string Operator) =>
         _comparationRegex.IsMatch(Operator) ?
             OperatorType.COMPARATION :
@@ -96,12 +127,37 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             OperatorType.LOGIC_OPERATION :
         
             OperatorType.UNKNOWN;
+
+    /// <summary>
+    /// Executes the operation.
+    /// </summary>
+    /// <returns>The result of the operation.</returns>
     public object Execute() => throw new NotImplementedException();
+
+    /// <summary>
+    /// Executes the operation.
+    /// </summary>
+    /// <param name="array">The array of items.</param>
+    /// <param name="index">The index of the item.</param>
+    /// <returns>The result of the operation.</returns>
     public object Execute(object[] array, int index) => throw new NotImplementedException();
+
+    /// <summary>
+    /// Executes the operation.
+    /// </summary>
+    /// <param name="variable">The variable.</param>
+    /// <returns>The result of the operation.</returns>
     public object Execute(Variable variable) =>
         (PrecedencesLogicOperators)Precedence == PrecedencesLogicOperators.NOT ?
             SolveLogicOperation(variable) :
             new NotImplementedException();
+
+    /// <summary>
+    /// Executes the operation.
+    /// </summary>
+    /// <param name="leftSideOperator">The left side operator.</param>
+    /// <param name="rightSideOperator">The right side operator.</param>
+    /// <returns>The result of the operation.</returns>
     public object Execute(Variable leftSideOperator, Variable rightSideOperator){
         if(leftSideOperator.Type != rightSideOperator.Type)
             throw new ParserException("Datatypes do not match");
@@ -132,6 +188,13 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         }
         return result;
     }
+
+    /// <summary>
+    /// Solves a comparation operation.
+    /// </summary>
+    /// <param name="var1">The first variable.</param>
+    /// <param name="var2">The second variable.</param>
+    /// <returns>The result of the comparation.</returns>
     public object SolveComparation(Variable var1, Variable var2)
     {
         switch (var1.Type)
@@ -168,6 +231,12 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         }
     }
 
+    /// <summary>
+    /// Solves a logic operation.
+    /// </summary>
+    /// <param name="var1">The first variable.</param>
+    /// <param name="var2">The second variable.</param>
+    /// <returns>The result of the logic operation.</returns>
     public object SolveLogicOperation(Variable var1, Variable var2)
     {
         char a = Convert.ToChar(var1.Value?.ToString()?.Replace("'", "") ?? throw new Exception("Malformed data"));
@@ -196,7 +265,20 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         }
         return result;
     }
+
+    /// <summary>
+    /// Solves an arithmetic operation.
+    /// </summary>
+    /// <param name="variable">The variable.</param>
+    /// <returns>The result of the arithmetic operation.</returns>
     public object SolveArithOperation(Variable variable) => throw new NotImplementedException();
+
+    /// <summary>
+    /// Solves an arithmetic operation.
+    /// </summary>
+    /// <param name="leftVariable">The left variable.</param>
+    /// <param name="rightVariable">The right variable.</param>
+    /// <returns>The result of the arithmetic operation.</returns>
     public object SolveArithOperation(Variable leftVariable, Variable rightVariable){
         object result = new();
         if(leftVariable.Type != rightVariable.Type){
@@ -219,6 +301,13 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         }
         return result;
     }
+
+    /// <summary>
+    /// Solves an integer operation.
+    /// </summary>
+    /// <param name="leftVariable">The left variable.</param>
+    /// <param name="rightVariable">The right variable.</param>
+    /// <returns>The result of the integer operation.</returns>
     public int SolveIntOperation(int leftVariable, int rightVariable){
         switch(OperatorName){
             case "+":
@@ -235,6 +324,13 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                 return 0;
         }
     }
+
+    /// <summary>
+    /// Solves a real operation.
+    /// </summary>
+    /// <param name="leftVariable">The left variable.</param>
+    /// <param name="rightVariable">The right variable.</param>
+    /// <returns>The result of the real operation.</returns>
     public double SolveRealOperation(double leftVariable, double rightVariable){
         switch(OperatorName){
             case "+":
@@ -251,6 +347,12 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                 return 0;
         }
     }
+
+    /// <summary>
+    /// Solves a logic operation.
+    /// </summary>
+    /// <param name="variable">The variable.</param>
+    /// <returns>The result of the logic operation.</returns>
     public object SolveLogicOperation(Variable variable){
         object result = new();
         char item = Convert.ToChar(variable.Value);
@@ -261,6 +363,13 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         }
         return result;
     }
+
+    /// <summary>
+    /// Solves a vector logic operation.
+    /// </summary>
+    /// <param name="v1">The first vector.</param>
+    /// <param name="v2">The second vector.</param>
+    /// <returns>The result of the vector logic operation.</returns>
     private object SolveVectorLogicOperation(Variable v1, Variable v2)
     {
         if (v1.Size != v2.Size)

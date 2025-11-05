@@ -4,13 +4,29 @@ using Parser.Repositories;
 using static Parser.Models.Constants.TYPE;
 namespace Interpreter.Services;
 
+/// <summary>
+/// Synthesizes variables from a token stream.
+/// </summary>
 public class VariableSyntetizer : ISControl
 {
+    /// <summary>
+    /// Gets the synthesized variables.
+    /// </summary>
     public HashSet<Variable> Variables { get; private set; } = new();
     private HashSet<Variable> _comparator;
     private readonly string _breaker = "begin";
     private bool _isPort, _isGeneric, _isSignal;
     private TokenStream _streamer;
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="VariableSyntetizer"/> class.
+    /// </summary>
+    /// <param name="Streamer">The token stream.</param>
+    /// <param name="Comparator">The set of variables to compare against.</param>
+    /// <param name="IsPort">Whether the variable is a port.</param>
+    /// <param name="IsGeneric">Whether the variable is a generic.</param>
+    /// <param name="Breaker">The token that breaks the synthesis.</param>
+    /// <param name="IsSignal">Whether the variable is a signal.</param>
     public VariableSyntetizer(TokenStream Streamer, HashSet<Variable> Comparator, bool IsPort = false, bool IsGeneric = false, string Breaker = "begin", bool IsSignal = false)
     {
         _streamer = Streamer;
@@ -20,8 +36,22 @@ public class VariableSyntetizer : ISControl
         _comparator = Comparator;
         _breaker = _isPort || _isGeneric ? ")" : Breaker.ToLower();
     }
+
+    /// <summary>
+    /// Executes the variable synthesizer asynchronously.
+    /// </summary>
+    /// <returns>A task representing the asynchronous operation.</returns>
     public async Task ExecuteAsync() => throw new NotImplementedException();
+
+    /// <summary>
+    /// Synthesizes the variables from a token stream.
+    /// </summary>
+    /// <param name="strings">The token stream.</param>
     public void Syntetize(string[] strings) => ExecuteAsync();
+
+    /// <summary>
+    /// Synthesizes the variables from a token stream.
+    /// </summary>
     public void Syntetize()
     {
         while (_breaker != _streamer.Current?.Value.ToLower())
@@ -106,6 +136,11 @@ public class VariableSyntetizer : ISControl
             _streamer.Expect(OPERATORS); // ;
         }
     }
+
+    /// <summary>
+    /// Gets the value of a variable.
+    /// </summary>
+    /// <returns>The value of the variable.</returns>
     private object GetVariableValue() {
         object varValue = null!;
         _streamer.SetRollBack();

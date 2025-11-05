@@ -2,14 +2,31 @@ using Interpreter.Services;
 using Parser.Models;
 
 namespace Interpreter.Repositories;
+
+/// <summary>
+/// Implements the Shunting-yard algorithm to convert infix notation to postfix notation.
+/// </summary>
 public class ShuntingYard {
     private Stack<Operator> _operators = new();
     private readonly List<object> _items = new();
+
+    /// <summary>
+    /// Gets the result of the Shunting-yard algorithm in postfix notation.
+    /// </summary>
     public List<object> Result { get; private set; } = new();
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="ShuntingYard"/> class.
+    /// </summary>
+    /// <param name="BaseItems">The list of items in infix notation.</param>
     public ShuntingYard(List<object> BaseItems) { 
         _items = BaseItems; 
         OrderPrecedenceList();
     }
+
+    /// <summary>
+    /// Orders the precedence of the operators in the list.
+    /// </summary>
     private void OrderPrecedenceList(){
         foreach (var item in _items){
             if(item is Variable) Result.Add(item);
