@@ -8,8 +8,23 @@ using static Parser.Models.Constants.TYPE;
 namespace Interpreter.Services;
 
 /// <summary>
-/// Represents a VHDL architecture.
+/// Represents a VHDL architecture and manages its behavioral synthesis and execution.
 /// </summary>
+/// <remarks>
+/// <para>The Architecture class is responsible for:</para>
+/// <list type="bullet">
+/// <item>Parsing signal declarations from the architecture's declarative region</item>
+/// <item>Synthesizing behavioral statements (processes, concurrent assignments, component instantiations)</item>
+/// <item>Managing labeled statements (labeled processes, generate blocks)</item>
+/// <item>Coordinating the execution of all architectural tasks</item>
+/// </list>
+/// <para><strong>v0.15.0 Improvements:</strong></para>
+/// <list type="bullet">
+/// <item>Added support for labeled component instantiation (label : ComponentName port map (...))</item>
+/// <item>Enhanced labeled statement detection for process, for-generate, if-generate</item>
+/// <item>Added SkipComponentInstantiation() for structural VHDL constructs</item>
+/// </list>
+/// </remarks>
 public class Architecture : ISControl, IControl
 {
     /// <summary>
@@ -117,9 +132,56 @@ public class Architecture : ISControl, IControl
     {
         while (_streamer.Current?.Value.ToLower() != "end")
         {
+            List<Variable> comparators = [.. _ports, .. _generics, .. _signals];
+
+            // Check for labeled statements (label : process/for/if/etc or component instantiation)
+            if (_streamer.Current?.Type == IDENTIFIERS)
+            {
+                _streamer.SetRollBack();
+                _streamer.MoveNext();
+                if (_streamer.Current?.Value == ":")
+                {
+                    _streamer.MoveNext(); // consume ':'
+                    // Now check what follows the label
+                    if (_streamer.Current?.Type == KEYWORDS)
+                    {
+                        string keyword = _streamer.Current.Value.ToLower();
+                        switch (keyword)
+                        {
+                            case "process":
+                                Process process = new(comparators.ToHashSet(), _streamer);
+                                process.Syntetize();
+                                Tasks.Add(process);
+                                continue;
+                            case "for":
+                                // For generate - skip for now
+                                SkipGenerateOrLoop();
+                                continue;
+                            case "if":
+                                // If generate - skip for now
+                                SkipGenerateOrLoop();
+                                continue;
+                            default:
+                                _streamer.MoveNext();
+                                continue;
+                        }
+                    }
+                    else if (_streamer.Current?.Type == IDENTIFIERS)
+                    {
+                        // Component instantiation: label : ComponentName [generic map (...)] port map (...)
+                        SkipComponentInstantiation();
+                        continue;
+                    }
+                }
+                else
+                {
+                    // Not a label, roll back
+                    _streamer.RollBack();
+                }
+            }
+
             if (_streamer.Current?.Type == KEYWORDS)
             {
-                List<Variable> comparators = [.. _ports, .. _generics, .. _signals];
                 // FOR COMPLEX BEHAVIOURS
                 switch (_streamer.Current.Value.ToLower())
                 {
@@ -127,18 +189,118 @@ public class Architecture : ISControl, IControl
                         Process process = new(comparators.ToHashSet(), _streamer);
                         process.Syntetize();
                         Tasks.Add(process);
-                    break;
+                        break;
                     case "if":
                         IfStructure ifStructure = new(comparators.ToHashSet(), _streamer);
                         ifStructure.Syntetize();
                         Tasks.Add(ifStructure);
-                    break;
+                        // Consume 'end if ;' after the if structure
+                        ConsumeEndIf();
+                        break;
+                    default:
+                        // Skip unknown keywords
+                        _streamer.MoveNext();
+                        break;
                 }
             }
             else
             {
                 // FOR SIMPLE ASSIGNATIONS
                 SyntetizeAssingations();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Skips a generate or loop construct (for now).
+    /// </summary>
+    private void SkipGenerateOrLoop()
+    {
+        int depth = 1;
+        string startKeyword = _streamer.Current?.Value.ToLower() ?? "";
+        _streamer.MoveNext(); // consume the starting keyword
+
+        while (_streamer.Current != null && depth > 0)
+        {
+            string currentVal = _streamer.Current.Value.ToLower();
+            if (currentVal == "for" || currentVal == "if" || currentVal == "process" || currentVal == "loop")
+            {
+                depth++;
+            }
+            else if (currentVal == "end")
+            {
+                _streamer.MoveNext(); // consume 'end'
+                string endWhat = _streamer.Current?.Value.ToLower() ?? "";
+                if (endWhat == "generate" || endWhat == "loop" || endWhat == "for" || endWhat == "if" || endWhat == "process")
+                {
+                    depth--;
+                    _streamer.MoveNext(); // consume the end type
+                    // Handle optional label after 'end generate label'
+                    if (_streamer.Current?.Type == IDENTIFIERS)
+                        _streamer.MoveNext();
+                    if (_streamer.Current?.Value == ";")
+                        _streamer.MoveNext();
+                    continue;
+                }
+            }
+            _streamer.MoveNext();
+        }
+    }
+
+    /// <summary>
+    /// Skips a component instantiation statement.
+    /// Handles the pattern: label : ComponentName [generic map (...)] port map (...) ;
+    /// Added in v0.15.0 to support component instantiation syntax.
+    /// </summary>
+    /// <remarks>
+    /// Component instantiation connects an entity/component to signals in the architecture.
+    /// For simulation purposes, we skip these declarations as the interpreter focuses on
+    /// behavioral execution rather than structural hierarchy.
+    /// </remarks>
+    private void SkipComponentInstantiation()
+    {
+        // Current is at the ComponentName (IDENTIFIER)
+        _streamer.MoveNext(); // consume component name
+
+        // Skip until we find the semicolon that ends the instantiation
+        // The pattern is: [generic map (...)] port map (...) ;
+        // Track parenthesis depth to handle nested expressions in port maps
+        int parenDepth = 0;
+        while (_streamer.Current != null)
+        {
+            string currentVal = _streamer.Current.Value;
+            if (currentVal == "(")
+            {
+                parenDepth++;
+            }
+            else if (currentVal == ")")
+            {
+                parenDepth--;
+            }
+            else if (currentVal == ";" && parenDepth == 0)
+            {
+                _streamer.MoveNext(); // consume ';'
+                break;
+            }
+            _streamer.MoveNext();
+        }
+    }
+
+    /// <summary>
+    /// Consumes the 'end if ;' tokens after an if structure.
+    /// </summary>
+    private void ConsumeEndIf()
+    {
+        if (_streamer.Current?.Value.ToLower() == "end")
+        {
+            _streamer.MoveNext(); // consume 'end'
+            if (_streamer.Current?.Value.ToLower() == "if")
+            {
+                _streamer.MoveNext(); // consume 'if'
+            }
+            if (_streamer.Current?.Value == ";")
+            {
+                _streamer.MoveNext(); // consume ';'
             }
         }
     }
@@ -161,7 +323,7 @@ public class Architecture : ISControl, IControl
     public void SyntetizeAssingations()
     {
         var rawDataBuilder = new StringBuilder();
-        while (_streamer.Current?.Value != "then")
+        while (_streamer.Current?.Value != ";")
         {
             rawDataBuilder.Append(_streamer.Current?.Value + " ");
             _streamer.MoveNext();

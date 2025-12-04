@@ -9,20 +9,70 @@ using static Parser.Models.Constants.TYPE;
 namespace Interpreter.Repositories;
 
 /// <summary>
+/// Represents a single branch (if, elsif, or else) of a VHDL if statement.
+/// </summary>
+public class IfBranch
+{
+    /// <summary>
+    /// Gets or sets the condition operation for this branch. Null for else branches.
+    /// </summary>
+    public Operation? Condition { get; set; }
+
+    /// <summary>
+    /// Gets or sets the list of tasks to execute when this branch is taken.
+    /// </summary>
+    public List<object> Tasks { get; set; } = new();
+
+    /// <summary>
+    /// Gets or sets whether this is an else branch (no condition).
+    /// </summary>
+    public bool IsElse { get; set; } = false;
+}
+
+/// <summary>
 /// Represents and manages the logic for a VHDL 'if' statement.
 /// It synthesizes the condition and the execution block, and executes it if the condition is met.
+/// Supports full if-elsif-else-end if structure.
 /// </summary>
+/// <remarks>
+/// <para><strong>Supported VHDL Syntax:</strong></para>
+/// <code>
+/// if condition1 then
+///     statements;
+/// elsif condition2 then
+///     statements;
+/// else
+///     statements;
+/// end if;
+/// </code>
+/// <para><strong>v0.15.0 Improvements:</strong></para>
+/// <list type="bullet">
+/// <item>Added support for nested case statements within if/elsif/else branches</item>
+/// <item>Unified ConsumeEndIf() to generic ConsumeEndKeyword() for if and case structures</item>
+/// <item>Enhanced branch body synthesis to handle case keyword</item>
+/// </list>
+/// <para><strong>Design:</strong></para>
+/// <para>
+/// Uses a flat list of IfBranch objects rather than recursive structure for better
+/// maintainability and execution control. Each branch contains its condition (or IsElse flag)
+/// and list of tasks to execute.
+/// </para>
+/// </remarks>
 public class IfStructure : ISControl
 {
     private readonly HashSet<Variable> _variables = new();
     private readonly TokenStream _streamer;
     private readonly OperationDetector _detector = new();
-    private Operation _baseCondition = default!;
 
     /// <summary>
     /// Gets the list of tasks or operations to be executed if the condition is true.
     /// </summary>
     public List<object> Tasks { get; private set; } = new();
+
+    /// <summary>
+    /// All branches (if, elsif*, else?) in order.
+    /// </summary>
+    public List<IfBranch> Branches { get; private set; } = new();
 
     /// <summary>
     /// Initializes a new instance of the <see cref="IfStructure"/> class.
@@ -36,81 +86,260 @@ public class IfStructure : ISControl
     }
 
     /// <summary>
-    /// Executes the if structure asynchronously. It evaluates the base condition and, if true,
-    /// executes the tasks within the if block.
+    /// Executes the if structure asynchronously. It evaluates conditions in order
+    /// and executes the first branch whose condition is true (or the else branch).
     /// </summary>
     public async Task ExecuteAsync()
     {
-        var result = _baseCondition.Execute() as Variable;
-        if (result?.Value is bool condition && condition)
+        foreach (var branch in Branches)
         {
-            Executer executer = new(Tasks);
-            await executer.ExecuteAsync();
-        }   
+            // Else branch - always execute if we reach it
+            if (branch.IsElse)
+            {
+                Executer executer = new(branch.Tasks);
+                await executer.ExecuteAsync();
+                return;
+            }
+
+            // Evaluate condition
+            if (branch.Condition != null)
+            {
+                var result = branch.Condition.Execute() as Variable;
+                if (result?.Value is bool condition && condition)
+                {
+                    Executer executer = new(branch.Tasks);
+                    await executer.ExecuteAsync();
+                    return;
+                }
+            }
+        }
     }
 
     /// <summary>
-    /// Synthesizes the if structure from the token stream. It parses the condition part (up to 'then')
-    /// and then synthesizes the statements within the block until it finds an 'end' keyword.
+    /// Synthesizes the complete if structure from the token stream.
+    /// Handles if-elsif-else-end if as a single unit.
     /// </summary>
     public void Syntetize()
     {
-        _streamer.Expect(KEYWORDS);
-        string rawData = string.Empty;
-        while (_streamer.Current?.Value != "then")
+        // Parse the main 'if' branch
+        SyntetizeIfBranch();
+
+        // Continue parsing elsif and else branches
+        while (_streamer.Current != null)
         {
-            rawData += _streamer.Current?.Value + " ";
+            var currentValue = _streamer.Current.Value.ToLower();
+
+            if (currentValue == "elsif")
+            {
+                SyntetizeElsifBranch();
+            }
+            else if (currentValue == "else")
+            {
+                SyntetizeElseBranch();
+            }
+            else if (currentValue == "end")
+            {
+                // End of if structure - don't consume here, let caller handle it
+                break;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        // Also populate the Tasks list with the first branch for backwards compatibility
+        if (Branches.Count > 0)
+        {
+            Tasks = Branches[0].Tasks;
+        }
+    }
+
+    /// <summary>
+    /// Synthesizes the main 'if' branch.
+    /// </summary>
+    private void SyntetizeIfBranch()
+    {
+        _streamer.Expect(KEYWORDS); // consume 'if'
+
+        var branch = new IfBranch();
+
+        // Parse condition (up to 'then')
+        var rawDataBuilder = new StringBuilder();
+        while (_streamer.Current?.Value.ToLower() != "then")
+        {
+            rawDataBuilder.Append(_streamer.Current?.Value + " ");
             _streamer.MoveNext();
         }
-        _streamer.Expect(KEYWORDS); // then
-        _baseCondition = new(rawData, _variables);
-        while (_streamer.Current?.Value.ToLower() != "end")
+        _streamer.Expect(KEYWORDS); // consume 'then'
+
+        string conditionRaw = rawDataBuilder.ToString().Trim();
+        branch.Condition = new Operation(conditionRaw, _variables);
+
+        // Parse body
+        SyntetizeBranchBody(branch);
+
+        Branches.Add(branch);
+    }
+
+    /// <summary>
+    /// Synthesizes an 'elsif' branch.
+    /// </summary>
+    private void SyntetizeElsifBranch()
+    {
+        _streamer.Expect(KEYWORDS); // consume 'elsif'
+
+        var branch = new IfBranch();
+
+        // Parse condition (up to 'then')
+        var rawDataBuilder = new StringBuilder();
+        while (_streamer.Current?.Value.ToLower() != "then")
         {
+            rawDataBuilder.Append(_streamer.Current?.Value + " ");
+            _streamer.MoveNext();
+        }
+        _streamer.Expect(KEYWORDS); // consume 'then'
+
+        string conditionRaw = rawDataBuilder.ToString().Trim();
+        branch.Condition = new Operation(conditionRaw, _variables);
+
+        // Parse body
+        SyntetizeBranchBody(branch);
+
+        Branches.Add(branch);
+    }
+
+    /// <summary>
+    /// Synthesizes the 'else' branch.
+    /// </summary>
+    private void SyntetizeElseBranch()
+    {
+        _streamer.Expect(KEYWORDS); // consume 'else'
+
+        var branch = new IfBranch { IsElse = true };
+
+        // Parse body
+        SyntetizeBranchBody(branch);
+
+        Branches.Add(branch);
+    }
+
+    /// <summary>
+    /// Synthesizes the body of a branch until 'elsif', 'else', or 'end' is found.
+    /// </summary>
+    private void SyntetizeBranchBody(IfBranch branch)
+    {
+        while (!IsEndOfBranch())
+        {
+            var currentValue = _streamer.Current?.Value.ToLower();
+
             if (_streamer.Current?.Type == KEYWORDS)
             {
-                // FOR COMPLEX BEHAVIOURS
-                switch (_streamer.Current.Value.ToLower())
+                switch (currentValue)
                 {
                     case "if":
-                    case "elsif":
-                        IfStructure ifStructure = new(_variables, _streamer);
-                        ifStructure.Syntetize();
-                        Tasks.Add(ifStructure);
+                        // Nested if statement - recursively parse and add to branch tasks
+                        IfStructure nestedIf = new(_variables, _streamer);
+                        nestedIf.Syntetize();
+                        branch.Tasks.Add(nestedIf);
+                        // Consume 'end if ;' tokens after nested structure
+                        ConsumeEndKeyword("if");
+                        break;
+
+                    case "case":
+                        // Nested case statement - allows case statements inside if/elsif/else branches
+                        // Added in v0.15.0 to support complex control flow nesting
+                        CaseStructure nestedCase = new(_variables, _streamer);
+                        nestedCase.Syntetize();
+                        branch.Tasks.Add(nestedCase);
+                        // Consume 'end case ;' tokens after nested structure
+                        ConsumeEndKeyword("case");
+                        break;
+
+                    default:
+                        // Other keywords - skip
+                        _streamer.MoveNext();
                         break;
                 }
             }
             else
             {
-                // FOR SIMPLE ASSIGNATIONS
-                SyntetizeAssingations();
+                // Simple assignations
+                SyntetizeAssingation(branch);
             }
         }
     }
 
     /// <summary>
-    /// Synthesizes simple assignment statements within the if block. It reads tokens until a semicolon
-    /// is found, determines the operation type, and adds it to the task list.
+    /// Checks if we've reached the end of the current branch (elsif, else, or end).
     /// </summary>
-    public void SyntetizeAssingations()
+    private bool IsEndOfBranch()
+    {
+        if (_streamer.Current == null) return true;
+
+        var currentValue = _streamer.Current.Value.ToLower();
+        return currentValue == "elsif" ||
+               currentValue == "else" ||
+               currentValue == "end";
+    }
+
+    /// <summary>
+    /// Consumes 'end keyword ;' tokens after a nested structure.
+    /// </summary>
+    private void ConsumeEndKeyword(string keyword)
+    {
+        if (_streamer.Current?.Value.ToLower() == "end")
+        {
+            _streamer.MoveNext(); // consume 'end'
+            if (_streamer.Current?.Value.ToLower() == keyword)
+            {
+                _streamer.MoveNext(); // consume keyword
+            }
+            if (_streamer.Current?.Value == ";")
+            {
+                _streamer.MoveNext(); // consume ';'
+            }
+        }
+    }
+
+    /// <summary>
+    /// Synthesizes a simple assignment statement within a branch.
+    /// </summary>
+    private void SyntetizeAssingation(IfBranch branch)
     {
         var rawDataBuilder = new StringBuilder();
-        while (_streamer.Current?.Value != ";")
+        while (_streamer.Current?.Value != ";" && !IsEndOfBranch())
         {
             rawDataBuilder.Append(_streamer.Current?.Value + " ");
             _streamer.MoveNext();
         }
+
         string operation = rawDataBuilder.ToString().Trim();
-        _streamer.MoveNext(); // ;
+        if (string.IsNullOrEmpty(operation)) return;
+
+        if (_streamer.Current?.Value == ";")
+        {
+            _streamer.MoveNext(); // consume ';'
+        }
+
         var type = _detector.GetOperationType(operation);
         switch (type)
         {
             case OperationType.ASSIGNATION:
-                Operation op;
-                // NEEDS CHANGE UP FOR AVOIDING OR SILENT EXCEPTIONS
-                // LIKE OUT OF INDEX ON VECTORS
-                op = new(operation, _variables);
-                Tasks.Add(op);
+                Operation op = new(operation, _variables);
+                branch.Tasks.Add(op);
                 break;
+        }
+    }
+
+    /// <summary>
+    /// Synthesizes simple assignment statements within the if block (for backwards compatibility).
+    /// </summary>
+    public void SyntetizeAssingations()
+    {
+        if (Branches.Count > 0)
+        {
+            SyntetizeAssingation(Branches[0]);
         }
     }
 

@@ -42,9 +42,14 @@ public class ShuntingYard {
                     if(_operators.Count > 0 && _operators.Peek().OperatorName == "(")
                         _operators.Pop(); // Discard the "("
                 }else{
+                    // v0.15.0 Fix: Use Convert.ToInt32() instead of direct cast for enum precedence
+                    // The Precedence property is typed as 'object' and can be either:
+                    // - PrecedencesLogicOperators (for AND, OR, NOT, etc.)
+                    // - PrecedencesArithOperators (for +, -, *, /, **, mod)
+                    // Direct casting (int) fails when the object contains an enum value
                     while(
                         _operators.Count > 0 &&
-                        (int)_operators.Peek().Precedence <= (int)operation.Precedence
+                        Convert.ToInt32(_operators.Peek().Precedence) <= Convert.ToInt32(operation.Precedence)
                     )
                         Result.Add(_operators.Pop());
                     _operators.Push(operation);

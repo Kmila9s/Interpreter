@@ -89,6 +89,9 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                     case "*":
                         Precedence = PrecedencesArithOperators.MULTIPLICATION;
                     break;
+                    case "**":
+                        Precedence = PrecedencesArithOperators.UNARY; // Power has high precedence
+                    break;
                     case "/":
                         Precedence = PrecedencesArithOperators.DIVISION;
                     break;
@@ -218,13 +221,29 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                     case "=":
                         return int.Parse((string)var1.Value) == int.Parse((string)var2.Value);
                     case "!=":
+                    case "/=":
                         return int.Parse((string)var1.Value) != int.Parse((string)var2.Value);
                     case ">":
                         return int.Parse((string)var1.Value) > int.Parse((string)var2.Value);
                     case "<":
-                        return int.Parse((string)var1.Value) == int.Parse((string)var2.Value);
+                        return int.Parse((string)var1.Value) < int.Parse((string)var2.Value);
+                    case ">=":
+                        return int.Parse((string)var1.Value) >= int.Parse((string)var2.Value);
+                    case "<=":
+                        return int.Parse((string)var1.Value) <= int.Parse((string)var2.Value);
                     default:
                         throw new Exception($"Operator type do not detected or even supported: {OperatorName}");
+                }
+            case DATATYPES.STD_LOGIC_VECTOR:
+                switch (OperatorName.ToLower())
+                {
+                    case "=":
+                        return ((string)var1.Value).Equals((string)var2.Value);
+                    case "!=":
+                    case "/=":
+                        return !((string)var1.Value).Equals((string)var2.Value);
+                    default:
+                        throw new Exception($"Operator type do not detected or even supported for vectors: {OperatorName}");
                 }
             default:
                 throw new Exception($"Datatype do not detected or even supported: {OperatorName}");
@@ -281,21 +300,42 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// <returns>The result of the arithmetic operation.</returns>
     public object SolveArithOperation(Variable leftVariable, Variable rightVariable){
         object result = new();
+        // Helper to safely get integer from variable value
+        int GetInt(Variable v) {
+            if (v.Value == null || v.Value.GetType() == typeof(object))
+            {
+                // Uninitialized variable - try to use 0 or parse name if it's a literal
+                if (int.TryParse(v.Name?.Replace("Literal-", "").Split('-')[0], out int parsed))
+                    return parsed;
+                return 0;
+            }
+            return Convert.ToInt32(v.Value);
+        }
+        double GetDouble(Variable v) {
+            if (v.Value == null || v.Value.GetType() == typeof(object))
+            {
+                if (double.TryParse(v.Name?.Replace("Literal-", "").Split('-')[0], out double parsed))
+                    return parsed;
+                return 0.0;
+            }
+            return Convert.ToDouble(v.Value);
+        }
+
         if(leftVariable.Type != rightVariable.Type){
             if(
                 (leftVariable.Type == DATATYPES.INTEGER || leftVariable.Type == DATATYPES.NATURAL) &&
                 (rightVariable.Type == DATATYPES.INTEGER || rightVariable.Type == DATATYPES.NATURAL)
             ){
-                result = SolveIntOperation(int.Parse((string)leftVariable.Value), int.Parse((string)rightVariable.Value));
+                result = SolveIntOperation(GetInt(leftVariable), GetInt(rightVariable));
             }else
                 throw new InvalidOperationException($"The datatypes do not match: {leftVariable.Name}:{leftVariable.Type} - {rightVariable.Name}:{rightVariable.Name}");
         }else{
             switch(leftVariable.Type){
                 case DATATYPES.INTEGER:
-                    result = SolveIntOperation(int.Parse((string)leftVariable.Value), int.Parse((string)rightVariable.Value));
+                    result = SolveIntOperation(GetInt(leftVariable), GetInt(rightVariable));
                 break;
                 case DATATYPES.NATURAL:
-                    result = SolveRealOperation(double.Parse((string)leftVariable.Value), double.Parse((string)rightVariable.Value));
+                    result = SolveRealOperation(GetDouble(leftVariable), GetDouble(rightVariable));
                 break;
             }
         }
@@ -316,6 +356,8 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                 return leftVariable - rightVariable;
             case "*":
                 return leftVariable * rightVariable;
+            case "**":
+                return (int)Math.Pow(leftVariable, rightVariable);
             case "/":
                 return leftVariable / rightVariable;
             case "mod":
@@ -339,6 +381,8 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                 return leftVariable - rightVariable;
             case "*":
                 return leftVariable * rightVariable;
+            case "**":
+                return Math.Pow(leftVariable, rightVariable);
             case "/":
                 return leftVariable / rightVariable;
             case "mod":
