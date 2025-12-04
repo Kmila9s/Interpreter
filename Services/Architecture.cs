@@ -18,7 +18,7 @@ namespace Interpreter.Services;
 /// <item>Managing labeled statements (labeled processes, generate blocks)</item>
 /// <item>Coordinating the execution of all architectural tasks</item>
 /// </list>
-/// <para><strong>v0.15.0 Improvements:</strong></para>
+/// <para><strong>v0.13.0 Improvements:</strong></para>
 /// <list type="bullet">
 /// <item>Added support for labeled component instantiation (label : ComponentName port map (...))</item>
 /// <item>Enhanced labeled statement detection for process, for-generate, if-generate</item>
@@ -250,7 +250,7 @@ public class Architecture : ISControl, IControl
     /// <summary>
     /// Skips a component instantiation statement.
     /// Handles the pattern: label : ComponentName [generic map (...)] port map (...) ;
-    /// Added in v0.15.0 to support component instantiation syntax.
+    /// Added in v0.13.0 to support component instantiation syntax.
     /// </summary>
     /// <remarks>
     /// Component instantiation connects an entity/component to signals in the architecture.

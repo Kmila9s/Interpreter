@@ -47,7 +47,7 @@ public class CaseWhenBranch
 /// <item>Multiple choice values per branch using '|' separator</item>
 /// <item>'when others =>' default/fallback branch</item>
 /// <item>Nested control structures (if, case, loops) within branches</item>
-/// <item>v0.15.0: Can be nested within if/elsif/else branches</item>
+/// <item>v0.13.0: Can be nested within if/elsif/else branches</item>
 /// </list>
 /// <para><strong>Design:</strong></para>
 /// <para>

@@ -117,7 +117,7 @@ public class Operation : IOperation {
             }
             else if(item is Operator op){
                 // Only treat as unary NOT if it's actually a logic operation with NOT precedence
-                // v0.15.0 Fix: Added type check to prevent ** (power) operator from being treated as NOT
+                // v0.13.0 Fix: Added type check to prevent ** (power) operator from being treated as NOT
                 // Issue: PrecedencesArithOperators.UNARY has value 0, same as PrecedencesLogicOperators.NOT
                 // Without type check, (int)PrecedencesArithOperators.UNARY == (int)PrecedencesLogicOperators.NOT
                 bool isUnaryNot = op.OperatorType == Constants.OperatorType.LOGIC_OPERATION &&
@@ -205,7 +205,7 @@ public class Operation : IOperation {
                 }
             }
 
-            // v0.15.0 Fix: Skip 'downto' and 'to' keywords - they're handled within ParseIndexedAccess
+            // v0.13.0 Fix: Skip 'downto' and 'to' keywords - they're handled within ParseIndexedAccess
             // but if we encounter them at the top level during expression synthesis, skip them
             // Example: signal(7 downto 0) - the 'downto' is not part of the arithmetic expression
             if (currentItem.ToLower() == "downto" || currentItem.ToLower() == "to")
@@ -214,7 +214,7 @@ public class Operation : IOperation {
                 continue;
             }
 
-            // v0.15.0 Fix: Skip 'when' and 'else' keywords for conditional signal assignments
+            // v0.13.0 Fix: Skip 'when' and 'else' keywords for conditional signal assignments
             // These are used in concurrent conditional assignments like:
             // signal <= value1 when condition1 else value2 when condition2 else default;
             // For simulation purposes, we use the first value and skip the conditional part

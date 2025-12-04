@@ -189,7 +189,7 @@ public class VariableSyntetizer : ISControl
                 if (_streamer.Current?.Value == "(")
                 {
                     // Parse vector range (7 downto 0) or (0 to 7)
-                    // For ports/generics, skip evaluation of complex expressions (v0.15.0 fix)
+                    // For ports/generics, skip evaluation of complex expressions (v0.13.0 fix)
                     // This prevents errors when expressions use generics or functions like clog2()
                     // Example: std_logic_vector((NUM_INPUTS * DATA_WIDTH) - 1 downto 0)
                     if (_isPort || _isGeneric)

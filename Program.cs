@@ -89,7 +89,7 @@ class Program
 
         bool inPackage = false;
         bool inConfiguration = false;
-        // v0.15.0 Fix: Track function/procedure nesting depth to prevent premature architecture end
+        // v0.13.0 Fix: Track function/procedure nesting depth to prevent premature architecture end
         // Issue: 'end FunctionName;' was being confused with 'end ArchitectureName;'
         // Solution: Count function/procedure starts and ends, only check for architecture end when depth is 0
         int funcProcDepth = 0;
@@ -170,7 +170,7 @@ class Program
             {
                 rawEntity.Add(item);
 
-                // v0.15.0 Fix: Track function/procedure depth to avoid premature architecture end detection
+                // v0.13.0 Fix: Track function/procedure depth to avoid premature architecture end detection
                 // When we see "function name(...) return type is" or "procedure name(...) is"
                 // increment the depth counter
                 if ((comparer.Contains("function ") && comparer.Contains(" is")) ||

@@ -16,7 +16,7 @@ namespace Interpreter.Services;
 /// <item><strong>Arithmetic:</strong> AddVectors(), SubtractVectors()</item>
 /// <item><strong>Synthesis Functions:</strong> clog2() - ceiling of log base 2</item>
 /// </list>
-/// <para><strong>v0.15.0 Improvements:</strong></para>
+/// <para><strong>v0.13.0 Improvements:</strong></para>
 /// <list type="bullet">
 /// <item>Enhanced ToInteger() with safety checks for 'U', 'X', 'Z' meta-values</item>
 /// <item>Added GetIntValue() and GetStringValue() helper methods for robust argument handling</item>
@@ -80,7 +80,7 @@ public static class StandardFunctions
 
     /// <summary>
     /// Converts std_logic_vector to integer.
-    /// v0.15.0: Enhanced with safety checks for uninitialized and invalid values.
+    /// v0.13.0: Enhanced with safety checks for uninitialized and invalid values.
     /// </summary>
     /// <param name="slv">The std_logic_vector string to convert (e.g., "1010", "U", "XXXX")</param>
     /// <returns>Integer representation, or 0 for invalid/uninitialized values</returns>
@@ -93,11 +93,11 @@ public static class StandardFunctions
     {
         string cleaned = slv.Replace("\"", "").Replace("'", "").Trim();
 
-        // v0.15.0 Fix: Handle empty or uninitialized values safely
+        // v0.13.0 Fix: Handle empty or uninitialized values safely
         if (string.IsNullOrEmpty(cleaned))
             return 0;
 
-        // v0.15.0 Fix: Handle VHDL meta-values 'U' (uninitialized), 'X' (unknown), 'Z' (high-impedance)
+        // v0.13.0 Fix: Handle VHDL meta-values 'U' (uninitialized), 'X' (unknown), 'Z' (high-impedance)
         // These cannot be converted to integers, so treat as 0
         if (cleaned.Contains('U') || cleaned.Contains('X') || cleaned.Contains('Z'))
             return 0;
@@ -107,7 +107,7 @@ public static class StandardFunctions
             return decimalValue;
 
         // Try to convert from binary (e.g., "1010" -> 10)
-        // v0.15.0 Fix: Added try-catch for robustness
+        // v0.13.0 Fix: Added try-catch for robustness
         try
         {
             return Convert.ToInt32(cleaned, 2);

@@ -45,7 +45,7 @@ public class IfBranch
 ///     statements;
 /// end if;
 /// </code>
-/// <para><strong>v0.15.0 Improvements:</strong></para>
+/// <para><strong>v0.13.0 Improvements:</strong></para>
 /// <list type="bullet">
 /// <item>Added support for nested case statements within if/elsif/else branches</item>
 /// <item>Unified ConsumeEndIf() to generic ConsumeEndKeyword() for if and case structures</item>
@@ -248,7 +248,7 @@ public class IfStructure : ISControl
 
                     case "case":
                         // Nested case statement - allows case statements inside if/elsif/else branches
-                        // Added in v0.15.0 to support complex control flow nesting
+                        // Added in v0.13.0 to support complex control flow nesting
                         CaseStructure nestedCase = new(_variables, _streamer);
                         nestedCase.Syntetize();
                         branch.Tasks.Add(nestedCase);
