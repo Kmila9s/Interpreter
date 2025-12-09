@@ -163,7 +163,10 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// <returns>The result of the operation.</returns>
     public object Execute(Variable leftSideOperator, Variable rightSideOperator){
         if(leftSideOperator.Type != rightSideOperator.Type)
-            throw new ParserException("Datatypes do not match");
+            throw ParserException.TypeMismatch(
+                leftSideOperator.Type.ToString(),
+                rightSideOperator.Type.ToString(),
+                null);
         object result = new();
         switch(OperatorType){
             case OperatorType.ASSIGNATION:
@@ -417,7 +420,8 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     private object SolveVectorLogicOperation(Variable v1, Variable v2)
     {
         if (v1.Size != v2.Size)
-            throw new ParserException($"Vectors do not match in size: {v1.Name}:{v1.Size} - {v2.Name}{v1.Size}");
+            throw new ParserException(
+                $"Vector size mismatch in '{OperatorName}' operation: '{v1.Name}' has {v1.Size} bits, '{v2.Name}' has {v2.Size} bits");
         string result = "",
         vectorString1 = (string)v1.Value,
         vectorString2 = (string)v2.Value;

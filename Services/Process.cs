@@ -88,7 +88,7 @@ public class Process : ISControl, IControl
                 _streamer.Expect(IDENTIFIERS);
                 var variable = SignalsPorts.FirstOrDefault(p => p.Name.Equals(varName));
                 if (variable is null)
-                    throw new ParserException($"Variable: {varName} not declared in this scope - {_streamer.Current?.Line + 1} : {_streamer.Current?.Col + 1}");
+                    throw ParserException.UndeclaredVariable(varName, _streamer.Previous);
                 else
                 {
                     SensitiveList.Add(variable);

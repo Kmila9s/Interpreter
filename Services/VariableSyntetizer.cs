@@ -133,7 +133,11 @@ public class VariableSyntetizer : ISControl
                     _streamer.MoveNext();
                 if (Variables.Contains(varName))
                 {
-                    throw new ParserException(Constants.ParseExceptions.DUPLICATE_DECLARATION, (int)_streamer.Current?.Line + 1, (int)_streamer.Current?.Line + 1);
+                    throw new ParserException(
+                        Constants.ParseExceptions.DUPLICATE_DECLARATION,
+                        (int)(_streamer.Current?.Line ?? 0) + 1,
+                        (int)(_streamer.Current?.Col ?? 0) + 1,
+                        varName);
                 }
                 // Note: Don't check if varName is in _comparator here - we're DECLARING the variable,
                 // not using it. Forward reference checks belong in initializer parsing.
@@ -181,6 +185,12 @@ public class VariableSyntetizer : ISControl
             _streamer.Expect(KEYWORDS);
             int VectorSize = 0;
 
+            // Set default size for single-bit types
+            if (dataType == Constants.DATATYPES.STD_LOGIC || dataType == Constants.DATATYPES.BIT)
+            {
+                VectorSize = 1;
+            }
+
             // Handle vector types with parentheses (std_logic_vector, bit_vector, signed, unsigned, etc.)
             if (dataType == Constants.DATATYPES.STD_LOGIC_VECTOR ||
                 dataTypeStr == "bit_vector" || dataTypeStr == "signed" || dataTypeStr == "unsigned" ||
@@ -189,13 +199,40 @@ public class VariableSyntetizer : ISControl
                 if (_streamer.Current?.Value == "(")
                 {
                     // Parse vector range (7 downto 0) or (0 to 7)
-                    // For ports/generics, skip evaluation of complex expressions (v0.13.0 fix)
-                    // This prevents errors when expressions use generics or functions like clog2()
-                    // Example: std_logic_vector((NUM_INPUTS * DATA_WIDTH) - 1 downto 0)
+                    // v0.13.0: For ports/generics, check if expression is complex before evaluating
+                    _streamer.Expect(PARENTHESIS); // consume '('
+
+                    // Check if this is a complex expression (contains operators or nested parens)
+                    bool isComplexExpression = false;
                     if (_isPort || _isGeneric)
                     {
-                        // Skip the entire range specification without evaluating
-                        _streamer.Expect(PARENTHESIS); // consume '('
+                        _streamer.SetRollBack();
+                        // Peek ahead to see if expression contains operators or nested parens
+                        int checkDepth = 0;
+                        while (_streamer.Current != null && _streamer.Current.Value != ")")
+                        {
+                            if (_streamer.Current.Value == "(")
+                            {
+                                isComplexExpression = true;
+                                break;
+                            }
+                            string[] operators = { "+", "-", "*", "**", "/" };
+                            if (operators.Contains(_streamer.Current.Value))
+                            {
+                                isComplexExpression = true;
+                                break;
+                            }
+                            _streamer.MoveNext();
+                        }
+                        _streamer.RollBack();
+                    }
+
+                    if (isComplexExpression)
+                    {
+#if DEBUG
+                        Console.WriteLine($"[VariableSyntetizer] Complex vector expression detected, using default size");
+#endif
+                        // Skip complex expression and use default size
                         int parenDepth = 1;
                         while (_streamer.Current != null && parenDepth > 0)
                         {
@@ -208,19 +245,22 @@ public class VariableSyntetizer : ISControl
                         }
                         if (_streamer.Current?.Value == ")")
                             _streamer.MoveNext(); // consume final ')'
-                        VectorSize = 8; // Default size for ports/generics with complex expressions
+                        VectorSize = 8; // Default size for complex expressions
                     }
                     else
                     {
-                        _streamer.Expect(PARENTHESIS);
+                        // Simple expression: evaluate normally
                         object varValue = GetVariableValue();
                         int initial = Convert.ToInt32(varValue);
                         string vecType = _streamer.Current?.Value ?? string.Empty;
-                        _streamer.Expect(KEYWORDS);
+                        _streamer.Expect(KEYWORDS); // consume 'downto' or 'to'
                         varValue = GetVariableValue();
                         int end = Convert.ToInt32(varValue);
-                        _streamer.Expect(PARENTHESIS);
+                        _streamer.Expect(PARENTHESIS); // consume ')'
                         VectorSize = vecType.ToLower() == "downto" ? initial - end + 1 : end - initial + 1;
+#if DEBUG
+                        Console.WriteLine($"[VariableSyntetizer] Simple vector range: {initial} {vecType} {end} = Size {VectorSize}");
+#endif
                     }
                 }
             }
@@ -266,15 +306,24 @@ public class VariableSyntetizer : ISControl
             }
             variables.ForEach(variable =>
             {
-                Variables.Add(new()
+#if DEBUG
+                if (_isPort && dataType == Constants.DATATYPES.STD_LOGIC_VECTOR)
+                    Console.WriteLine($"[VariableSyntetizer] Creating port '{variable.Name}' with VectorSize={VectorSize}");
+#endif
+                var newVar = new Variable()
                 {
                     Name = variable.Name,
                     Type = dataType,
                     IsPort = _isPort,
                     PortType = portType,
+                    Size = VectorSize,  // Set Size BEFORE Value to avoid Size setter issues
                     Value = !_isPort ? value : null!,
-                    Size = VectorSize,
-                });
+                };
+#if DEBUG
+                if (_isPort && dataType == Constants.DATATYPES.STD_LOGIC_VECTOR)
+                    Console.WriteLine($"[VariableSyntetizer] Created port '{newVar.Name}' actual Size={newVar.Size}");
+#endif
+                Variables.Add(newVar);
             });
             if ((_isPort || _isGeneric) && _streamer.Current?.Value != ";") break;
             _streamer.Expect(OPERATORS); // ;
@@ -416,7 +465,9 @@ public class VariableSyntetizer : ISControl
             varValue = _comparator.FirstOrDefault(p => p.Name == _streamer.Current?.Value!)?.Value!;
             if (varValue == null)
             {
-                throw new Exception($"Variable {_streamer.Current.Value} not found {_streamer.Current.Line + 1} : {_streamer.Current.Col + 1}");
+                throw ParserException.UndeclaredVariable(
+                    _streamer.Current?.Value ?? "unknown",
+                    _streamer.Current);
             }
             _streamer.Expect(IDENTIFIERS);
         }
@@ -689,25 +740,34 @@ public class VariableSyntetizer : ISControl
 
     /// <summary>
     /// Skips a type declaration until ';'
+    /// Handles: enumeration types, array types, record types
     /// </summary>
     private void SkipTypeDeclaration()
     {
         // Type declarations can be complex (records, arrays, etc.)
-        // For simplicity, skip until we see 'is' followed by not 'record'/'array', or 'end record'
-        int depth = 0;
+        // Only 'record' needs depth tracking (has 'end record')
+        // Array types end with ';' directly (no 'end array')
+        int recordDepth = 0;
         while (_streamer.Current != null)
         {
             string val = _streamer.Current.Value.ToLower();
-            if (val == "record" || val == "array")
+
+            // Safety check: if we hit 'begin', we've gone too far
+            if (val == "begin" || val == _breaker)
             {
-                depth++;
+                break;
+            }
+
+            if (val == "record")
+            {
+                recordDepth++;
             }
             else if (val == "end")
             {
                 _streamer.MoveNext();
                 if (_streamer.Current?.Value.ToLower() == "record")
                 {
-                    depth--;
+                    recordDepth--;
                     _streamer.MoveNext(); // skip 'record'
                     // Skip optional type name
                     if (_streamer.Current?.Type == IDENTIFIERS)
@@ -715,7 +775,7 @@ public class VariableSyntetizer : ISControl
                         _streamer.MoveNext();
                     }
                 }
-                if (depth == 0)
+                if (recordDepth == 0)
                 {
                     // Skip semicolon
                     if (_streamer.Current?.Value == ";")
@@ -726,7 +786,7 @@ public class VariableSyntetizer : ISControl
                 }
                 continue;
             }
-            else if (val == ";" && depth == 0)
+            else if (val == ";" && recordDepth == 0)
             {
                 _streamer.MoveNext(); // skip ';'
                 break;

@@ -296,7 +296,8 @@ public class Operation : IOperation {
                     }
                 }
 
-                if (!Variables.Contains(currentItem)) throw new Exception($"Instance not in this scope: '{currentItem}' in expression '{_rawData}'");
+                if (!Variables.Contains(currentItem))
+                    throw new ParserException($"Undeclared identifier '{currentItem}' in expression '{_rawData}'. Available signals: {string.Join(", ", Variables.Take(5).Select(v => v.Name))}{(Variables.Count > 5 ? "..." : "")}");
                 var variable = Variables.First(p => p.Name.ToLower().Equals(currentItem.ToLower()));
 
                 // Check for array/vector element access: var(index)

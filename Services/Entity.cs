@@ -29,6 +29,13 @@ public class Entity : ISControl, IControl{
     /// Gets the architecture of the entity.
     /// </summary>
     public Architecture Architecture { get; private set; } = default!;
+
+    /// <summary>
+    /// Gets the hardware resource estimation for this entity.
+    /// Calculated after entity synthesis is complete.
+    /// </summary>
+    public Resources ResourceUsage { get; private set; } = default!;
+
     private Tokenizer _tokenizer = new(string.Empty);
     private TokenStream _streamer = default!;
 
@@ -67,10 +74,17 @@ public class Entity : ISControl, IControl{
     }
 
     /// <summary>
-    /// Sets the architecture of the entity.
+    /// Sets the architecture of the entity and calculates resource usage.
     /// </summary>
     /// <param name="architecture">The architecture to set.</param>
-    public void SetArchitecture(Architecture architecture) => Architecture = architecture;
+    public void SetArchitecture(Architecture architecture)
+    {
+        Architecture = architecture;
+
+        // Calculate hardware resource estimates
+        ResourceUsage = new Resources(this);
+        ResourceUsage.Calculate();
+    }
 
     /// <summary>
     /// Synthesizes the entity from raw data.

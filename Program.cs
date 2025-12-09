@@ -45,6 +45,17 @@ class Program
                     {
                         Console.WriteLine($"      Architecture tasks: {entity.Architecture.Tasks.Count}");
                     }
+
+                    // Display resource estimation (only if architecture exists)
+                    if (entity.Architecture != null && entity.ResourceUsage != null)
+                    {
+                        Console.WriteLine($"      Resources: FF={entity.ResourceUsage.FlipFlops}, " +
+                                        $"LUT={entity.ResourceUsage.LUTs}, " +
+                                        $"DSP={entity.ResourceUsage.DSPSlices}, " +
+                                        $"BRAM={entity.ResourceUsage.BRAMBlocks:F1}, " +
+                                        $"IO={entity.ResourceUsage.IOPins}, " +
+                                        $"CLK={entity.ResourceUsage.ClockDomains}");
+                    }
                 }
 
                 Console.WriteLine($"  [PASS] {fileName} - Synthesized successfully!");
@@ -84,7 +95,8 @@ class Program
         List<Entity> Entities = new();
         List<string> rawEntity = new();
         int it = 0;
-        string currentEntityArchName = string.Empty;
+        string currentEntityName = string.Empty;
+        string currentArchName = string.Empty;
         int architectureCount = 0;
 
         bool inPackage = false;
@@ -147,7 +159,9 @@ class Program
             }
             else if (comparer.StartsWith("architecture"))
             {
-                currentEntityArchName = item.Split(' ')[3];
+                var archParts = item.Split(' ');
+                currentArchName = archParts[1];  // Architecture name (e.g., "behavioral")
+                currentEntityName = archParts[3];  // Entity name (e.g., "example")
                 it = 2;
             }
 
@@ -218,12 +232,12 @@ class Program
                         var skipNames = new[] { "if", "process", "case", "loop", "for", "while", "generate", "function", "procedure" };
                         if (!skipNames.Contains(endName))
                         {
-                            // Also check if it matches the architecture name
-                            string entityNameMatch = Entities.LastOrDefault()?.Name?.ToLower() ?? "";
-                            if (endName == currentEntityArchName.ToLower() ||
-                                comparer.Contains(currentEntityArchName.ToLower()) ||
-                                endName == entityNameMatch ||
-                                comparer.Contains(entityNameMatch))
+                            // Check if end matches either the architecture name OR the entity name
+                            // Supports both: "end behavioral;" and "end example;"
+                            if (endName == currentArchName.ToLower() ||
+                                endName == currentEntityName.ToLower() ||
+                                comparer.Contains(currentArchName.ToLower()) ||
+                                comparer.Contains(currentEntityName.ToLower()))
                             {
                                 isEndOfArchitecture = true;
                             }
@@ -233,8 +247,8 @@ class Program
 
                 if (isEndOfArchitecture)
                 {
-                    Entity entity = Entities.FirstOrDefault(p => p.Name.Equals(currentEntityArchName)) ?? default!;
-                    if (entity == null) throw new Exception($"Entity '{currentEntityArchName}' not found");
+                    Entity entity = Entities.FirstOrDefault(p => p.Name.Equals(currentEntityName)) ?? default!;
+                    if (entity == null) throw new Exception($"Entity '{currentEntityName}' not found");
 
                     Architecture arch = new(entity.Ports, entity.Generics);
                     arch.Syntetize(rawEntity.ToArray());
