@@ -8,7 +8,7 @@ This module is a core component of **Kmila-9s**, a project officially titled "Ap
 **Email:** dulricht1700@alumno.ipn.mx
 **Email 2:** danielulrichtamayo@gmail.com
 **Version:** 0.13.0
-**Last Updated:** December 8, 2025
+**Last Updated:** December 9, 2025
 
 ---
 
@@ -127,6 +127,7 @@ IOperation (Interface)
 *   **`Resources.cs`**: Estimates FPGA hardware resource usage (flip-flops, LUTs, DSP slices, BRAM, I/O, clocks)
 *   **`TypeRegistry.cs`**: Registry for custom VHDL type definitions (enumeration, array, record, subtype)
 *   **`TypeDefinition.cs`**: Model class representing custom type declarations
+*   **`ProgressReporter.cs`**: Event-based progress reporting system for UI integration
 
 ---
 
@@ -657,6 +658,152 @@ entity.ResourceUsage.PrintReport("Xilinx 7-Series");
 5. **CalculateBRAM()** - Detects array/memory patterns (TODO: implementation pending)
 6. **CalculateLUTs()** - Estimates combinational logic (TODO: implementation pending)
 
+### 5.10. ProgressReporter - Progress Tracking System
+
+**File:** `Services/ProgressReporter.cs`
+
+**Purpose:** Event-based progress reporting for UI integration and debugging.
+
+**Features:**
+- Singleton pattern for global access
+- Event-driven updates via `ProgressChanged`, `ErrorOccurred`, `Completed` events
+- Progress as tuple `(float, string)` for easy UI binding
+- ASCII progress bar visualization
+- Processing phase tracking
+- Scoped reporters for sub-operations
+
+**Processing Phases:**
+```csharp
+public enum ProcessingPhase
+{
+    Initializing, Tokenizing, ParsingEntity, ParsingPorts, ParsingGenerics,
+    ParsingArchitecture, ParsingSignals, ParsingTypes, SynthesizingBehavior,
+    ParsingProcess, ParsingIfStructure, ParsingCaseStructure, ParsingLoop,
+    EvaluatingExpression, CalculatingResources, Completed, Error
+}
+```
+
+**Usage - Subscribe to Progress Updates:**
+```csharp
+// Subscribe to progress events
+ProgressReporter.Instance.ProgressChanged += (sender, e) =>
+{
+    // Get progress as tuple (float, string)
+    var (progress, message) = e.Update.ToTuple();
+
+    // Or access individual properties
+    float percent = e.Update.Progress;           // 0.0 to 1.0
+    string status = e.Update.Message;            // "Parsing entity"
+    string detail = e.Update.Detail;             // "AND_Gate"
+    ProcessingPhase phase = e.Update.Phase;      // ProcessingPhase.ParsingEntity
+
+    // Update your UI
+    progressBar.Value = percent * 100;
+    statusLabel.Text = $"{status} {detail}";
+};
+
+// Subscribe to errors
+ProgressReporter.Instance.ErrorOccurred += (sender, e) =>
+{
+    ShowError(e.Update.Message, e.Update.Detail);
+};
+
+// Subscribe to completion
+ProgressReporter.Instance.Completed += (sender, e) =>
+{
+    ShowSuccess("Parsing completed!");
+};
+```
+
+**Usage - Report Progress (from parsing code):**
+```csharp
+var progress = ProgressReporter.Instance;
+
+// Report with phase-relative progress (0-1 within phase)
+progress.ReportPhase(0.5f, "Parsing ports", ProcessingPhase.ParsingPorts, "clk");
+
+// Report absolute progress
+progress.Report(0.75f, "Almost done", ProcessingPhase.Completed);
+
+// Report error
+progress.ReportError("Failed to parse entity", "Unexpected token at line 42");
+
+// Report completion
+progress.ReportCompleted("Successfully parsed 5 entities");
+```
+
+**Cancellation Support:**
+
+The progress reporter integrates with `CancellationToken` for graceful operation cancellation:
+
+```csharp
+// Setup cancellation (typically in Program.cs)
+var cts = new CancellationTokenSource();
+var progress = ProgressReporter.Instance;
+
+// Register CTS with progress reporter
+progress.StartCancellableOperation(cts);
+
+// Handle Ctrl+C for console applications
+Console.CancelKeyPress += (sender, e) =>
+{
+    e.Cancel = true; // Prevent immediate termination
+    progress.RequestCancellation();
+};
+
+// Subscribe to cancellation events
+progress.CancellationRequested += (sender, e) =>
+{
+    Console.WriteLine($"Cancelled: {e.Update.Message}");
+};
+
+// Pass token to parsing methods
+try
+{
+    entity.Syntetize(rawData, cts.Token);
+    architecture.Syntetize(rawData, cts.Token);
+}
+catch (OperationCanceledException)
+{
+    Console.WriteLine("Operation was cancelled by user.");
+}
+```
+
+**Cancellation Methods:**
+- `StartCancellableOperation()` - Creates new CancellationTokenSource
+- `StartCancellableOperation(CancellationTokenSource)` - Uses provided CTS
+- `RequestCancellation()` - Triggers cancellation and raises event
+- `ThrowIfCancellationRequested()` - Throws if cancelled (for use in loops)
+- `CheckCancellation()` - Returns bool without throwing
+- `IsCancellationRequested` - Property to check cancellation state
+- `CancellationToken` - Property to get the current token
+
+**Integrated Components:**
+All major parsing components support CancellationToken:
+- `Entity.Syntetize(string[], CancellationToken)`
+- `Architecture.Syntetize(string[], CancellationToken)`
+- `Process.Syntetize(CancellationToken)`
+- `VariableSyntetizer.Syntetize(CancellationToken)`
+
+Cancellation is checked at each loop iteration in parsing methods, ensuring responsive cancellation even for large VHDL files.
+
+**Progress Bar Visualization:**
+```
+[████████████░░░░░░░░]  62.0% | Parsing process variables [counter]
+```
+
+**Console Output with Icons (verbose mode):**
+```
+📝 [█░░░░░░░░░░░░░░░░░░░]   5.0% | Tokenizing entity
+📦 [████░░░░░░░░░░░░░░░░]  20.0% | Found entity [AND_Gate]
+🔌 [█████░░░░░░░░░░░░░░░]  25.0% | Parsed 3 port(s)
+🏗️ [██████░░░░░░░░░░░░░░]  33.0% | Found architecture [behavioral of AND_Gate]
+📡 [███████░░░░░░░░░░░░░]  38.0% | Parsed 5 signal(s)
+⚡ [██████████████░░░░░░]  73.0% | Synthesizing behavior
+📊 [█████████████████░░░]  87.5% | Calculating resource usage
+✅ [████████████████████] 100.0% | Processing completed
+```
+
 ---
 
 ## 6. How to Use
@@ -665,10 +812,20 @@ entity.ResourceUsage.PrintReport("Xilinx 7-Series");
 
 ```bash
 cd /mnt/ssd1tb/Codigos/Kmila-9s/Interpreter
+
+# Standard output
 dotnet run --framework net9.0
+
+# Verbose mode with progress details
+dotnet run --framework net9.0 -- -v
+dotnet run --framework net9.0 -- --verbose
+
+# Compact progress bar mode
+dotnet run --framework net9.0 -- -p
+dotnet run --framework net9.0 -- --progress
 ```
 
-**Output:**
+**Standard Output:**
 ```
 Found 20 test file(s)
 ============================================================
@@ -683,6 +840,18 @@ Found 20 test file(s)
 ...
 
 Test Results: 16 passed, 4 failed, 20 total
+```
+
+**Verbose Output (-v):**
+```
+[TEST] Processing: test1.vhdl
+----------------------------------------
+    📝 [█░░░░░░░░░░░░░░░░░░░]   5.0% | Tokenizing entity
+    📦 [████░░░░░░░░░░░░░░░░]  20.0% | Found entity [AND_Gate]
+    🔌 [█████░░░░░░░░░░░░░░░]  25.0% | Parsed 3 port(s)
+  Entities parsed: 1
+    - AND_Gate: 3 ports, 0 generics
+  [PASS] test1.vhdl - Synthesized successfully!
 ```
 
 ### Programmatic Usage
@@ -1038,7 +1207,7 @@ while (_streamer.Current != null)
 
 ## 10. Changelog
 
-### v0.13.0 - Regex Fixes, Resource Estimation, Custom Types & Memory Fixes (2025-12-08)
+### v0.13.0 - Regex Fixes, Resource Estimation, Custom Types, Cancellation & Memory Fixes (2025-12-09)
 
 #### New Features
 
@@ -1060,6 +1229,29 @@ while (_streamer.Current != null)
         *   Record: `type packet_t is record valid: std_logic; end record;`
     *   Automatic size calculation and default value generation
     *   Signals using custom types are now properly sized and initialized
+
+*   **Progress Reporting System (`Services/ProgressReporter.cs`)**: NEW event-based progress tracking for UI integration
+    *   Singleton `ProgressReporter.Instance` for global access
+    *   Events: `ProgressChanged`, `ErrorOccurred`, `Completed`, `CancellationRequested`
+    *   Progress tuple output: `(float Progress, string Message)` via `e.Update.ToTuple()`
+    *   ASCII progress bar visualization with emoji icons
+    *   Processing phases: Tokenizing, ParsingEntity, ParsingPorts, ParsingArchitecture, etc.
+    *   Scoped reporters for sub-operations (`CreateScope()`, `CreateItemScope()`)
+    *   Command line options: `-v`/`--verbose` for detailed progress, `-p`/`--progress` for compact bar
+    *   Integrated into Entity, Architecture, and Process parsing
+
+*   **CancellationToken Support**: Graceful operation cancellation throughout the parsing pipeline
+    *   `ProgressReporter` methods: `StartCancellableOperation()`, `RequestCancellation()`, `ThrowIfCancellationRequested()`, `CheckCancellation()`
+    *   `CancellationRequested` event for notification when cancellation is triggered
+    *   Ctrl+C handling in `Program.cs` for console application cancellation
+    *   `CancellationToken` parameter added to all major parsing methods:
+        *   `Entity.Syntetize(string[], CancellationToken)`
+        *   `Architecture.Syntetize(string[], CancellationToken)`
+        *   `Process.Syntetize(CancellationToken)`
+        *   `VariableSyntetizer.Syntetize(CancellationToken)`
+    *   Cancellation checks at each loop iteration for responsive cancellation
+    *   Graceful `OperationCanceledException` handling prevents crashes
+    *   Useful for stopping processing of large VHDL files (e.g., FPGA_KILLER)
 
 #### Memory Leak Fixes
 

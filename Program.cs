@@ -6,8 +6,47 @@ namespace Interpreter;
 
 class Program
 {
+    // Flag to control verbose progress output
+    static bool _verboseProgress = false;
+
+    // Cancellation token source for Ctrl+C handling
+    static CancellationTokenSource _cts = new();
+
     static void Main(string[] args)
     {
+        // Parse command line arguments
+        _verboseProgress = args.Contains("--verbose") || args.Contains("-v");
+        bool showProgressBar = args.Contains("--progress") || args.Contains("-p");
+
+        // Setup Ctrl+C handling for graceful cancellation
+        Console.CancelKeyPress += (sender, e) =>
+        {
+            e.Cancel = true; // Prevent immediate termination
+            Console.WriteLine("\nCancellation requested... Please wait.");
+            _cts.Cancel();
+        };
+
+        // Setup progress reporting
+        var progress = ProgressReporter.Instance;
+        progress.IsEnabled = true;
+        progress.ConsoleOutput = false; // We'll handle output ourselves
+
+        // Register cancellation token with progress reporter
+        progress.StartCancellableOperation(_cts);
+
+        // Subscribe to cancellation events
+        progress.CancellationRequested += (sender, e) =>
+        {
+            Console.WriteLine($"Operation cancelled: {e.Update.Message}");
+        };
+
+        if (_verboseProgress)
+        {
+            // Subscribe to all progress updates for verbose mode
+            progress.ProgressChanged += OnProgressChanged;
+            progress.ErrorOccurred += OnErrorOccurred;
+        }
+
         // Find all test*.vhdl files in the current directory
         string currentDir = Directory.GetCurrentDirectory();
         var testFiles = Directory.GetFiles(currentDir, "test*.vhdl")
@@ -26,48 +65,91 @@ class Program
         int passedTests = 0;
         int failedTests = 0;
 
-        foreach (var testFile in testFiles)
+        for (int i = 0; i < testFiles.Length; i++)
         {
+            var testFile = testFiles[i];
             string fileName = Path.GetFileName(testFile);
-            Console.WriteLine($"\n[TEST] Processing: {fileName}");
-            Console.WriteLine(new string('-', 40));
+
+            // Reset progress for each file
+            progress.Reset();
+
+            if (showProgressBar)
+            {
+                // Show overall test progress
+                float overallProgress = (float)i / testFiles.Length;
+                Console.Write($"\r[{GetProgressBar(overallProgress, 20)}] {overallProgress * 100:F0}% | {fileName}".PadRight(70));
+            }
+            else
+            {
+                Console.WriteLine($"\n[TEST] Processing: {fileName}");
+                Console.WriteLine(new string('-', 40));
+            }
 
             try
             {
-                string raw = File.ReadAllText(testFile);
-                var result = ProcessVhdlCode(raw);
-
-                Console.WriteLine($"  Entities parsed: {result.entities.Count}");
-                foreach (var entity in result.entities)
+                // Check for cancellation before processing each file
+                if (_cts.Token.IsCancellationRequested)
                 {
-                    Console.WriteLine($"    - {entity.Name}: {entity.Ports.Count} ports, {entity.Generics.Count} generics");
-                    if (entity.Architecture != null)
-                    {
-                        Console.WriteLine($"      Architecture tasks: {entity.Architecture.Tasks.Count}");
-                    }
-
-                    // Display resource estimation (only if architecture exists)
-                    if (entity.Architecture != null && entity.ResourceUsage != null)
-                    {
-                        Console.WriteLine($"      Resources: FF={entity.ResourceUsage.FlipFlops}, " +
-                                        $"LUT={entity.ResourceUsage.LUTs}, " +
-                                        $"DSP={entity.ResourceUsage.DSPSlices}, " +
-                                        $"BRAM={entity.ResourceUsage.BRAMBlocks:F1}, " +
-                                        $"IO={entity.ResourceUsage.IOPins}, " +
-                                        $"CLK={entity.ResourceUsage.ClockDomains}");
-                    }
+                    Console.WriteLine("\nProcessing cancelled by user.");
+                    break;
                 }
 
-                Console.WriteLine($"  [PASS] {fileName} - Synthesized successfully!");
+                string raw = File.ReadAllText(testFile);
+                var result = ProcessVhdlCode(raw, _cts.Token);
+
+                if (!showProgressBar)
+                {
+                    Console.WriteLine($"  Entities parsed: {result.entities.Count}");
+                    foreach (var entity in result.entities)
+                    {
+                        Console.WriteLine($"    - {entity.Name}: {entity.Ports.Count} ports, {entity.Generics.Count} generics");
+                        if (entity.Architecture != null)
+                        {
+                            Console.WriteLine($"      Architecture tasks: {entity.Architecture.Tasks.Count}");
+                        }
+
+                        // Display resource estimation (only if architecture exists)
+                        if (entity.Architecture != null && entity.ResourceUsage != null)
+                        {
+                            Console.WriteLine($"      Resources: FF={entity.ResourceUsage.FlipFlops}, " +
+                                            $"LUT={entity.ResourceUsage.LUTs}, " +
+                                            $"DSP={entity.ResourceUsage.DSPSlices}, " +
+                                            $"BRAM={entity.ResourceUsage.BRAMBlocks:F1}, " +
+                                            $"IO={entity.ResourceUsage.IOPins}, " +
+                                            $"CLK={entity.ResourceUsage.ClockDomains}");
+                        }
+                    }
+
+                    Console.WriteLine($"  [PASS] {fileName} - Synthesized successfully!");
+                }
                 passedTests++;
+            }
+            catch (OperationCanceledException)
+            {
+                // User requested cancellation
+                Console.WriteLine($"\n  [CANCELLED] {fileName}");
+                Console.WriteLine("Processing was cancelled by user request.");
+                break;
             }
             catch (Exception ex)
             {
+                if (showProgressBar)
+                {
+                    Console.WriteLine(); // New line after progress bar
+                }
                 Console.WriteLine($"  [FAIL] {fileName}");
                 Console.WriteLine($"    Error: {ex.Message}");
-                Console.WriteLine($"    Stack: {ex.StackTrace}");
+                if (_verboseProgress)
+                {
+                    Console.WriteLine($"    Stack: {ex.StackTrace}");
+                }
                 failedTests++;
             }
+        }
+
+        if (showProgressBar)
+        {
+            Console.WriteLine(); // Final newline after progress bar
         }
 
         Console.WriteLine(new string('=', 60));
@@ -84,7 +166,7 @@ class Program
         }
     }
 
-    static (List<Entity> entities, int architectureCount) ProcessVhdlCode(string raw)
+    static (List<Entity> entities, int architectureCount) ProcessVhdlCode(string raw, CancellationToken cancellationToken = default)
     {
         Tokenizer tok = new("");
         var prev = raw.Split("\n")
@@ -108,6 +190,8 @@ class Program
 
         foreach (var item in prev)
         {
+            // Check for cancellation periodically during parsing
+            cancellationToken.ThrowIfCancellationRequested();
             string comparer = item.Trim().ToLower();
 
             // Skip package declarations and bodies
@@ -170,7 +254,8 @@ class Program
                 if (comparer.StartsWith("end ") && comparer.EndsWith(";"))
                 {
                     rawEntity.Add(item.Trim());
-                    Entity entity = new(rawEntity.ToArray());
+                    Entity entity = new();
+                    entity.Syntetize(rawEntity.ToArray(), cancellationToken);
                     Entities.Add(entity);
                     rawEntity = new();
                     it = 0;
@@ -251,7 +336,7 @@ class Program
                     if (entity == null) throw new Exception($"Entity '{currentEntityName}' not found");
 
                     Architecture arch = new(entity.Ports, entity.Generics);
-                    arch.Syntetize(rawEntity.ToArray());
+                    arch.Syntetize(rawEntity.ToArray(), cancellationToken);
                     entity.SetArchitecture(arch);
                     architectureCount++;
                     rawEntity = new();
@@ -261,5 +346,58 @@ class Program
         }
 
         return (Entities, architectureCount);
+    }
+
+    /// <summary>
+    /// Event handler for progress updates in verbose mode.
+    /// </summary>
+    static void OnProgressChanged(object? sender, ProgressEventArgs e)
+    {
+        var update = e.Update;
+        string phaseIcon = update.Phase switch
+        {
+            ProcessingPhase.Initializing => "🔄",
+            ProcessingPhase.Tokenizing => "📝",
+            ProcessingPhase.ParsingEntity => "📦",
+            ProcessingPhase.ParsingPorts => "🔌",
+            ProcessingPhase.ParsingGenerics => "⚙️",
+            ProcessingPhase.ParsingArchitecture => "🏗️",
+            ProcessingPhase.ParsingSignals => "📡",
+            ProcessingPhase.ParsingTypes => "📐",
+            ProcessingPhase.SynthesizingBehavior => "⚡",
+            ProcessingPhase.ParsingProcess => "🔄",
+            ProcessingPhase.ParsingIfStructure => "❓",
+            ProcessingPhase.ParsingCaseStructure => "🔀",
+            ProcessingPhase.ParsingLoop => "🔁",
+            ProcessingPhase.EvaluatingExpression => "🧮",
+            ProcessingPhase.CalculatingResources => "📊",
+            ProcessingPhase.Completed => "✅",
+            ProcessingPhase.Error => "❌",
+            _ => "  "
+        };
+
+        Console.WriteLine($"    {phaseIcon} {update}");
+    }
+
+    /// <summary>
+    /// Event handler for error events.
+    /// </summary>
+    static void OnErrorOccurred(object? sender, ProgressEventArgs e)
+    {
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine($"    ❌ ERROR: {e.Update.Message}");
+        if (e.Update.Detail != null)
+            Console.WriteLine($"       Detail: {e.Update.Detail}");
+        Console.ResetColor();
+    }
+
+    /// <summary>
+    /// Gets an ASCII progress bar.
+    /// </summary>
+    static string GetProgressBar(float progress, int width = 20)
+    {
+        int filled = (int)(progress * width);
+        int empty = width - filled;
+        return $"{"█".PadRight(filled, '█')}{"░".PadRight(empty, '░')}";
     }
 }

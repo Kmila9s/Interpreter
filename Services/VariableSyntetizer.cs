@@ -62,10 +62,19 @@ public class VariableSyntetizer : ISControl
     /// <summary>
     /// Synthesizes the variables from a token stream.
     /// </summary>
-    public void Syntetize()
+    public void Syntetize() => Syntetize(CancellationToken.None);
+
+    /// <summary>
+    /// Synthesizes the variables from a token stream.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public void Syntetize(CancellationToken cancellationToken)
     {
         while (_streamer.Current != null && _breaker != _streamer.Current?.Value.ToLower())
         {
+            // Check for cancellation at each iteration
+            cancellationToken.ThrowIfCancellationRequested();
+
             // Skip component declarations
             if (_streamer.Current?.Value?.ToLower() == "component")
             {

@@ -79,36 +79,72 @@ public class Entity : ISControl, IControl{
     /// <param name="architecture">The architecture to set.</param>
     public void SetArchitecture(Architecture architecture)
     {
+        var progress = ProgressReporter.Instance;
         Architecture = architecture;
 
         // Calculate hardware resource estimates
+        progress.ReportPhase(0.5f, "Calculating resource usage", ProcessingPhase.CalculatingResources, Name);
         ResourceUsage = new Resources(this);
         ResourceUsage.Calculate();
+        progress.ReportPhase(1f, $"Resources: FF={ResourceUsage.FlipFlops}, IO={ResourceUsage.IOPins}", ProcessingPhase.CalculatingResources, Name);
     }
 
     /// <summary>
     /// Synthesizes the entity from raw data.
     /// </summary>
     /// <param name="RawEntity">The raw data of the entity.</param>
-    public void Syntetize(string[] RawEntity)
+    public void Syntetize(string[] RawEntity) => Syntetize(RawEntity, CancellationToken.None);
+
+    /// <summary>
+    /// Synthesizes the entity from raw data.
+    /// </summary>
+    /// <param name="RawEntity">The raw data of the entity.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public void Syntetize(string[] RawEntity, CancellationToken cancellationToken)
     {
+        var progress = ProgressReporter.Instance;
+        progress.ReportPhase(0f, "Tokenizing entity", ProcessingPhase.Tokenizing);
+
+        // Check for cancellation before starting
+        cancellationToken.ThrowIfCancellationRequested();
+
         RawEntity.ToList().ForEach(_tokenizer.TokenizeLine);
         _tokenizer.Evaluate();
         _streamer = new(_tokenizer.GetDictionaryType());
+
+        // Check for cancellation after tokenization
+        cancellationToken.ThrowIfCancellationRequested();
+
+        progress.ReportPhase(0.3f, "Parsing entity declaration", ProcessingPhase.ParsingEntity);
         _streamer.Expect(KEYWORDS);
         Name = _streamer.Current?.Value ?? string.Empty;
+
+        progress.ReportPhase(0.5f, "Found entity", ProcessingPhase.ParsingEntity, Name);
         _streamer.Expect(IDENTIFIERS);
         _streamer.Expect(KEYWORDS);
-        SyntetizeBehaviour();
+
+        SyntetizeBehaviour(cancellationToken);
+        progress.ReportPhase(1f, "Entity parsed", ProcessingPhase.ParsingEntity, Name);
     }
 
     /// <summary>
     /// Synthesizes the behavior of the entity.
     /// </summary>
-    public void SyntetizeBehaviour()
+    public void SyntetizeBehaviour() => SyntetizeBehaviour(CancellationToken.None);
+
+    /// <summary>
+    /// Synthesizes the behavior of the entity.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public void SyntetizeBehaviour(CancellationToken cancellationToken)
     {
+        var progress = ProgressReporter.Instance;
+
         while (_streamer.Current?.Value.ToLower() != "end")
         {
+            // Check for cancellation at each iteration
+            cancellationToken.ThrowIfCancellationRequested();
+
             var type = _streamer.Current?.Value.ToLower();
             _streamer.Expect(KEYWORDS);
             _streamer.Expect(PARENTHESIS);
@@ -116,14 +152,18 @@ public class Entity : ISControl, IControl{
             switch (type)
             {
                 case "generic":
+                    progress.ReportPhase(0.2f, "Parsing generics", ProcessingPhase.ParsingGenerics);
                     syntetizer = new(_streamer, Ports, false, true);
-                    syntetizer.Syntetize();
+                    syntetizer.Syntetize(cancellationToken);
                     Generics = syntetizer.Variables;
+                    progress.ReportPhase(1f, $"Parsed {Generics.Count} generic(s)", ProcessingPhase.ParsingGenerics);
                     break;
                 case "port":
+                    progress.ReportPhase(0.2f, "Parsing ports", ProcessingPhase.ParsingPorts);
                     syntetizer = new(_streamer, Generics, true, false);
-                    syntetizer.Syntetize();
+                    syntetizer.Syntetize(cancellationToken);
                     Ports = syntetizer.Variables;
+                    progress.ReportPhase(1f, $"Parsed {Ports.Count} port(s)", ProcessingPhase.ParsingPorts);
                     break;
                 default:
                     throw new NotImplementedException();

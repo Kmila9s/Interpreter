@@ -111,12 +111,30 @@ public class Architecture : ISControl, IControl
     /// Synthesizes the architecture from raw data.
     /// </summary>
     /// <param name="RawArchitecture">The raw data of the architecture.</param>
-    public void Syntetize(string[] RawArchitecture)
+    public void Syntetize(string[] RawArchitecture) => Syntetize(RawArchitecture, CancellationToken.None);
+
+    /// <summary>
+    /// Synthesizes the architecture from raw data.
+    /// </summary>
+    /// <param name="RawArchitecture">The raw data of the architecture.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public void Syntetize(string[] RawArchitecture, CancellationToken cancellationToken)
     {
+        var progress = ProgressReporter.Instance;
+        progress.ReportPhase(0f, "Tokenizing architecture", ProcessingPhase.Tokenizing);
+
+        // Check for cancellation before starting
+        cancellationToken.ThrowIfCancellationRequested();
+
         RawArchitecture.ToList().ForEach(_tokenizer.TokenizeLine);
         _tokenizer.Evaluate();
         _streamer = new(_tokenizer.GetDictionaryType());
         var tokens = _tokenizer.GetDictionaryType();
+
+        // Check for cancellation after tokenization
+        cancellationToken.ThrowIfCancellationRequested();
+
+        progress.ReportPhase(0.2f, "Parsing architecture header", ProcessingPhase.ParsingArchitecture);
         _streamer.Expect(KEYWORDS);
         Name = _streamer.Current?.Value ?? string.Empty;
         _streamer.Expect(IDENTIFIERS);
@@ -125,15 +143,27 @@ public class Architecture : ISControl, IControl
         _streamer.Expect(IDENTIFIERS);
         _streamer.Expect(KEYWORDS); // is
 
+        progress.ReportPhase(0.3f, "Found architecture", ProcessingPhase.ParsingArchitecture, $"{Name} of {EntityName}");
+
         // Pass TypeRegistry to VariableSyntetizer for custom type parsing
+        progress.ReportPhase(0.4f, "Parsing signals and types", ProcessingPhase.ParsingSignals);
         VariableSyntetizer syntetizer = new(_streamer, [.._ports, .._generics], IsSignal: true, TypeRegistry: CustomTypes);
-        syntetizer.Syntetize();
+        syntetizer.Syntetize(cancellationToken);
         _signals = syntetizer.Variables;
 
+        progress.ReportPhase(0.6f, $"Parsed {_signals.Count} signal(s)", ProcessingPhase.ParsingSignals);
+
+        // Check for cancellation after signals
+        cancellationToken.ThrowIfCancellationRequested();
+
         // Transfer any parsed types to our registry (in case syntetizer created new ones)
-        foreach (var typeDef in syntetizer.ParsedTypes.Types.Values)
+        if (syntetizer.ParsedTypes.Count > 0)
         {
-            CustomTypes.TryRegister(typeDef);
+            progress.ReportPhase(0.7f, $"Registering {syntetizer.ParsedTypes.Count} custom type(s)", ProcessingPhase.ParsingTypes);
+            foreach (var typeDef in syntetizer.ParsedTypes.Types.Values)
+            {
+                CustomTypes.TryRegister(typeDef);
+            }
         }
 
 #if DEBUG
@@ -144,13 +174,21 @@ public class Architecture : ISControl, IControl
 #endif
 
         _streamer.Expect(KEYWORDS); // begin
-        SyntetizeBehaviour();
+        progress.ReportPhase(0.8f, "Synthesizing behavior", ProcessingPhase.SynthesizingBehavior);
+        SyntetizeBehaviour(cancellationToken);
+        progress.ReportPhase(1f, $"Architecture complete ({Tasks.Count} tasks)", ProcessingPhase.ParsingArchitecture, Name);
     }
 
     /// <summary>
     /// Synthesizes the behavior of the architecture.
     /// </summary>
-    public void SyntetizeBehaviour()
+    public void SyntetizeBehaviour() => SyntetizeBehaviour(CancellationToken.None);
+
+    /// <summary>
+    /// Synthesizes the behavior of the architecture.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public void SyntetizeBehaviour(CancellationToken cancellationToken)
     {
         // v0.13.0 Fix: Move comparators list outside the loop to prevent repeated allocation
         // Previously created a new List<Variable> on every iteration, causing memory pressure
@@ -158,6 +196,9 @@ public class Architecture : ISControl, IControl
 
         while (_streamer.Current?.Value.ToLower() != "end")
         {
+            // Check for cancellation at each iteration
+            cancellationToken.ThrowIfCancellationRequested();
+
             // Check for labeled statements (label : process/for/if/etc or component instantiation)
             if (_streamer.Current?.Type == IDENTIFIERS)
             {
@@ -174,7 +215,7 @@ public class Architecture : ISControl, IControl
                         {
                             case "process":
                                 Process process = new(comparators, _streamer);
-                                process.Syntetize();
+                                process.Syntetize(cancellationToken);
                                 Tasks.Add(process);
                                 continue;
                             case "for":
@@ -211,7 +252,7 @@ public class Architecture : ISControl, IControl
                 {
                     case "process":
                         Process process = new(comparators, _streamer);
-                        process.Syntetize();
+                        process.Syntetize(cancellationToken);
                         Tasks.Add(process);
                         break;
                     case "if":

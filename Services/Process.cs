@@ -54,17 +54,40 @@ public class Process : ISControl, IControl
     /// <summary>
     /// Synthesizes the process.
     /// </summary>
-    public void Syntetize()
+    public void Syntetize() => Syntetize(CancellationToken.None);
+
+    /// <summary>
+    /// Synthesizes the process.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public void Syntetize(CancellationToken cancellationToken)
     {
+        var progress = ProgressReporter.Instance;
+        progress.ReportPhase(0.1f, "Parsing process", ProcessingPhase.ParsingProcess);
+
+        // Check for cancellation before starting
+        cancellationToken.ThrowIfCancellationRequested();
+
         VariableSyntetizer syntetizer = new(_streamer, SignalsPorts);
         SyntentizeSensitiveList();
+
+        progress.ReportPhase(0.3f, $"Sensitivity list: {SensitiveList.Count} signal(s)", ProcessingPhase.ParsingProcess);
+
+        // Check for cancellation after sensitivity list
+        cancellationToken.ThrowIfCancellationRequested();
+
         if (_streamer.Current?.Value != "begin")
         {
-            syntetizer.Syntetize();
+            progress.ReportPhase(0.4f, "Parsing process variables", ProcessingPhase.ParsingProcess);
+            syntetizer.Syntetize(cancellationToken);
             _variables = syntetizer.Variables;
+            progress.ReportPhase(0.6f, $"Parsed {_variables.Count} variable(s)", ProcessingPhase.ParsingProcess);
         }
         _streamer.Expect(KEYWORDS); // begin
-        SyntetizeBehaviour();
+
+        progress.ReportPhase(0.7f, "Synthesizing process behavior", ProcessingPhase.ParsingProcess);
+        SyntetizeBehaviour(cancellationToken);
+        progress.ReportPhase(1f, $"Process complete ({Tasks.Count} tasks)", ProcessingPhase.ParsingProcess);
     }
 
     /// <summary>
@@ -103,13 +126,22 @@ public class Process : ISControl, IControl
     /// <summary>
     /// Synthesizes the behavior of the process.
     /// </summary>
-    public void SyntetizeBehaviour()
+    public void SyntetizeBehaviour() => SyntetizeBehaviour(CancellationToken.None);
+
+    /// <summary>
+    /// Synthesizes the behavior of the process.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public void SyntetizeBehaviour(CancellationToken cancellationToken)
     {
         // Combine all available variables: signals/ports and local process variables
         HashSet<Variable> allVariables = [.. SignalsPorts, .. _variables];
 
         while (_streamer.Current?.Value.ToLower() != "end")
         {
+            // Check for cancellation at each iteration
+            cancellationToken.ThrowIfCancellationRequested();
+
             if (_streamer.Current?.Type == KEYWORDS)
             {
                 switch (_streamer.Current.Value.ToLower())
