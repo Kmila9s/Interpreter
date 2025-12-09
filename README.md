@@ -125,6 +125,8 @@ IOperation (Interface)
 *   **`StandardFunctions.cs`**: Implements IEEE standard library functions
 *   **`SignalAttributeHandler.cs`**: Tracks signal attributes ('event, 'last_value, etc.)
 *   **`Resources.cs`**: Estimates FPGA hardware resource usage (flip-flops, LUTs, DSP slices, BRAM, I/O, clocks)
+*   **`TypeRegistry.cs`**: Registry for custom VHDL type definitions (enumeration, array, record, subtype)
+*   **`TypeDefinition.cs`**: Model class representing custom type declarations
 
 ---
 
@@ -1036,7 +1038,7 @@ while (_streamer.Current != null)
 
 ## 10. Changelog
 
-### v0.13.0 - Regex Fixes, Resource Estimation & Critical Parser Bugs (2025-12-08)
+### v0.13.0 - Regex Fixes, Resource Estimation, Custom Types & Memory Fixes (2025-12-08)
 
 #### New Features
 
@@ -1047,6 +1049,30 @@ while (_streamer.Current != null)
     *   Framework for DSP, BRAM, LUT estimation (implementation in progress)
     *   Automatic calculation when architecture is attached to entity
     *   Example output: `Resources: FF=8, LUT=0, DSP=0, BRAM=0.0, IO=18, CLK=1`
+
+*   **Custom Type Support (`Models/TypeDefinition.cs`, `Services/TypeRegistry.cs`)**: NEW infrastructure for VHDL custom type declarations
+    *   `TypeDefinition` model supporting Enumeration, Array, Record, and Subtype kinds
+    *   `TypeRegistry` for storing and looking up custom types within architecture scope
+    *   Full parsing of type declarations in `VariableSyntetizer.ParseTypeDeclaration()`
+    *   Supported syntax:
+        *   Enumeration: `type state_t is (IDLE, RUN, STOP);`
+        *   Array: `type memory_t is array (0 to 255) of std_logic;`
+        *   Record: `type packet_t is record valid: std_logic; end record;`
+    *   Automatic size calculation and default value generation
+    *   Signals using custom types are now properly sized and initialized
+
+#### Memory Leak Fixes
+
+*   **Fixed infinite loop in `SkipTypeDeclaration()` (Services/VariableSyntetizer.cs)**: Array type declarations like `type big_mem_t is array (0 to 199999) of STD_LOGIC;` were causing infinite loops and memory exhaustion. Added:
+    *   `parenDepth` tracking for array bounds
+    *   `MAX_ITERATIONS = 10000` safety limit
+    *   Only break on `;` when `parenDepth == 0`
+
+*   **Fixed LoggerFactory memory leak (Parser/Repositories/TokenStream.cs)**: Each `TokenStream` instance was creating a new `LoggerFactory`. Changed to static shared instance.
+
+*   **Fixed Regex allocation in Operation class (Services/Operation.cs)**: Each `Operation` instance was creating 4 new `Regex` objects. Changed to static shared compiled instances.
+
+*   **Fixed list allocation in loop (Services/Architecture.cs)**: `List<Variable> comparators` was being allocated on every iteration of `SyntetizeBehaviour()` loop. Moved outside loop and changed to `HashSet<Variable>`.
 
 #### Critical Bug Fixes
 
@@ -1143,13 +1169,18 @@ while (_streamer.Current != null)
 The following VHDL features require additional development:
 
 ### Parser-Level (require Parser module changes):
-*   **Custom type declarations** - `type big_mem_t is array (0 to 199999) of STD_LOGIC;`
-*   **Record types** - `type filter_config_t`, `type axi_lite_m2s_t`
 *   **VHDL aggregates** - `(others => '0')`, `(others => '1')`
 *   **Signal attributes with 'range** - `for i in inputs'range loop`
 *   **Array slicing with complex expressions**
 *   **Complete time literal support** - `ns`, `ps`, `us`, etc.
 *   **Full range type constraints**
+
+### Partially Supported (Interpreter-side ready, awaiting Parser support):
+*   **Custom type declarations** - Infrastructure implemented in `TypeDefinition.cs` and `TypeRegistry.cs`
+    *   Enumeration types: `type state_t is (IDLE, RUN, STOP);` ✓ Interpreter ready
+    *   Array types: `type memory_t is array (0 to 255) of std_logic;` ✓ Interpreter ready
+    *   Record types: `type packet_t is record ... end record;` ✓ Interpreter ready
+    *   Note: Full support requires Parser to properly tokenize `type` keyword and declarations
 
 ### Interpreter-Level (current module):
 *   **Generate statement execution** - for-generate, if-generate (currently skipped)

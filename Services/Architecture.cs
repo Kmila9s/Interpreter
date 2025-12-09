@@ -43,6 +43,12 @@ public class Architecture : ISControl, IControl
     /// Gets the list of tasks.
     /// </summary>
     public List<object> Tasks { get; private set; } = new();
+
+    /// <summary>
+    /// Gets the registry of custom type definitions for this architecture.
+    /// </summary>
+    public TypeRegistry CustomTypes { get; private set; } = new();
+
     private Tokenizer _tokenizer = new(string.Empty);
     private TokenStream _streamer = default!;
     private readonly OperationDetector _detector = new();
@@ -118,9 +124,25 @@ public class Architecture : ISControl, IControl
         EntityName = _streamer.Current?.Value ?? string.Empty;
         _streamer.Expect(IDENTIFIERS);
         _streamer.Expect(KEYWORDS); // is
-        VariableSyntetizer syntetizer = new(_streamer, [.._ports, .._generics], IsSignal: true);
+
+        // Pass TypeRegistry to VariableSyntetizer for custom type parsing
+        VariableSyntetizer syntetizer = new(_streamer, [.._ports, .._generics], IsSignal: true, TypeRegistry: CustomTypes);
         syntetizer.Syntetize();
         _signals = syntetizer.Variables;
+
+        // Transfer any parsed types to our registry (in case syntetizer created new ones)
+        foreach (var typeDef in syntetizer.ParsedTypes.Types.Values)
+        {
+            CustomTypes.TryRegister(typeDef);
+        }
+
+#if DEBUG
+        if (CustomTypes.Count > 0)
+        {
+            Console.WriteLine($"[Architecture] {CustomTypes.GetSummary()}");
+        }
+#endif
+
         _streamer.Expect(KEYWORDS); // begin
         SyntetizeBehaviour();
     }
@@ -130,10 +152,12 @@ public class Architecture : ISControl, IControl
     /// </summary>
     public void SyntetizeBehaviour()
     {
+        // v0.13.0 Fix: Move comparators list outside the loop to prevent repeated allocation
+        // Previously created a new List<Variable> on every iteration, causing memory pressure
+        HashSet<Variable> comparators = [.. _ports, .. _generics, .. _signals];
+
         while (_streamer.Current?.Value.ToLower() != "end")
         {
-            List<Variable> comparators = [.. _ports, .. _generics, .. _signals];
-
             // Check for labeled statements (label : process/for/if/etc or component instantiation)
             if (_streamer.Current?.Type == IDENTIFIERS)
             {
@@ -149,7 +173,7 @@ public class Architecture : ISControl, IControl
                         switch (keyword)
                         {
                             case "process":
-                                Process process = new(comparators.ToHashSet(), _streamer);
+                                Process process = new(comparators, _streamer);
                                 process.Syntetize();
                                 Tasks.Add(process);
                                 continue;
@@ -186,12 +210,12 @@ public class Architecture : ISControl, IControl
                 switch (_streamer.Current.Value.ToLower())
                 {
                     case "process":
-                        Process process = new(comparators.ToHashSet(), _streamer);
+                        Process process = new(comparators, _streamer);
                         process.Syntetize();
                         Tasks.Add(process);
                         break;
                     case "if":
-                        IfStructure ifStructure = new(comparators.ToHashSet(), _streamer);
+                        IfStructure ifStructure = new(comparators, _streamer);
                         ifStructure.Syntetize();
                         Tasks.Add(ifStructure);
                         // Consume 'end if ;' after the if structure

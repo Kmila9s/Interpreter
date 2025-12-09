@@ -1,4 +1,5 @@
 using Interpreter.Interfaces;
+using Interpreter.Models;
 using Parser.Models;
 using Parser.Repositories;
 using static Parser.Models.Constants.TYPE;
@@ -13,10 +14,17 @@ public class VariableSyntetizer : ISControl
     /// Gets the synthesized variables.
     /// </summary>
     public HashSet<Variable> Variables { get; private set; } = new();
+
+    /// <summary>
+    /// Gets the parsed custom type definitions.
+    /// </summary>
+    public TypeRegistry ParsedTypes { get; private set; } = new();
+
     private HashSet<Variable> _comparator;
     private readonly string _breaker = "begin";
     private bool _isPort, _isGeneric, _isSignal;
     private TokenStream _streamer;
+    private TypeRegistry? _typeRegistry;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="VariableSyntetizer"/> class.
@@ -27,7 +35,8 @@ public class VariableSyntetizer : ISControl
     /// <param name="IsGeneric">Whether the variable is a generic.</param>
     /// <param name="Breaker">The token that breaks the synthesis.</param>
     /// <param name="IsSignal">Whether the variable is a signal.</param>
-    public VariableSyntetizer(TokenStream Streamer, HashSet<Variable> Comparator, bool IsPort = false, bool IsGeneric = false, string Breaker = "begin", bool IsSignal = false)
+    /// <param name="TypeRegistry">Optional type registry for custom type resolution.</param>
+    public VariableSyntetizer(TokenStream Streamer, HashSet<Variable> Comparator, bool IsPort = false, bool IsGeneric = false, string Breaker = "begin", bool IsSignal = false, TypeRegistry? TypeRegistry = null)
     {
         _streamer = Streamer;
         _isPort = IsPort;
@@ -35,6 +44,7 @@ public class VariableSyntetizer : ISControl
         _isGeneric = IsGeneric;
         _comparator = Comparator;
         _breaker = _isPort || _isGeneric ? ")" : Breaker.ToLower();
+        _typeRegistry = TypeRegistry;
     }
 
     /// <summary>
@@ -153,14 +163,28 @@ public class VariableSyntetizer : ISControl
             var dataType = Variable.GetDatatype(_streamer.Current?.Value ?? string.Empty);
             string dataTypeStr = _streamer.Current?.Value?.ToLower() ?? string.Empty;
 
-            // If datatype is UNKNOWN, skip this declaration (custom type)
-            if (dataType == Constants.DATATYPES.UNKNOWN && !_isPort && !_isGeneric)
+            // Check if it's a custom type in the registry
+            TypeDefinition? customTypeDef = null;
+            if (dataType == Constants.DATATYPES.UNKNOWN)
+            {
+                // Try to resolve from type registry
+                customTypeDef = _typeRegistry?.Get(dataTypeStr) ?? ParsedTypes.Get(dataTypeStr);
+                if (customTypeDef != null)
+                {
+#if DEBUG
+                    Console.WriteLine($"[VariableSyntetizer] Resolved custom type '{dataTypeStr}' -> {customTypeDef.Kind}, Size={customTypeDef.TotalSize}");
+#endif
+                }
+            }
+
+            // If datatype is UNKNOWN and NOT in registry, skip this declaration
+            if (dataType == Constants.DATATYPES.UNKNOWN && customTypeDef == null && !_isPort && !_isGeneric)
             {
                 SkipToSemicolon();
                 continue;
             }
             // For ports with unknown type, try to skip gracefully
-            if (dataType == Constants.DATATYPES.UNKNOWN && (_isPort || _isGeneric))
+            if (dataType == Constants.DATATYPES.UNKNOWN && customTypeDef == null && (_isPort || _isGeneric))
             {
                 // Skip to semicolon or closing paren of port list (not inner parens)
                 int parenDepth = 0;
@@ -291,6 +315,33 @@ public class VariableSyntetizer : ISControl
                 int end = Convert.ToInt32(varValue);
                 VectorSize = Math.Abs(end - initial);
             }
+            // Handle custom types from registry
+            else if (customTypeDef != null)
+            {
+                VectorSize = customTypeDef.TotalSize;
+                // For custom types, use base type if available (for arrays/subtypes)
+                if (customTypeDef.Kind == TypeKind.Array)
+                {
+                    dataType = customTypeDef.BaseType != Constants.DATATYPES.UNKNOWN
+                        ? customTypeDef.BaseType
+                        : Constants.DATATYPES.STD_LOGIC_VECTOR;
+                }
+                else if (customTypeDef.Kind == TypeKind.Enumeration)
+                {
+                    // Enum types can be stored as integers representing enum index
+                    dataType = Constants.DATATYPES.INTEGER;
+                }
+                else if (customTypeDef.Kind == TypeKind.Subtype)
+                {
+                    dataType = customTypeDef.BaseType;
+                }
+                // For records, use STD_LOGIC_VECTOR as storage type
+                else if (customTypeDef.Kind == TypeKind.Record)
+                {
+                    dataType = Constants.DATATYPES.STD_LOGIC_VECTOR;
+                }
+                _streamer.Expect(KEYWORDS); // consume type name
+            }
 
             object value = new();
             // Handle initialization with :=
@@ -310,6 +361,13 @@ public class VariableSyntetizer : ISControl
                 if (_isPort && dataType == Constants.DATATYPES.STD_LOGIC_VECTOR)
                     Console.WriteLine($"[VariableSyntetizer] Creating port '{variable.Name}' with VectorSize={VectorSize}");
 #endif
+                // Determine initial value - use custom type default if applicable
+                object initValue = value;
+                if (!_isPort && customTypeDef != null && (value is null || value.Equals(new object())))
+                {
+                    initValue = customTypeDef.GetDefaultValue();
+                }
+
                 var newVar = new Variable()
                 {
                     Name = variable.Name,
@@ -317,10 +375,19 @@ public class VariableSyntetizer : ISControl
                     IsPort = _isPort,
                     PortType = portType,
                     Size = VectorSize,  // Set Size BEFORE Value to avoid Size setter issues
-                    Value = !_isPort ? value : null!,
+                    Value = !_isPort ? initValue : null!,
                 };
+
+                // Store custom type name reference for debugging/analysis
+                if (customTypeDef != null)
+                {
+                    // We could add a CustomTypeName property to Variable if needed
 #if DEBUG
-                if (_isPort && dataType == Constants.DATATYPES.STD_LOGIC_VECTOR)
+                    Console.WriteLine($"[VariableSyntetizer] Created '{newVar.Name}' with custom type '{customTypeDef.Name}', Size={newVar.Size}");
+#endif
+                }
+#if DEBUG
+                else if (_isPort && dataType == Constants.DATATYPES.STD_LOGIC_VECTOR)
                     Console.WriteLine($"[VariableSyntetizer] Created port '{newVar.Name}' actual Size={newVar.Size}");
 #endif
                 Variables.Add(newVar);
@@ -739,61 +806,383 @@ public class VariableSyntetizer : ISControl
     }
 
     /// <summary>
-    /// Skips a type declaration until ';'
+    /// Parses a type declaration and registers it in the type registry.
     /// Handles: enumeration types, array types, record types
     /// </summary>
-    private void SkipTypeDeclaration()
+    /// <remarks>
+    /// <para>Supported type declarations:</para>
+    /// <code>
+    /// type state_t is (IDLE, RUN, STOP);                           -- Enumeration
+    /// type mem_t is array (0 to 255) of std_logic;                 -- Array
+    /// type packet_t is record valid: std_logic; end record;        -- Record
+    /// </code>
+    /// <para>v0.13.0: Added safety limit to prevent infinite loops.</para>
+    /// </remarks>
+    private void ParseTypeDeclaration()
     {
-        // Type declarations can be complex (records, arrays, etc.)
-        // Only 'record' needs depth tracking (has 'end record')
-        // Array types end with ';' directly (no 'end array')
-        int recordDepth = 0;
-        while (_streamer.Current != null)
+        int iterations = 0;
+        const int MAX_ITERATIONS = 10000;
+
+        // Skip 'type' keyword
+        if (_streamer.Current?.Value.ToLower() == "type")
         {
-            string val = _streamer.Current.Value.ToLower();
+            _streamer.MoveNext();
+        }
 
-            // Safety check: if we hit 'begin', we've gone too far
-            if (val == "begin" || val == _breaker)
-            {
-                break;
-            }
+        // Get type name
+        string typeName = _streamer.Current?.Value ?? "unknown_type";
+        _streamer.MoveNext(); // skip type name
 
-            if (val == "record")
+        // Skip 'is' keyword
+        if (_streamer.Current?.Value.ToLower() == "is")
+        {
+            _streamer.MoveNext();
+        }
+
+        // Determine type kind based on next token
+        string nextToken = _streamer.Current?.Value.ToLower() ?? "";
+
+        TypeDefinition? typeDef = null;
+
+        if (nextToken == "(")
+        {
+            // Enumeration type: type state_t is (IDLE, RUN, STOP);
+            typeDef = ParseEnumerationType(typeName);
+        }
+        else if (nextToken == "array")
+        {
+            // Array type: type mem_t is array (0 to 255) of std_logic;
+            typeDef = ParseArrayType(typeName);
+        }
+        else if (nextToken == "record")
+        {
+            // Record type: type packet_t is record ... end record;
+            typeDef = ParseRecordType(typeName);
+        }
+        else
+        {
+            // Unknown or subtype - skip to semicolon
+            SkipToSemicolonSafe(ref iterations, MAX_ITERATIONS);
+        }
+
+        // Register the parsed type
+        if (typeDef != null)
+        {
+            ParsedTypes.TryRegister(typeDef);
+            _typeRegistry?.TryRegister(typeDef);
+        }
+    }
+
+    /// <summary>
+    /// Parses an enumeration type declaration.
+    /// Example: type state_t is (IDLE, RUN, STOP);
+    /// </summary>
+    private TypeDefinition ParseEnumerationType(string typeName)
+    {
+        var typeDef = new TypeDefinition
+        {
+            Name = typeName,
+            Kind = TypeKind.Enumeration
+        };
+
+        // Skip '('
+        if (_streamer.Current?.Value == "(")
+        {
+            _streamer.MoveNext();
+        }
+
+        // Collect enum values until ')'
+        int iterations = 0;
+        while (_streamer.Current != null && _streamer.Current.Value != ")" && iterations < 1000)
+        {
+            iterations++;
+            string val = _streamer.Current.Value;
+
+            if (val != "," && val != "(" && val != ")")
             {
-                recordDepth++;
-            }
-            else if (val == "end")
-            {
-                _streamer.MoveNext();
-                if (_streamer.Current?.Value.ToLower() == "record")
-                {
-                    recordDepth--;
-                    _streamer.MoveNext(); // skip 'record'
-                    // Skip optional type name
-                    if (_streamer.Current?.Type == IDENTIFIERS)
-                    {
-                        _streamer.MoveNext();
-                    }
-                }
-                if (recordDepth == 0)
-                {
-                    // Skip semicolon
-                    if (_streamer.Current?.Value == ";")
-                    {
-                        _streamer.MoveNext();
-                    }
-                    break;
-                }
-                continue;
-            }
-            else if (val == ";" && recordDepth == 0)
-            {
-                _streamer.MoveNext(); // skip ';'
-                break;
+                typeDef.EnumValues.Add(val);
             }
             _streamer.MoveNext();
         }
+
+        // Skip ')' and ';'
+        if (_streamer.Current?.Value == ")")
+            _streamer.MoveNext();
+        if (_streamer.Current?.Value == ";")
+            _streamer.MoveNext();
+
+#if DEBUG
+        Console.WriteLine($"[ParseTypeDeclaration] Enumeration '{typeName}': ({string.Join(", ", typeDef.EnumValues)})");
+#endif
+
+        return typeDef;
     }
+
+    /// <summary>
+    /// Parses an array type declaration.
+    /// Example: type mem_t is array (0 to 255) of std_logic_vector(7 downto 0);
+    /// </summary>
+    private TypeDefinition ParseArrayType(string typeName)
+    {
+        var typeDef = new TypeDefinition
+        {
+            Name = typeName,
+            Kind = TypeKind.Array
+        };
+
+        // Skip 'array'
+        if (_streamer.Current?.Value.ToLower() == "array")
+        {
+            _streamer.MoveNext();
+        }
+
+        // Parse array bounds: (0 to 255) or (natural range <>)
+        if (_streamer.Current?.Value == "(")
+        {
+            _streamer.MoveNext(); // skip '('
+
+            // Check for unconstrained array (natural range <>)
+            if (_streamer.Current?.Value.ToLower() == "natural" ||
+                _streamer.Current?.Value.ToLower() == "integer" ||
+                _streamer.Current?.Value.ToLower() == "positive")
+            {
+                typeDef.IsUnconstrained = true;
+                // Skip to closing ')'
+                while (_streamer.Current != null && _streamer.Current.Value != ")")
+                {
+                    _streamer.MoveNext();
+                }
+            }
+            else
+            {
+                // Parse constrained bounds: low to/downto high
+                if (int.TryParse(_streamer.Current?.Value, out int lowBound))
+                {
+                    _streamer.MoveNext(); // skip low bound
+
+                    // Get direction (to or downto)
+                    string direction = _streamer.Current?.Value.ToLower() ?? "to";
+                    typeDef.IsDownto = direction == "downto";
+                    _streamer.MoveNext(); // skip 'to' or 'downto'
+
+                    // Get high bound
+                    if (int.TryParse(_streamer.Current?.Value, out int highBound))
+                    {
+                        if (typeDef.IsDownto)
+                        {
+                            typeDef.ArrayBounds = (highBound, lowBound);
+                        }
+                        else
+                        {
+                            typeDef.ArrayBounds = (lowBound, highBound);
+                        }
+                        _streamer.MoveNext(); // skip high bound
+                    }
+                }
+            }
+
+            // Skip to closing ')'
+            while (_streamer.Current != null && _streamer.Current.Value != ")")
+            {
+                _streamer.MoveNext();
+            }
+            if (_streamer.Current?.Value == ")")
+                _streamer.MoveNext();
+        }
+
+        // Skip 'of'
+        if (_streamer.Current?.Value.ToLower() == "of")
+        {
+            _streamer.MoveNext();
+        }
+
+        // Get element type
+        string elementTypeName = _streamer.Current?.Value ?? "std_logic";
+        typeDef.BaseTypeName = elementTypeName;
+        typeDef.BaseType = Variable.GetDatatype(elementTypeName);
+        _streamer.MoveNext();
+
+        // Check for element vector size: std_logic_vector(7 downto 0)
+        if (_streamer.Current?.Value == "(")
+        {
+            _streamer.MoveNext(); // skip '('
+
+            if (int.TryParse(_streamer.Current?.Value, out int elemHigh))
+            {
+                _streamer.MoveNext(); // skip high
+                _streamer.MoveNext(); // skip 'downto' or 'to'
+
+                if (int.TryParse(_streamer.Current?.Value, out int elemLow))
+                {
+                    typeDef.ElementSize = Math.Abs(elemHigh - elemLow) + 1;
+                    _streamer.MoveNext(); // skip low
+                }
+            }
+
+            // Skip to closing ')'
+            while (_streamer.Current != null && _streamer.Current.Value != ")")
+            {
+                _streamer.MoveNext();
+            }
+            if (_streamer.Current?.Value == ")")
+                _streamer.MoveNext();
+        }
+        else if (typeDef.BaseType == Constants.DATATYPES.STD_LOGIC ||
+                 typeDef.BaseType == Constants.DATATYPES.BIT)
+        {
+            typeDef.ElementSize = 1;
+        }
+
+        // Skip ';'
+        if (_streamer.Current?.Value == ";")
+            _streamer.MoveNext();
+
+#if DEBUG
+        Console.WriteLine($"[ParseTypeDeclaration] Array '{typeName}': ({typeDef.ArrayBounds.Low} to {typeDef.ArrayBounds.High}) of {typeDef.BaseTypeName}, ElementSize={typeDef.ElementSize}, TotalSize={typeDef.TotalSize}");
+#endif
+
+        return typeDef;
+    }
+
+    /// <summary>
+    /// Parses a record type declaration.
+    /// Example: type packet_t is record valid: std_logic; data: std_logic_vector(7 downto 0); end record;
+    /// </summary>
+    private TypeDefinition ParseRecordType(string typeName)
+    {
+        var typeDef = new TypeDefinition
+        {
+            Name = typeName,
+            Kind = TypeKind.Record
+        };
+
+        // Skip 'record'
+        if (_streamer.Current?.Value.ToLower() == "record")
+        {
+            _streamer.MoveNext();
+        }
+
+        int iterations = 0;
+        const int MAX_ITERATIONS = 1000;
+
+        // Parse fields until 'end record'
+        while (_streamer.Current != null && iterations < MAX_ITERATIONS)
+        {
+            iterations++;
+            string val = _streamer.Current.Value.ToLower();
+
+            if (val == "end")
+            {
+                _streamer.MoveNext(); // skip 'end'
+                if (_streamer.Current?.Value.ToLower() == "record")
+                {
+                    _streamer.MoveNext(); // skip 'record'
+                }
+                // Skip optional type name after 'end record'
+                if (_streamer.Current?.Type == IDENTIFIERS)
+                {
+                    _streamer.MoveNext();
+                }
+                break;
+            }
+
+            // Parse field: fieldName : fieldType;
+            if (_streamer.Current?.Type == IDENTIFIERS)
+            {
+                string fieldName = _streamer.Current.Value;
+                _streamer.MoveNext();
+
+                if (_streamer.Current?.Value == ":")
+                {
+                    _streamer.MoveNext(); // skip ':'
+
+                    string fieldTypeName = _streamer.Current?.Value ?? "std_logic";
+                    var fieldType = Variable.GetDatatype(fieldTypeName);
+                    _streamer.MoveNext();
+
+                    int fieldSize = 1;
+                    // Check for vector size
+                    if (_streamer.Current?.Value == "(")
+                    {
+                        _streamer.MoveNext(); // skip '('
+                        if (int.TryParse(_streamer.Current?.Value, out int high))
+                        {
+                            _streamer.MoveNext();
+                            _streamer.MoveNext(); // skip direction
+                            if (int.TryParse(_streamer.Current?.Value, out int low))
+                            {
+                                fieldSize = Math.Abs(high - low) + 1;
+                                _streamer.MoveNext();
+                            }
+                        }
+                        // Skip to ')'
+                        while (_streamer.Current != null && _streamer.Current.Value != ")")
+                            _streamer.MoveNext();
+                        if (_streamer.Current?.Value == ")")
+                            _streamer.MoveNext();
+                    }
+
+                    var field = new Variable
+                    {
+                        Name = fieldName,
+                        Type = fieldType,
+                        Size = fieldSize
+                    };
+                    typeDef.RecordFields.Add(field);
+
+                    // Skip ';'
+                    if (_streamer.Current?.Value == ";")
+                        _streamer.MoveNext();
+
+                    continue;
+                }
+            }
+
+            _streamer.MoveNext();
+        }
+
+        // Skip final ';'
+        if (_streamer.Current?.Value == ";")
+            _streamer.MoveNext();
+
+#if DEBUG
+        Console.WriteLine($"[ParseTypeDeclaration] Record '{typeName}': {typeDef.RecordFields.Count} fields, TotalSize={typeDef.TotalSize}");
+#endif
+
+        return typeDef;
+    }
+
+    /// <summary>
+    /// Safely skips to semicolon with iteration limit.
+    /// </summary>
+    private void SkipToSemicolonSafe(ref int iterations, int maxIterations)
+    {
+        int parenDepth = 0;
+        while (_streamer.Current != null && iterations < maxIterations)
+        {
+            iterations++;
+            string val = _streamer.Current.Value;
+
+            if (val == "(") parenDepth++;
+            else if (val == ")") parenDepth--;
+            else if (val == ";" && parenDepth == 0)
+            {
+                _streamer.MoveNext();
+                break;
+            }
+            else if (val.ToLower() == "begin" || val.ToLower() == _breaker)
+            {
+                break;
+            }
+
+            _streamer.MoveNext();
+        }
+    }
+
+    /// <summary>
+    /// Legacy method - now calls ParseTypeDeclaration for backwards compatibility.
+    /// </summary>
+    private void SkipTypeDeclaration() => ParseTypeDeclaration();
 
     /// <summary>
     /// Skips a subtype declaration until ';'

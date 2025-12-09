@@ -39,8 +39,17 @@ public class Operation : IOperation {
     /// Gets the variables of the operation.
     /// </summary>
     public HashSet<Variable> Variables { get; private set; }
-    private readonly Regex _variableRegex, _operators, _logicOperators, _arithOperators;
-    private readonly LiteralsFinder _finder;
+
+    // v0.13.0 Fix: Use static shared Regex instances to prevent memory bloat
+    // Previously each Operation created 4 new Regex objects, causing significant memory allocation
+    // when processing many expressions (e.g., large VHDL files with many signals/assignments)
+    private static readonly RegexOptions _optionsCompiled = RegexOptions.Compiled;
+    private static readonly Regex _variableRegex = new(Constants.IDENTIFIERS, _optionsCompiled);
+    private static readonly Regex _operators = new(Constants.OPERATORS, _optionsCompiled);
+    private static readonly Regex _logicOperators = new(Constants.LOGIC_OPERATORS, _optionsCompiled);
+    private static readonly Regex _arithOperators = new(Constants.ARITH_OPERATORS, _optionsCompiled);
+    private static readonly LiteralsFinder _finder = new();
+
     private string _rawData = string.Empty;
 
     /// <summary>
@@ -50,13 +59,7 @@ public class Operation : IOperation {
     /// <param name="Variables">The variables of the operation.</param>
     public Operation(string RawData, HashSet<Variable> Variables)
     {
-        RegexOptions optionsCompiled = RegexOptions.Compiled;
         this.Variables = Variables;
-        _variableRegex = new(Constants.IDENTIFIERS, optionsCompiled);
-        _operators = new(Constants.OPERATORS, optionsCompiled);
-        _logicOperators = new(Constants.LOGIC_OPERATORS, optionsCompiled);
-        _arithOperators = new(Constants.ARITH_OPERATORS, optionsCompiled);
-        _finder = new();
         _rawData = RawData;
         Tokenizer tokenizer = new(string.Empty);
         if (RawData.Contains("<="))
