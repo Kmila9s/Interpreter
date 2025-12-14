@@ -7,7 +7,7 @@ This module is a core component of **Kmila-9s**, a project officially titled "Ap
 **Author:** Ulrich Tamayo Daniel
 **Email:** dulricht1700@alumno.ipn.mx
 **Email 2:** danielulrichtamayo@gmail.com
-**Version:** 0.16.0
+**Version:** 0.16.1
 **Last Updated:** December 13, 2025
 
 ---
@@ -98,13 +98,21 @@ ISControl (Interface)
 ├── WhileLoopStructure
 ├── SimpleLoopStructure
 ├── Process
-└── Architecture
+├── Architecture
+└── Executer
 
 IOperation (Interface)
 ├── IArithOperation
 │   └── Operator (arithmetic: +, -, *, /, **, mod)
 └── ILogicOperation
     └── Operator (logic: and, or, xor, nand, nor, not)
+
+IFinder (Interface)
+└── LiteralsFinder
+
+Utility Classes
+├── OperationDetector
+└── ShuntingYard (ISYard)
 ```
 
 ### Key Components Summary
@@ -128,6 +136,9 @@ IOperation (Interface)
 *   **`TypeRegistry.cs`**: Registry for custom VHDL type definitions (enumeration, array, record, subtype)
 *   **`TypeDefinition.cs`**: Model class representing custom type declarations
 *   **`ProgressReporter.cs`**: Event-based progress reporting system for UI integration
+*   **`Executer.cs`**: Orchestrates task execution with pause/resume/cancel support, integrates with TimeMachine
+*   **`LiteralsFinder.cs`**: Identifies and classifies literal values (integers, std_logic, vectors, hex, boolean) using regex
+*   **`OperationDetector.cs`**: Detects operation types (assignment, etc.) from raw string input
 
 ---
 
@@ -1210,6 +1221,22 @@ while (_streamer.Current != null)
 ---
 
 ## 10. Changelog
+
+### v0.16.1 - Diagram Updates (2025-12-13)
+
+#### Diagram and Documentation Updates
+
+*   **Class Hierarchy**: Updated to include all Repository classes:
+    *   Added `Executer` under ISControl interface implementations
+    *   Added `IFinder` interface with `LiteralsFinder` implementation
+    *   Added Utility Classes section with `OperationDetector` and `ShuntingYard`
+
+*   **Key Components Summary**: Added missing component descriptions:
+    *   `Executer.cs` - Task orchestration with pause/resume/cancel support
+    *   `LiteralsFinder.cs` - Literal value identification and classification
+    *   `OperationDetector.cs` - Operation type detection from raw input
+
+---
 
 ### v0.16.0 - Documentation Enhancement Release (2025-12-13)
 
