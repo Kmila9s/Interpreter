@@ -10,9 +10,52 @@ namespace Interpreter.Repositories;
 
 /// <summary>
 /// Represents and manages the logic for a VHDL 'while' loop statement.
-/// Syntax: while condition loop statements end loop;
-/// Example: while count < 10 loop ... end loop;
+/// Parses and executes while loops with condition-based iteration.
 /// </summary>
+/// <remarks>
+/// <para><strong>Supported VHDL Syntax:</strong></para>
+/// <code>
+/// -- Simple while loop
+/// while count &lt; 10 loop
+///     count := count + 1;
+/// end loop;
+///
+/// -- While loop with complex condition
+/// while (enable = '1') and (error = '0') loop
+///     process_data;
+/// end loop;
+///
+/// -- While loop with exit
+/// while true loop
+///     statements;
+///     exit when done = '1';
+/// end loop;
+/// </code>
+/// <para><strong>Features:</strong></para>
+/// <list type="bullet">
+/// <item>Condition evaluation before each iteration</item>
+/// <item>Support for boolean, std_logic ('1'/'0'), and string conditions</item>
+/// <item>Nested control structures (if, case, loops) within body</item>
+/// <item>Exit statement support with optional 'when' condition</item>
+/// <item>Maximum iteration limit (10,000) to prevent infinite loops</item>
+/// </list>
+/// <para><strong>Condition Evaluation:</strong></para>
+/// <para>
+/// The condition is re-evaluated before each iteration using a fresh Operation instance.
+/// This ensures variable changes in the loop body affect the condition.
+/// Supported condition result types:
+/// </para>
+/// <list type="bullet">
+/// <item><c>bool</c> - Direct boolean evaluation</item>
+/// <item><c>char</c> - '1' is true, anything else is false</item>
+/// <item><c>string</c> - "1" or "true" (case-insensitive) is true</item>
+/// </list>
+/// <para><strong>Safety:</strong></para>
+/// <para>
+/// A maximum iteration count (MaxIterations = 10,000) prevents runaway loops
+/// during simulation. A warning is issued if this limit is reached.
+/// </para>
+/// </remarks>
 public class WhileLoopStructure : ISControl
 {
     private readonly HashSet<Variable> _variables;

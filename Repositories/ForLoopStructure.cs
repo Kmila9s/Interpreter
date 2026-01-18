@@ -11,9 +11,48 @@ namespace Interpreter.Repositories;
 
 /// <summary>
 /// Represents and manages the logic for a VHDL 'for' loop statement.
-/// Syntax: for identifier in range loop statements end loop;
-/// Example: for i in 0 to 7 loop ... end loop;
+/// Parses and executes for loops with ascending (to) or descending (downto) iteration.
 /// </summary>
+/// <remarks>
+/// <para><strong>Supported VHDL Syntax:</strong></para>
+/// <code>
+/// -- Ascending loop
+/// for i in 0 to 7 loop
+///     statements;
+/// end loop;
+///
+/// -- Descending loop
+/// for i in 7 downto 0 loop
+///     statements;
+/// end loop;
+///
+/// -- Loop with expression ranges
+/// for i in 0 to ARRAY_SIZE - 1 loop
+///     statements;
+/// end loop;
+/// </code>
+/// <para><strong>Features:</strong></para>
+/// <list type="bullet">
+/// <item>Ascending ranges with 'to' keyword</item>
+/// <item>Descending ranges with 'downto' keyword</item>
+/// <item>Expression-based range bounds (e.g., TREE_DEPTH - 1)</item>
+/// <item>Automatic loop variable creation and scoping</item>
+/// <item>Nested control structures (if, case, loops) within body</item>
+/// <item>Exit statement support with optional 'when' condition</item>
+/// </list>
+/// <para><strong>v0.13.0 Improvements:</strong></para>
+/// <list type="bullet">
+/// <item>Added expression evaluation for range bounds via ParseRangeValue()</item>
+/// <item>Added iteration guards to prevent infinite loops during synthesis</item>
+/// <item>Support for undeclared identifiers in range expressions (returns 0)</item>
+/// </list>
+/// <para><strong>Execution:</strong></para>
+/// <para>
+/// During execution, a loop variable is created with the specified name and added
+/// to a temporary scope. The loop iterates from RangeStart to RangeEnd (inclusive),
+/// updating the loop variable each iteration before executing the body tasks.
+/// </para>
+/// </remarks>
 public class ForLoopStructure : ISControl
 {
     private readonly HashSet<Variable> _variables;

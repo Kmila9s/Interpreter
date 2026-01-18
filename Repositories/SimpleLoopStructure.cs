@@ -10,10 +10,57 @@ namespace Interpreter.Repositories;
 
 /// <summary>
 /// Represents and manages the logic for a VHDL simple (infinite) loop statement.
-/// Syntax: loop statements end loop;
-/// Note: Simple loops run until an 'exit' statement is encountered.
-/// Example: loop ... exit when condition; ... end loop;
+/// Parses and executes infinite loops that rely on exit statements to terminate.
 /// </summary>
+/// <remarks>
+/// <para><strong>Supported VHDL Syntax:</strong></para>
+/// <code>
+/// -- Simple infinite loop with conditional exit
+/// loop
+///     read_data;
+///     exit when buffer_full = '1';
+/// end loop;
+///
+/// -- Loop with unconditional exit
+/// loop
+///     process_item;
+///     if done then
+///         exit;
+///     end if;
+/// end loop;
+///
+/// -- Loop with multiple exit conditions
+/// loop
+///     compute;
+///     exit when error = '1';
+///     exit when complete = '1';
+/// end loop;
+/// </code>
+/// <para><strong>Features:</strong></para>
+/// <list type="bullet">
+/// <item>Infinite loop semantics (no implicit termination condition)</item>
+/// <item>Exit statement support with optional 'when' condition</item>
+/// <item>Multiple exit conditions tracked via ExitConditions list</item>
+/// <item>Unconditional exit (just 'exit;') supported</item>
+/// <item>Nested control structures (if, case, loops) within body</item>
+/// <item>Maximum iteration limit (10,000) as safety fallback</item>
+/// </list>
+/// <para><strong>Exit Condition Handling:</strong></para>
+/// <para>
+/// Exit statements are parsed during synthesis and stored as ExitCondition objects.
+/// During execution, after each iteration:
+/// </para>
+/// <list type="number">
+/// <item>If an unconditional exit was encountered, loop terminates</item>
+/// <item>Each conditional exit's condition is re-evaluated</item>
+/// <item>If any condition is true ('1', "true", or boolean true), loop terminates</item>
+/// </list>
+/// <para><strong>Safety:</strong></para>
+/// <para>
+/// A maximum iteration count (MaxIterations = 10,000) prevents runaway loops
+/// during simulation if no exit condition is met. A warning is issued if reached.
+/// </para>
+/// </remarks>
 public class SimpleLoopStructure : ISControl
 {
     private readonly HashSet<Variable> _variables;
