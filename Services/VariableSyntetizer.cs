@@ -130,6 +130,19 @@ public class VariableSyntetizer : ISControl
                 continue;
             }
 
+            // Check for constant declarations with function calls (e.g., constant X := func(Y);)
+            // v0.13.0: Constants with function calls cannot be evaluated at parse time
+            // Only skip if the initialization contains a function call (identifier followed by '(')
+            if (_streamer.Current?.Value?.ToLower() == "constant")
+            {
+                if (HasFunctionCallInConstant())
+                {
+                    SkipConstantDeclaration();
+                    continue;
+                }
+                // Otherwise, fall through to normal variable parsing
+            }
+
             List<Variable> variables = new();
             string varType = _streamer.Current?.Value ?? string.Empty;
             if (!_isPort && !_isGeneric)
@@ -215,7 +228,16 @@ public class VariableSyntetizer : ISControl
                     _streamer.MoveNext();
                 continue;
             }
-            _streamer.Expect(KEYWORDS);
+            // v0.13.0: Handle custom types - they are IDENTIFIERS not KEYWORDS
+            // For custom types found in the registry, consume the type identifier directly
+            if (customTypeDef != null)
+            {
+                _streamer.Expect(IDENTIFIERS); // consume custom type name (e.g., 'reg_array_t')
+            }
+            else
+            {
+                _streamer.Expect(KEYWORDS); // consume standard type keyword (e.g., 'std_logic')
+            }
             int VectorSize = 0;
 
             // Set default size for single-bit types
@@ -349,7 +371,14 @@ public class VariableSyntetizer : ISControl
                 {
                     dataType = Constants.DATATYPES.STD_LOGIC_VECTOR;
                 }
-                _streamer.Expect(KEYWORDS); // consume type name
+                // v0.13.0: Type name already consumed at lines 231-240, no need to Expect again
+            }
+
+            // v0.13.0: Handle 'bus' keyword for guarded signals (e.g., signal x : std_logic_vector bus := ...)
+            // The 'bus' keyword appears after the type to indicate a guarded/resolved signal
+            if (_streamer.Current?.Value?.ToLower() == "bus")
+            {
+                _streamer.MoveNext(); // Skip 'bus' keyword
             }
 
             object value = new();
@@ -766,6 +795,125 @@ public class VariableSyntetizer : ISControl
         // Skip the time unit
         if (_streamer.Current?.Type == TIME_VARIABLES)
         {
+            _streamer.MoveNext();
+        }
+    }
+
+    /// <summary>
+    /// Checks if a constant declaration contains a function call in its initialization.
+    /// Uses lookahead without consuming tokens.
+    /// </summary>
+    /// <returns>True if the constant has a function call like func(args), false otherwise.</returns>
+    private bool HasFunctionCallInConstant()
+    {
+        _streamer.SetRollBack();
+
+        // Look ahead to find ':=' and then check what follows
+        bool foundAssign = false;
+        int iterations = 0;
+        const int MAX_LOOKAHEAD = 50;
+
+        while (_streamer.Current != null && iterations < MAX_LOOKAHEAD)
+        {
+            iterations++;
+            string val = _streamer.Current.Value;
+
+            // Stop if we hit semicolon or begin
+            if (val == ";" || val.ToLower() == "begin" || val.ToLower() == _breaker)
+            {
+                break;
+            }
+
+            if (val == ":=")
+            {
+                foundAssign = true;
+                _streamer.MoveNext();
+                continue;
+            }
+
+            // After ':=', check if we have identifier followed by '('
+            // which indicates a function call
+            if (foundAssign)
+            {
+                // Skip any leading '(' for aggregate initializers like "(others => '0')"
+                if (val == "(")
+                {
+                    _streamer.RollBack();
+                    return false; // This is an aggregate, not a function call
+                }
+
+                // Check for identifier followed by '('
+                if (_streamer.Current?.Type == IDENTIFIERS)
+                {
+                    string ident = _streamer.Current.Value;
+                    _streamer.MoveNext();
+
+                    // If next is '(', it's a function call
+                    if (_streamer.Current?.Value == "(")
+                    {
+                        _streamer.RollBack();
+                        return true;
+                    }
+                }
+
+                // If we got here without finding function call pattern, it's a simple constant
+                _streamer.RollBack();
+                return false;
+            }
+
+            _streamer.MoveNext();
+        }
+
+        _streamer.RollBack();
+        return false;
+    }
+
+    /// <summary>
+    /// Skips a constant declaration until ';'.
+    /// Constants with function calls cannot be evaluated at parse time.
+    /// </summary>
+    /// <remarks>
+    /// <para>v0.13.0: Added to handle constants with function call initializations.</para>
+    /// <code>
+    /// constant TREE_DEPTH : integer := clog2(NUM_INPUTS);  -- Skipped
+    /// constant ZERO : std_logic_vector(7 downto 0) := (others => '0');  -- Skipped
+    /// </code>
+    /// </remarks>
+    private void SkipConstantDeclaration()
+    {
+        // Skip 'constant' keyword
+        _streamer.MoveNext();
+
+        int parenDepth = 0;
+        int iterations = 0;
+        const int MAX_ITERATIONS = 1000;
+
+        // Skip until we find ';' at depth 0
+        while (_streamer.Current != null && iterations < MAX_ITERATIONS)
+        {
+            iterations++;
+            string val = _streamer.Current.Value;
+
+            if (val == "(")
+            {
+                parenDepth++;
+            }
+            else if (val == ")")
+            {
+                parenDepth--;
+            }
+            else if (val == ";" && parenDepth == 0)
+            {
+                _streamer.MoveNext(); // skip ';'
+                break;
+            }
+
+            // Safety: if we hit 'begin', we've gone too far
+            if (val.ToLower() == "begin" || val.ToLower() == _breaker)
+            {
+                break;
+            }
+
             _streamer.MoveNext();
         }
     }

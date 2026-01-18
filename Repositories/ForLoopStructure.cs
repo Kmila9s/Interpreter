@@ -135,24 +135,55 @@ public class ForLoopStructure : ISControl
     }
 
     /// <summary>
-    /// Parses a range value (integer literal or variable reference).
+    /// Parses a range value (integer literal, variable reference, or expression).
+    /// v0.13.0: Added support for expressions like "TREE_DEPTH - 1".
     /// </summary>
     private int ParseRangeValue()
     {
-        string value = _streamer.Current?.Value ?? "0";
-        _streamer.MoveNext();
-
-        // Try to parse as integer
-        if (int.TryParse(value, out int result))
+        // Collect tokens until we hit 'to', 'downto', 'loop', or 'generate'
+        StringBuilder exprBuilder = new();
+        while (_streamer.Current != null)
         {
-            return result;
+            string currentVal = _streamer.Current.Value.ToLower();
+            // Stop at direction/boundary keywords
+            if (currentVal == "to" || currentVal == "downto" || currentVal == "loop" || currentVal == "generate")
+                break;
+
+            exprBuilder.Append(_streamer.Current.Value + " ");
+            _streamer.MoveNext();
         }
 
-        // Try to find variable
-        var variable = _variables.FirstOrDefault(v => v.Name.Equals(value, StringComparison.OrdinalIgnoreCase));
-        if (variable != null && int.TryParse(variable.Value?.ToString(), out int varValue))
+        string expr = exprBuilder.ToString().Trim();
+        if (string.IsNullOrEmpty(expr))
+            return 0;
+
+        // Try simple integer first
+        if (int.TryParse(expr, out int simpleResult))
+            return simpleResult;
+
+        // Try single variable lookup
+        if (!expr.Contains(' '))
         {
-            return varValue;
+            var variable = _variables.FirstOrDefault(v => v.Name.Equals(expr, StringComparison.OrdinalIgnoreCase));
+            if (variable != null && int.TryParse(variable.Value?.ToString(), out int varValue))
+                return varValue;
+        }
+
+        // Try to evaluate as expression (may contain undeclared identifiers)
+        try
+        {
+            Operation op = new(expr, _variables);
+            var result = op.Execute();
+            if (result is Variable v && int.TryParse(v.Value?.ToString(), out int opResult))
+                return opResult;
+            if (result is int intResult)
+                return intResult;
+            if (int.TryParse(result?.ToString(), out int parsedResult))
+                return parsedResult;
+        }
+        catch
+        {
+            // Expression evaluation failed - return default
         }
 
         return 0;
@@ -163,8 +194,11 @@ public class ForLoopStructure : ISControl
     /// </summary>
     private void SyntetizeLoopBody(HashSet<Variable> loopVariables)
     {
-        while (!IsEndOfLoop())
+        int iterations = 0;
+        const int maxIterations = 5000;
+        while (!IsEndOfLoop() && iterations < maxIterations)
         {
+            iterations++;
             if (_streamer.Current?.Type == KEYWORDS)
             {
                 var keyword = _streamer.Current.Value.ToLower();
@@ -280,8 +314,11 @@ public class ForLoopStructure : ISControl
     private void SyntetizeAssignment(HashSet<Variable> variables)
     {
         var rawDataBuilder = new StringBuilder();
-        while (_streamer.Current?.Value != ";" && !IsEndOfLoop())
+        int iterations = 0;
+        const int maxIterations = 1000;
+        while (_streamer.Current?.Value != ";" && !IsEndOfLoop() && iterations < maxIterations)
         {
+            iterations++;
             rawDataBuilder.Append(_streamer.Current?.Value + " ");
             _streamer.MoveNext();
         }

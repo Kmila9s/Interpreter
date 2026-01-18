@@ -245,6 +245,20 @@ public class CaseStructure : ISControl
                         ConsumeEndKeyword("case");
                         break;
 
+                    case "null":
+                        // v0.13.0: Handle 'null;' statement (VHDL no-operation)
+                        _streamer.MoveNext(); // skip 'null'
+                        if (_streamer.Current?.Value == ";")
+                            _streamer.MoveNext(); // skip ';'
+                        break;
+
+                    case "for":
+                    case "while":
+                    case "loop":
+                        // v0.13.0: Skip loop constructs (not fully implemented)
+                        SkipToKeywordEnd("loop");
+                        break;
+
                     default:
                         _streamer.MoveNext();
                         break;
@@ -321,6 +335,49 @@ public class CaseStructure : ISControl
         {
             Operation op = new(operation, _variables);
             branch.Tasks.Add(op);
+        }
+    }
+
+    /// <summary>
+    /// Skips tokens until we reach 'end keyword;' for the specified keyword.
+    /// Used to skip over loop constructs that are not fully implemented.
+    /// </summary>
+    private void SkipToKeywordEnd(string keyword)
+    {
+        int depth = 1;
+        int iterations = 0;
+        const int maxIterations = 5000;
+
+        while (depth > 0 && _streamer.Current != null && iterations < maxIterations)
+        {
+            iterations++;
+            var val = _streamer.Current.Value.ToLower();
+
+            // Track nested constructs
+            if (val == keyword || val == "for" || val == "while")
+            {
+                // Only increment depth if followed by loop-related content
+                _streamer.MoveNext();
+                if (_streamer.Current?.Value.ToLower() == "loop" || val == "loop")
+                    depth++;
+                continue;
+            }
+
+            if (val == "end")
+            {
+                _streamer.MoveNext();
+                if (_streamer.Current?.Value.ToLower() == keyword ||
+                    _streamer.Current?.Value.ToLower() == "loop")
+                {
+                    depth--;
+                    _streamer.MoveNext();
+                    if (_streamer.Current?.Value == ";")
+                        _streamer.MoveNext();
+                    continue;
+                }
+            }
+
+            _streamer.MoveNext();
         }
     }
 

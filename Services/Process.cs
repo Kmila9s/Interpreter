@@ -137,8 +137,12 @@ public class Process : ISControl, IControl
         // Combine all available variables: signals/ports and local process variables
         HashSet<Variable> allVariables = [.. SignalsPorts, .. _variables];
 
-        while (_streamer.Current?.Value.ToLower() != "end")
+        int iterations = 0;
+        const int maxIterations = 10000;
+
+        while (_streamer.Current?.Value.ToLower() != "end" && iterations < maxIterations)
         {
+            iterations++;
             // Check for cancellation at each iteration
             cancellationToken.ThrowIfCancellationRequested();
 

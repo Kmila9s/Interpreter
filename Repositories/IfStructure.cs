@@ -229,8 +229,11 @@ public class IfStructure : ISControl
     /// </summary>
     private void SyntetizeBranchBody(IfBranch branch)
     {
-        while (!IsEndOfBranch())
+        int iterations = 0;
+        const int maxIterations = 5000;
+        while (!IsEndOfBranch() && iterations < maxIterations)
         {
+            iterations++;
             var currentValue = _streamer.Current?.Value.ToLower();
 
             if (_streamer.Current?.Type == KEYWORDS)
@@ -308,8 +311,11 @@ public class IfStructure : ISControl
     private void SyntetizeAssingation(IfBranch branch)
     {
         var rawDataBuilder = new StringBuilder();
-        while (_streamer.Current?.Value != ";" && !IsEndOfBranch())
+        int iterations = 0;
+        const int maxIterations = 1000;
+        while (_streamer.Current?.Value != ";" && !IsEndOfBranch() && iterations < maxIterations)
         {
+            iterations++;
             rawDataBuilder.Append(_streamer.Current?.Value + " ");
             _streamer.MoveNext();
         }

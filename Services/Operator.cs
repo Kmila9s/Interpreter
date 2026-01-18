@@ -75,6 +75,24 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                     case "not":
                         Precedence = PrecedencesLogicOperators.NOT;
                     break;
+                    case "sll":
+                        Precedence = PrecedencesLogicOperators.SLL;
+                    break;
+                    case "srl":
+                        Precedence = PrecedencesLogicOperators.SRL;
+                    break;
+                    case "sla":
+                        Precedence = PrecedencesLogicOperators.SLA;
+                    break;
+                    case "sra":
+                        Precedence = PrecedencesLogicOperators.SRA;
+                    break;
+                    case "rol":
+                        Precedence = PrecedencesLogicOperators.ROL;
+                    break;
+                    case "ror":
+                        Precedence = PrecedencesLogicOperators.ROR;
+                    break;
                 }
             break;
             case OperatorType.ARITH_OPERATION:
@@ -162,7 +180,10 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// <param name="rightSideOperator">The right side operator.</param>
     /// <returns>The result of the operation.</returns>
     public object Execute(Variable leftSideOperator, Variable rightSideOperator){
-        if(leftSideOperator.Type != rightSideOperator.Type)
+        // v0.13.0: Relax type checking when one operand is a stub (undeclared identifier)
+        // This allows parsing to continue even with missing package definitions
+        if(leftSideOperator.Type != rightSideOperator.Type &&
+           !leftSideOperator.IsStub && !rightSideOperator.IsStub)
             throw ParserException.TypeMismatch(
                 leftSideOperator.Type.ToString(),
                 rightSideOperator.Type.ToString(),
@@ -330,7 +351,14 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                 (rightVariable.Type == DATATYPES.INTEGER || rightVariable.Type == DATATYPES.NATURAL)
             ){
                 result = SolveIntOperation(GetInt(leftVariable), GetInt(rightVariable));
-            }else
+            }
+            // v0.13.0: Skip type check for stub variables (undeclared identifiers)
+            else if (leftVariable.IsStub || rightVariable.IsStub)
+            {
+                // Return a default value for operations involving stub variables
+                result = 0;
+            }
+            else
                 throw new InvalidOperationException($"The datatypes do not match: {leftVariable.Name}:{leftVariable.Type} - {rightVariable.Name}:{rightVariable.Name}");
         }else{
             switch(leftVariable.Type){
@@ -339,6 +367,23 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                 break;
                 case DATATYPES.NATURAL:
                     result = SolveRealOperation(GetDouble(leftVariable), GetDouble(rightVariable));
+                break;
+                case DATATYPES.STD_LOGIC_VECTOR:
+                    // v0.13.0: Handle STD_LOGIC_VECTOR arithmetic (common with stub variables)
+                    // Return 0 for stub operations; for real vectors, attempt integer interpretation
+                    if (leftVariable.IsStub || rightVariable.IsStub)
+                    {
+                        result = 0;
+                    }
+                    else
+                    {
+                        // Try to interpret vectors as integers for arithmetic
+                        result = SolveIntOperation(GetInt(leftVariable), GetInt(rightVariable));
+                    }
+                break;
+                default:
+                    // Default to integer operation or return 0 for unhandled types
+                    result = 0;
                 break;
             }
         }
@@ -419,6 +464,14 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// <returns>The result of the vector logic operation.</returns>
     private object SolveVectorLogicOperation(Variable v1, Variable v2)
     {
+        // Check for shift/rotate operations (v2 is shift amount, not a vector)
+        string opLower = OperatorName.ToLower();
+        if (opLower == "sll" || opLower == "srl" || opLower == "sla" || opLower == "sra" ||
+            opLower == "rol" || opLower == "ror")
+        {
+            return SolveShiftOperation(v1, v2);
+        }
+
         if (v1.Size != v2.Size)
             throw new ParserException(
                 $"Vector size mismatch in '{OperatorName}' operation: '{v1.Name}' has {v1.Size} bits, '{v2.Name}' has {v2.Size} bits");
@@ -430,6 +483,66 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             Variable valueA = new("tempA", vectorString1[i], DATATYPES.STD_LOGIC),
             valueB = new("tempB", vectorString2[i], DATATYPES.STD_LOGIC);
             result += Convert.ToString(SolveLogicOperation(valueA, valueB));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Solves shift and rotate operations (sll, srl, sla, sra, rol, ror).
+    /// </summary>
+    /// <param name="vector">The vector to shift/rotate.</param>
+    /// <param name="amount">The shift/rotate amount variable.</param>
+    /// <returns>The shifted/rotated vector as string.</returns>
+    private object SolveShiftOperation(Variable vector, Variable amount)
+    {
+        string vecStr = vector.Value?.ToString() ?? new string('0', vector.Size);
+        int shiftAmt;
+
+        // Get shift amount from the variable
+        if (amount.Type == DATATYPES.INTEGER || amount.Type == DATATYPES.NATURAL)
+        {
+            shiftAmt = Convert.ToInt32(amount.Value);
+        }
+        else
+        {
+            // Try to parse from value
+            if (!int.TryParse(amount.Value?.ToString() ?? "0", out shiftAmt))
+                shiftAmt = 0;
+        }
+
+        int len = vecStr.Length;
+        if (len == 0) return vecStr;
+
+        // Clamp shift amount
+        shiftAmt = Math.Abs(shiftAmt) % len;
+        if (shiftAmt == 0) return vecStr;
+
+        string result;
+        switch (OperatorName.ToLower())
+        {
+            case "sll": // Shift Left Logical - fill with '0' on right
+                result = vecStr.Substring(shiftAmt) + new string('0', shiftAmt);
+                break;
+            case "srl": // Shift Right Logical - fill with '0' on left
+                result = new string('0', shiftAmt) + vecStr.Substring(0, len - shiftAmt);
+                break;
+            case "sla": // Shift Left Arithmetic - fill with rightmost bit on right
+                char fillRight = vecStr[len - 1];
+                result = vecStr.Substring(shiftAmt) + new string(fillRight, shiftAmt);
+                break;
+            case "sra": // Shift Right Arithmetic - fill with leftmost bit (sign) on left
+                char signBit = vecStr[0];
+                result = new string(signBit, shiftAmt) + vecStr.Substring(0, len - shiftAmt);
+                break;
+            case "rol": // Rotate Left
+                result = vecStr.Substring(shiftAmt) + vecStr.Substring(0, shiftAmt);
+                break;
+            case "ror": // Rotate Right
+                result = vecStr.Substring(len - shiftAmt) + vecStr.Substring(0, len - shiftAmt);
+                break;
+            default:
+                result = vecStr;
+                break;
         }
         return result;
     }

@@ -4,14 +4,14 @@ namespace Interpreter.Models;
 /// Defines the precedence levels for logical operators. Lower integer values indicate higher precedence.
 /// </summary>
 public enum PrecedencesLogicOperators : int {
-    /// <summary>Comparation operators (e.g., =, /=, <, >).</summary>
+    /// <summary>Comparation operators (e.g., =, /=, less than, greater than).</summary>
     COMPARATION = 5,
-    /// <summary>Signal or variable assignment (e.g., <=, :=). Lowest precedence.</summary>
+    /// <summary>Signal or variable assignment (e.g., less than or equal, :=). Lowest precedence.</summary>
     ASSIGNATION = 5, // LOWEST PRECEDENCE
     /// <summary>Parenthesis for grouping expressions.</summary>
     PARENTHESIS = 4,
     /// <summary>Exclusive OR operator.</summary>
-    XOR = 3, 
+    XOR = 3,
     /// <summary>Exclusive NOR operator.</summary>
     XNOR = 3,
     /// <summary>OR operator.</summary>
@@ -22,6 +22,18 @@ public enum PrecedencesLogicOperators : int {
     AND = 1,
     /// <summary>NAND operator.</summary>
     NAND = 1,
+    /// <summary>Shift left logical operator (sll).</summary>
+    SLL = 1,
+    /// <summary>Shift right logical operator (srl).</summary>
+    SRL = 1,
+    /// <summary>Shift left arithmetic operator (sla).</summary>
+    SLA = 1,
+    /// <summary>Shift right arithmetic operator (sra).</summary>
+    SRA = 1,
+    /// <summary>Rotate left operator (rol).</summary>
+    ROL = 1,
+    /// <summary>Rotate right operator (ror).</summary>
+    ROR = 1,
     /// <summary>Absolute value operator.</summary>
     ABS = 0,
     /// <summary>Logical NOT operator. Highest precedence.</summary>
