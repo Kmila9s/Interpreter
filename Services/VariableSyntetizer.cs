@@ -723,6 +723,57 @@ public class VariableSyntetizer : ISControl
     }
 
     /// <summary>
+    /// Evaluates an argument expression for function calls.
+    /// Handles variable references, literals, and simple expressions.
+    /// v0.15.0: Added to support constant evaluation with function calls.
+    /// v0.15.0: Now also checks PackageRegistry for package constants.
+    /// </summary>
+    /// <param name="argExpr">The argument expression string.</param>
+    /// <returns>The evaluated value.</returns>
+    private object EvaluateArgumentExpression(string argExpr)
+    {
+        // Try to find variable reference first
+        var argVar = _comparator.FirstOrDefault(p => p.Name.Equals(argExpr, StringComparison.OrdinalIgnoreCase));
+        if (!ReferenceEquals(argVar, null))
+            return argVar.Value ?? 0;
+
+        // Check Variables being declared
+        argVar = Variables.FirstOrDefault(p => p.Name.Equals(argExpr, StringComparison.OrdinalIgnoreCase));
+        if (!ReferenceEquals(argVar, null))
+            return argVar.Value ?? 0;
+
+        // v0.15.0: Package constant lookup disabled for debugging
+        // var packageConst = PackageRegistry.Instance.GetConstant(argExpr);
+        // if (packageConst != null && packageConst.Value != null)
+        //     return packageConst.Value;
+
+        // Try parsing as integer
+        if (int.TryParse(argExpr, out int argInt))
+            return argInt;
+
+        // Check for expression with operators
+        string[] basicOps = { "**", "*", "-", "+", "/" };
+        if (basicOps.Any(argExpr.Contains))
+        {
+            try
+            {
+                Operation op = new(argExpr, _comparator);
+                var outData = op.Execute();
+                if (outData is Variable variable)
+                    return variable.Value ?? 0;
+                return outData ?? 0;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        // Return as string if nothing else works
+        return argExpr;
+    }
+
+    /// <summary>
     /// Parses an aggregate expression like (others => '0') or a parenthesized expression.
     /// </summary>
     private object ParseAggregateOrExpression()

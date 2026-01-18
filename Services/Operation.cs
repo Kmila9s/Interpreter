@@ -306,7 +306,6 @@ public class Operation : IOperation {
                 }
 
                 // v0.13.0: Handle undeclared identifiers gracefully
-                // Instead of throwing, create a stub variable so parsing can continue
                 // This allows tests with package/constant references to pass
                 Variable variable;
                 if (!Variables.Contains(currentItem))

@@ -188,29 +188,59 @@ class Program
         // Solution: Count function/procedure starts and ends, only check for architecture end when depth is 0
         int funcProcDepth = 0;
 
+        // v0.15.0: Collect package lines for parsing
+        List<string> packageLines = new();
+        string currentPackageName = string.Empty;
+        bool isPackageBody = false;
+
         foreach (var item in prev)
         {
             // Check for cancellation periodically during parsing
             cancellationToken.ThrowIfCancellationRequested();
             string comparer = item.Trim().ToLower();
 
-            // Skip package declarations and bodies
+            // v0.15.0: Parse package declarations and bodies to extract constants
             if (comparer.StartsWith("package ") && !comparer.StartsWith("package body"))
             {
                 inPackage = true;
+                isPackageBody = false;
+                // Extract package name: "package pkg_name is" -> "pkg_name"
+                var parts = item.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 2)
+                    currentPackageName = parts[1];
+                packageLines.Clear();
+                packageLines.Add(item);
                 continue;
             }
             if (comparer.StartsWith("package body"))
             {
                 inPackage = true;
+                isPackageBody = true;
+                // Extract package name: "package body pkg_name is" -> "pkg_name"
+                var parts = item.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 3)
+                    currentPackageName = parts[2];
+                packageLines.Clear();
+                packageLines.Add(item);
                 continue;
             }
             if (inPackage)
             {
+                packageLines.Add(item);
                 // Check for end of package
                 if (comparer.StartsWith("end ") && comparer.EndsWith(";"))
                 {
                     inPackage = false;
+                    // v0.15.0: Parse package constants (simple integer constants only)
+                    try
+                    {
+                        ParsePackageConstants(currentPackageName, packageLines.ToArray(), isPackageBody);
+                    }
+                    catch
+                    {
+                        // Ignore errors in package parsing - don't affect main parsing
+                    }
+                    packageLines.Clear();
                 }
                 continue;
             }
@@ -346,6 +376,175 @@ class Program
         }
 
         return (Entities, architectureCount);
+    }
+
+    /// <summary>
+    /// Parses package constants and registers them in the PackageRegistry.
+    /// v0.15.0: Added to support package constant resolution.
+    /// </summary>
+    /// <param name="packageName">The name of the package.</param>
+    /// <param name="lines">The package source lines.</param>
+    /// <param name="isBody">True if this is a package body, false for package declaration.</param>
+    static void ParsePackageConstants(string packageName, string[] lines, bool isBody)
+    {
+        if (string.IsNullOrEmpty(packageName) || lines.Length == 0)
+            return;
+
+        var registry = PackageRegistry.Instance;
+
+        // Check if package already exists
+        var existingPackage = registry.GetPackage(packageName);
+        var packageDef = existingPackage ?? new PackageDefinition { Name = packageName };
+
+        // Parse each line looking for constant declarations
+        foreach (var line in lines)
+        {
+            string trimmed = line.Trim();
+            string lower = trimmed.ToLower();
+
+            // Skip non-constant lines
+            if (!lower.StartsWith("constant "))
+                continue;
+
+            try
+            {
+                // Parse: constant NAME : TYPE := VALUE;
+                // Example: constant DATA_WIDTH : integer := 32;
+                // Example: constant DEPTH : integer := 16;
+
+                // Remove "constant " prefix
+                string rest = trimmed.Substring(9).Trim();
+
+                // Find the colon
+                int colonIdx = rest.IndexOf(':');
+                if (colonIdx < 0) continue;
+
+                string constName = rest.Substring(0, colonIdx).Trim();
+
+                // Find the := for initialization
+                int assignIdx = rest.IndexOf(":=");
+                if (assignIdx < 0)
+                {
+                    // Declaration without initialization (common in package declaration)
+                    // Just register the name, value will be set in package body
+                    continue;
+                }
+
+                // Get type (between : and :=)
+                string typeStr = rest.Substring(colonIdx + 1, assignIdx - colonIdx - 1).Trim();
+
+                // Get value (after := until ;)
+                int semiIdx = rest.IndexOf(';', assignIdx);
+                if (semiIdx < 0) semiIdx = rest.Length;
+                string valueStr = rest.Substring(assignIdx + 2, semiIdx - assignIdx - 2).Trim();
+
+                // Determine datatype
+                var dataType = Variable.GetDatatype(typeStr.Split('(')[0].Trim());
+
+                // Evaluate value
+                object value;
+                if (int.TryParse(valueStr, out int intVal))
+                {
+                    value = intVal;
+                }
+                else if (valueStr.StartsWith("\"") && valueStr.EndsWith("\""))
+                {
+                    value = valueStr.Trim('"');
+                }
+                else if (valueStr.StartsWith("'") && valueStr.EndsWith("'"))
+                {
+                    value = valueStr.Trim('\'');
+                }
+                else if (valueStr.ToLower() == "true")
+                {
+                    value = true;
+                }
+                else if (valueStr.ToLower() == "false")
+                {
+                    value = false;
+                }
+                else if (valueStr.StartsWith("x\"") || valueStr.StartsWith("X\""))
+                {
+                    // Hex literal
+                    string hex = valueStr.Substring(2, valueStr.Length - 3);
+                    value = string.Join("", hex.Select(c =>
+                        Convert.ToString(Convert.ToInt32(c.ToString(), 16), 2).PadLeft(4, '0')));
+                }
+                else if (StandardFunctions.IsStandardFunction(valueStr.Split('(')[0].Trim()))
+                {
+                    // Function call like clog2(16)
+                    string funcName = valueStr.Split('(')[0].Trim();
+                    int openParen = valueStr.IndexOf('(');
+                    int closeParen = valueStr.LastIndexOf(')');
+                    if (openParen >= 0 && closeParen > openParen)
+                    {
+                        string argsStr = valueStr.Substring(openParen + 1, closeParen - openParen - 1);
+                        var args = new List<object>();
+
+                        // Parse arguments (simple case: single integer or constant reference)
+                        foreach (var arg in argsStr.Split(','))
+                        {
+                            string argTrim = arg.Trim();
+                            if (int.TryParse(argTrim, out int argInt))
+                            {
+                                args.Add(argInt);
+                            }
+                            else
+                            {
+                                // Try to resolve as constant
+                                var refConst = registry.GetConstant(argTrim);
+                                if (refConst != null && refConst.Value != null)
+                                    args.Add(refConst.Value);
+                                else
+                                    args.Add(argTrim);
+                            }
+                        }
+
+                        value = StandardFunctions.EvaluateFunction(funcName, args.ToArray(), new HashSet<Variable>());
+                    }
+                    else
+                    {
+                        value = valueStr;
+                    }
+                }
+                else
+                {
+                    // Check if it's a reference to another constant
+                    var refConst = registry.GetConstant(valueStr);
+                    if (refConst != null && refConst.Value != null)
+                        value = refConst.Value;
+                    else
+                        value = valueStr;
+                }
+
+                // Create and register the constant
+                var constant = new Variable
+                {
+                    Name = constName,
+                    Type = dataType,
+                    Value = value,
+                    PortType = Parser.Models.Constants.PortType.IN // Constants are read-only
+                };
+
+                registry.RegisterConstant(constant, packageName);
+
+#if DEBUG
+                Console.WriteLine($"[ParsePackageConstants] Registered: {packageName}.{constName} = {value}");
+#endif
+            }
+            catch (Exception ex)
+            {
+#if DEBUG
+                Console.WriteLine($"[ParsePackageConstants] Error parsing constant: {ex.Message}");
+#endif
+            }
+        }
+
+        // Register the package if it's new
+        if (existingPackage == null)
+        {
+            registry.TryRegisterPackage(packageDef);
+        }
     }
 
     /// <summary>
