@@ -125,10 +125,23 @@ public class CaseStructure : ISControl
     {
         _streamer.Expect(KEYWORDS); // consume 'case'
 
+        // v0.16.1: Handle optional parentheses around selector: case (selector) is
+        bool hasParens = _streamer.Current?.Value == "(";
+        if (hasParens)
+        {
+            _streamer.MoveNext(); // consume '('
+        }
+
         // Get selector expression
         _selectorName = _streamer.Current?.Value ?? "";
         _selector = _variables.FirstOrDefault(v => v.Name.Equals(_selectorName, StringComparison.OrdinalIgnoreCase));
         _streamer.MoveNext(); // consume selector
+
+        // v0.16.1: Consume closing parenthesis if we had an opening one
+        if (hasParens && _streamer.Current?.Value == ")")
+        {
+            _streamer.MoveNext(); // consume ')'
+        }
 
         _streamer.Expect(KEYWORDS); // consume 'is'
 

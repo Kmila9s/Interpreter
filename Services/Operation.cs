@@ -62,24 +62,53 @@ public class Operation : IOperation {
         this.Variables = Variables;
         _rawData = RawData;
         Tokenizer tokenizer = new(string.Empty);
-        if (RawData.Contains("<="))
+
+        // v0.16.1: Support both signal assignment (<=) and variable assignment (:=)
+        bool isSignalAssignment = RawData.Contains("<=");
+        bool isVariableAssignment = RawData.Contains(":=");
+
+        if (isSignalAssignment || isVariableAssignment)
         {
-            var splitted = RawData.Trim().Split("<=");
-            string varName = splitted[0].Trim();
-            var foundVar = this.Variables.Where(p => !ReferenceEquals(p, null)).FirstOrDefault(p =>
-                !string.IsNullOrEmpty(p.Name) &&
-                p.Name.Equals(varName, StringComparison.OrdinalIgnoreCase));
-            if (ReferenceEquals(foundVar, null))
+            // Determine which operator to use for splitting
+            string assignOp = isSignalAssignment ? "<=" : ":=";
+            var splitted = RawData.Trim().Split(assignOp);
+
+            if (splitted.Length >= 2)
             {
-                // The <= might be a comparison operator, not assignment
-                // Create a temporary result variable for condition
-                Result = new Variable("ConditionResult", "false", Constants.DATATYPES.BOOLEAN);
-                Result.PortType = Constants.PortType.OUT;
+                string varName = splitted[0].Trim();
+                var foundVar = this.Variables.Where(p => !ReferenceEquals(p, null)).FirstOrDefault(p =>
+                    !string.IsNullOrEmpty(p.Name) &&
+                    p.Name.Equals(varName, StringComparison.OrdinalIgnoreCase));
+
+                if (ReferenceEquals(foundVar, null))
+                {
+                    if (isSignalAssignment)
+                    {
+                        // The <= might be a comparison operator, not assignment
+                        // Create a temporary result variable for condition
+                        Result = new Variable("ConditionResult", "false", Constants.DATATYPES.BOOLEAN);
+                        Result.PortType = Constants.PortType.OUT;
+                    }
+                    else
+                    {
+                        // For := with unknown variable, create a temporary variable
+                        // This handles local variables in procedures/processes
+                        Result = new Variable(varName, "0", Constants.DATATYPES.STD_LOGIC_VECTOR);
+                        Result.PortType = Constants.PortType.OUT;
+                        RawData = splitted[1].Trim();
+                    }
+                }
+                else
+                {
+                    Result = foundVar;
+                    RawData = splitted[1].Trim();
+                }
             }
             else
             {
-                Result = foundVar;
-                RawData = splitted[1].Trim();
+                // Malformed assignment - treat as condition
+                Result = new Variable("ConditionResult", "false", Constants.DATATYPES.BOOLEAN);
+                Result.PortType = Constants.PortType.OUT;
             }
         }
         else

@@ -194,14 +194,26 @@ public class Architecture : ISControl, IControl
         // Previously created a new List<Variable> on every iteration, causing memory pressure
         HashSet<Variable> comparators = [.. _ports, .. _generics, .. _signals];
 
-        while (_streamer.Current?.Value.ToLower() != "end")
+        // v0.16.1: Add iteration limit to prevent infinite loops
+        const int MAX_ITERATIONS = 100000;
+        int iterations = 0;
+
+        while (_streamer.Current != null && _streamer.Current.Value.ToLower() != "end")
         {
             // Check for cancellation at each iteration
             cancellationToken.ThrowIfCancellationRequested();
 
+            // v0.16.1: Safety check for infinite loops
+            if (++iterations > MAX_ITERATIONS)
+            {
+                throw new InvalidOperationException($"Architecture parsing exceeded {MAX_ITERATIONS} iterations - possible infinite loop");
+            }
+
             // Check for labeled statements (label : process/for/if/etc or component instantiation)
             if (_streamer.Current?.Type == IDENTIFIERS)
             {
+                // v0.16.0: Capture the label before moving past it
+                string label = _streamer.Current.Value;
                 _streamer.SetRollBack();
                 _streamer.MoveNext();
                 if (_streamer.Current?.Value == ":")
@@ -231,10 +243,25 @@ public class Architecture : ISControl, IControl
                                 continue;
                         }
                     }
-                    else if (_streamer.Current?.Type == IDENTIFIERS)
+                    else if (_streamer.Current?.Type == IDENTIFIERS ||
+                             _streamer.Current?.Value?.ToLower() == "entity")
                     {
                         // Component instantiation: label : ComponentName [generic map (...)] port map (...)
-                        SkipComponentInstantiation();
+                        // Or direct entity instantiation: label : entity library.EntityName [generic map (...)] port map (...)
+                        // v0.16.0: Parse and register component instances for hierarchical design support
+                        try
+                        {
+                            var instance = ParseComponentInstantiation(label);
+                            if (instance != null)
+                            {
+                                EntityRegistry.Instance.RegisterComponentInstance(EntityName, instance);
+                            }
+                        }
+                        catch
+                        {
+                            // Fall back to skipping the component instantiation
+                            SkipToSemicolon();
+                        }
                         continue;
                     }
                 }
@@ -282,7 +309,7 @@ public class Architecture : ISControl, IControl
     private void SkipGenerateOrLoop()
     {
         int depth = 1;
-        string startKeyword = _streamer.Current?.Value.ToLower() ?? "";
+        string startKeyword = _streamer.Current?.Value?.ToLower() ?? "";
         _streamer.MoveNext(); // consume the starting keyword
 
         while (_streamer.Current != null && depth > 0)
@@ -295,7 +322,7 @@ public class Architecture : ISControl, IControl
             else if (currentVal == "end")
             {
                 _streamer.MoveNext(); // consume 'end'
-                string endWhat = _streamer.Current?.Value.ToLower() ?? "";
+                string endWhat = _streamer.Current?.Value?.ToLower() ?? "";
                 if (endWhat == "generate" || endWhat == "loop" || endWhat == "for" || endWhat == "if" || endWhat == "process")
                 {
                     depth--;
@@ -356,10 +383,10 @@ public class Architecture : ISControl, IControl
     /// </summary>
     private void ConsumeEndIf()
     {
-        if (_streamer.Current?.Value.ToLower() == "end")
+        if (_streamer.Current?.Value?.ToLower() == "end")
         {
             _streamer.MoveNext(); // consume 'end'
-            if (_streamer.Current?.Value.ToLower() == "if")
+            if (_streamer.Current?.Value?.ToLower() == "if")
             {
                 _streamer.MoveNext(); // consume 'if'
             }
@@ -367,6 +394,240 @@ public class Architecture : ISControl, IControl
             {
                 _streamer.MoveNext(); // consume ';'
             }
+        }
+    }
+
+    /// <summary>
+    /// Parses a component instantiation and returns metadata about it.
+    /// v0.16.0: Added to support hierarchical design discovery.
+    /// </summary>
+    private ComponentInstance? ParseComponentInstantiation(string instanceLabel)
+    {
+        var instance = new ComponentInstance { InstanceName = instanceLabel };
+
+        // Check for 'entity' keyword (direct entity instantiation)
+        if (_streamer.Current?.Value?.ToLower() == "entity")
+        {
+            _streamer.MoveNext(); // consume 'entity'
+
+            // Parse library.entity format: work.EntityName or just EntityName
+            string entityRef = _streamer.Current?.Value ?? string.Empty;
+            _streamer.MoveNext();
+
+            if (_streamer.Current?.Value == ".")
+            {
+                // Has library prefix
+                instance.LibraryName = entityRef;
+                _streamer.MoveNext(); // consume '.'
+                instance.EntityName = _streamer.Current?.Value ?? string.Empty;
+                _streamer.MoveNext();
+            }
+            else
+            {
+                instance.EntityName = entityRef;
+            }
+
+            // Check for architecture specification: (arch_name)
+            if (_streamer.Current?.Value == "(")
+            {
+                _streamer.MoveNext(); // consume '('
+                // Skip architecture name
+                while (_streamer.Current != null && _streamer.Current.Value != ")")
+                {
+                    _streamer.MoveNext();
+                }
+                if (_streamer.Current?.Value == ")")
+                    _streamer.MoveNext(); // consume ')'
+            }
+        }
+        else
+        {
+            // Component name directly (uses component declaration)
+            instance.EntityName = _streamer.Current?.Value ?? string.Empty;
+            _streamer.MoveNext();
+        }
+
+        // Parse optional generic map
+        if (_streamer.Current?.Value?.ToLower() == "generic")
+        {
+            _streamer.MoveNext(); // consume 'generic'
+            if (_streamer.Current?.Value?.ToLower() == "map")
+            {
+                _streamer.MoveNext(); // consume 'map'
+                ParseGenericMap(instance);
+            }
+        }
+
+        // Parse port map
+        if (_streamer.Current?.Value?.ToLower() == "port")
+        {
+            _streamer.MoveNext(); // consume 'port'
+            if (_streamer.Current?.Value?.ToLower() == "map")
+            {
+                _streamer.MoveNext(); // consume 'map'
+                ParsePortMap(instance);
+            }
+        }
+
+        // Consume trailing semicolon
+        if (_streamer.Current?.Value == ";")
+        {
+            _streamer.MoveNext();
+        }
+
+        return instance;
+    }
+
+    /// <summary>
+    /// Parses a generic map: ( GenericName => Value, ... )
+    /// </summary>
+    private void ParseGenericMap(ComponentInstance instance)
+    {
+        if (_streamer.Current?.Value != "(")
+            return;
+
+        _streamer.MoveNext(); // consume '('
+
+        int parenDepth = 1;
+        string currentGeneric = string.Empty;
+        string currentValue = string.Empty;
+        bool afterArrow = false;
+
+        while (_streamer.Current != null && parenDepth > 0)
+        {
+            string val = _streamer.Current.Value;
+
+            if (val == "(")
+            {
+                parenDepth++;
+                if (afterArrow)
+                    currentValue += val + " ";
+            }
+            else if (val == ")")
+            {
+                parenDepth--;
+                if (parenDepth > 0 && afterArrow)
+                    currentValue += val + " ";
+                else if (parenDepth == 0)
+                {
+                    // End of generic map - save current mapping
+                    if (!string.IsNullOrEmpty(currentGeneric))
+                    {
+                        instance.GenericMap[currentGeneric.Trim()] = currentValue.Trim();
+                    }
+                }
+            }
+            else if (val == "=>")
+            {
+                afterArrow = true;
+            }
+            else if (val == "," && parenDepth == 1)
+            {
+                // Save current mapping and start new one
+                if (!string.IsNullOrEmpty(currentGeneric))
+                {
+                    instance.GenericMap[currentGeneric.Trim()] = currentValue.Trim();
+                }
+                currentGeneric = string.Empty;
+                currentValue = string.Empty;
+                afterArrow = false;
+            }
+            else
+            {
+                if (afterArrow)
+                    currentValue += val + " ";
+                else
+                    currentGeneric += val + " ";
+            }
+
+            _streamer.MoveNext();
+        }
+    }
+
+    /// <summary>
+    /// Parses a port map: ( PortName => SignalName, ... )
+    /// </summary>
+    private void ParsePortMap(ComponentInstance instance)
+    {
+        if (_streamer.Current?.Value != "(")
+            return;
+
+        _streamer.MoveNext(); // consume '('
+
+        int parenDepth = 1;
+        string currentPort = string.Empty;
+        string currentSignal = string.Empty;
+        bool afterArrow = false;
+
+        while (_streamer.Current != null && parenDepth > 0)
+        {
+            string val = _streamer.Current.Value;
+
+            if (val == "(")
+            {
+                parenDepth++;
+                if (afterArrow)
+                    currentSignal += val + " ";
+            }
+            else if (val == ")")
+            {
+                parenDepth--;
+                if (parenDepth > 0 && afterArrow)
+                    currentSignal += val + " ";
+                else if (parenDepth == 0)
+                {
+                    // End of port map - save current mapping
+                    if (!string.IsNullOrEmpty(currentPort))
+                    {
+                        instance.PortMap[currentPort.Trim()] = currentSignal.Trim();
+                    }
+                }
+            }
+            else if (val == "=>")
+            {
+                afterArrow = true;
+            }
+            else if (val == "," && parenDepth == 1)
+            {
+                // Save current mapping and start new one
+                if (!string.IsNullOrEmpty(currentPort))
+                {
+                    instance.PortMap[currentPort.Trim()] = currentSignal.Trim();
+                }
+                currentPort = string.Empty;
+                currentSignal = string.Empty;
+                afterArrow = false;
+            }
+            else
+            {
+                if (afterArrow)
+                    currentSignal += val + " ";
+                else
+                    currentPort += val + " ";
+            }
+
+            _streamer.MoveNext();
+        }
+    }
+
+    /// <summary>
+    /// Skips tokens until semicolon is found.
+    /// </summary>
+    private void SkipToSemicolon()
+    {
+        int parenDepth = 0;
+        while (_streamer.Current != null)
+        {
+            if (_streamer.Current.Value == "(")
+                parenDepth++;
+            else if (_streamer.Current.Value == ")")
+                parenDepth--;
+            else if (_streamer.Current.Value == ";" && parenDepth == 0)
+            {
+                _streamer.MoveNext(); // consume ';'
+                break;
+            }
+            _streamer.MoveNext();
         }
     }
 

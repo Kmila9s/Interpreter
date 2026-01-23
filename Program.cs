@@ -62,6 +62,15 @@ class Program
         Console.WriteLine($"Found {testFiles.Length} test file(s)");
         Console.WriteLine(new string('=', 60));
 
+        // v0.16.1: Pre-scan ALL test files for entities before processing any
+        // This allows cross-file entity references to work correctly
+        EntityRegistry.Instance.Clear();
+        PackageRegistry.Instance.Clear();
+        foreach (var file in testFiles)
+        {
+            EntityRegistry.Instance.ScanFile(file);
+        }
+
         int passedTests = 0;
         int failedTests = 0;
 
@@ -93,6 +102,9 @@ class Program
                     Console.WriteLine("\nProcessing cancelled by user.");
                     break;
                 }
+
+                // Note: EntityRegistry already pre-scanned, just clear PackageRegistry per file
+                PackageRegistry.Instance.Clear();
 
                 string raw = File.ReadAllText(testFile);
                 var result = ProcessVhdlCode(raw, _cts.Token);

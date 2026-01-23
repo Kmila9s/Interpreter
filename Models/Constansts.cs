@@ -70,6 +70,7 @@ public enum OperationType : int {
 /// Contains regular expressions used to identify different types of operations in the code.
 /// </summary>
 public class OperationsRegex {
-    /// <summary>Regex to detect a VHDL signal assignment (<=).</summary>
-    public static string ASSIGNATION = @"[A-Za-z_]+[_a-zA-Z0-9]*\s?\<\=\s?.+";
+    /// <summary>Regex to detect a VHDL signal assignment (<=) or variable assignment (:=).</summary>
+    /// <remarks>v0.16.1: Added support for := variable assignments used in processes and procedures.</remarks>
+    public static string ASSIGNATION = @"[A-Za-z_]+[_a-zA-Z0-9]*\s?(\<\=|:\=)\s?.+";
 }

@@ -70,8 +70,37 @@ public class VariableSyntetizer : ISControl
     /// <param name="cancellationToken">Cancellation token.</param>
     public void Syntetize(CancellationToken cancellationToken)
     {
-        while (_streamer.Current != null && _breaker != _streamer.Current?.Value.ToLower())
+        // v0.16.1: Track parenthesis depth for port/generic parsing
+        // This ensures we only stop at the closing ')' of the Port/Generic section,
+        // not at inner parentheses used in type declarations like std_logic_vector(7 downto 0)
+        int portGenericParenDepth = 0;
+
+        while (_streamer.Current != null)
         {
+            // For ports/generics, track parenthesis depth
+            if (_isPort || _isGeneric)
+            {
+                if (_streamer.Current.Value == "(")
+                {
+                    portGenericParenDepth++;
+                }
+                else if (_streamer.Current.Value == ")")
+                {
+                    if (portGenericParenDepth == 0)
+                    {
+                        // This is the closing ')' of the Port/Generic section
+                        break;
+                    }
+                    portGenericParenDepth--;
+                }
+            }
+            else
+            {
+                // For signals/variables, use the string breaker (typically "begin")
+                if (_breaker == _streamer.Current?.Value.ToLower())
+                    break;
+            }
+
             // Check for cancellation at each iteration
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -176,12 +205,32 @@ public class VariableSyntetizer : ISControl
                 variables.Add(new() { Name = varName });
             }
             _streamer.Expect(OPERATORS); // :
-            Constants.PortType portType = _isPort || _isGeneric ? _streamer.Current?.Value.ToLower() == "in" ?
-                Constants.PortType.IN : Constants.PortType.OUT
-                    : varType.ToLower() == "constant" ?
-                Constants.PortType.IN : Constants.PortType.OUT;
-            if (_isPort)
-                _streamer.Expect(KEYWORDS); // IN/OUT/INOUT Type
+
+            // v0.16.1: Handle port direction - VHDL allows omitting direction (defaults to 'in')
+            Constants.PortType portType = Constants.PortType.IN; // Default per VHDL spec
+            if (_isPort || _isGeneric)
+            {
+                string currentVal = _streamer.Current?.Value?.ToLower() ?? "";
+                if (currentVal == "in" || currentVal == "out" || currentVal == "inout" || currentVal == "buffer")
+                {
+                    // Direction keyword present - parse it
+                    portType = currentVal switch
+                    {
+                        "in" => Constants.PortType.IN,
+                        "out" => Constants.PortType.OUT,
+                        "inout" => Constants.PortType.OUT, // Treat inout as out for resource estimation
+                        "buffer" => Constants.PortType.OUT, // Treat buffer as out
+                        _ => Constants.PortType.IN
+                    };
+                    _streamer.MoveNext(); // Consume direction keyword
+                }
+                // If no direction keyword, portType stays as IN (default)
+            }
+            else if (varType.ToLower() == "constant")
+            {
+                portType = Constants.PortType.IN;
+            }
+
             var dataType = Variable.GetDatatype(_streamer.Current?.Value ?? string.Empty);
             string dataTypeStr = _streamer.Current?.Value?.ToLower() ?? string.Empty;
 

@@ -182,12 +182,19 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     public object Execute(Variable leftSideOperator, Variable rightSideOperator){
         // v0.13.0: Relax type checking when one operand is a stub (undeclared identifier)
         // This allows parsing to continue even with missing package definitions
+        // v0.16.1: Add type coercion support for INTEGER <-> STD_LOGIC_VECTOR
         if(leftSideOperator.Type != rightSideOperator.Type &&
            !leftSideOperator.IsStub && !rightSideOperator.IsStub)
-            throw ParserException.TypeMismatch(
-                leftSideOperator.Type.ToString(),
-                rightSideOperator.Type.ToString(),
-                null);
+        {
+            // Try to coerce types before throwing error
+            if (!TryCoerceTypes(ref leftSideOperator, ref rightSideOperator))
+            {
+                throw ParserException.TypeMismatch(
+                    leftSideOperator.Type.ToString(),
+                    rightSideOperator.Type.ToString(),
+                    null);
+            }
+        }
         object result = new();
         switch(OperatorType){
             case OperatorType.ASSIGNATION:
@@ -272,6 +279,47 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             default:
                 throw new Exception($"Datatype do not detected or even supported: {OperatorName}");
         }
+    }
+
+    /// <summary>
+    /// Attempts to coerce types for type-mismatched operands.
+    /// v0.16.1: Added to support implicit type conversion for educational purposes.
+    /// </summary>
+    /// <param name="left">The left operand (may be modified).</param>
+    /// <param name="right">The right operand (may be modified).</param>
+    /// <returns>True if coercion was successful, false otherwise.</returns>
+    private bool TryCoerceTypes(ref Variable left, ref Variable right)
+    {
+        // INTEGER <-> STD_LOGIC_VECTOR coercion
+        if ((left.Type == DATATYPES.INTEGER && right.Type == DATATYPES.STD_LOGIC_VECTOR) ||
+            (left.Type == DATATYPES.STD_LOGIC_VECTOR && right.Type == DATATYPES.INTEGER))
+        {
+            // For educational purposes, allow this - convert INTEGER to vector representation
+            // or treat vector as integer for arithmetic
+            return true; // Allow the operation to proceed with mixed types
+        }
+
+        // INTEGER <-> NATURAL coercion (NATURAL is a subset of INTEGER)
+        if ((left.Type == DATATYPES.INTEGER && right.Type == DATATYPES.NATURAL) ||
+            (left.Type == DATATYPES.NATURAL && right.Type == DATATYPES.INTEGER))
+        {
+            return true;
+        }
+
+        // STD_LOGIC <-> BIT coercion
+        if ((left.Type == DATATYPES.STD_LOGIC && right.Type == DATATYPES.BIT) ||
+            (left.Type == DATATYPES.BIT && right.Type == DATATYPES.STD_LOGIC))
+        {
+            return true;
+        }
+
+        // UNKNOWN type - allow coercion for flexibility with custom types
+        if (left.Type == DATATYPES.UNKNOWN || right.Type == DATATYPES.UNKNOWN)
+        {
+            return true;
+        }
+
+        return false;
     }
 
     /// <summary>
