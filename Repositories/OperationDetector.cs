@@ -7,6 +7,7 @@ namespace Interpreter.Repositories;
 /// Detects the type of operation from a raw string input.
 /// </summary>
 public class OperationDetector {
+    /// <summary>Compiled regex for detecting assignment operations.</summary>
     private readonly Regex _assingationRegex;
 
     /// <summary>

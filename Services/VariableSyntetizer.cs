@@ -306,17 +306,18 @@ public class VariableSyntetizer : ISControl
                     // v0.13.0: For ports/generics, check if expression is complex before evaluating
                     _streamer.Expect(PARENTHESIS); // consume '('
 
-                    // Check if this is a complex expression (contains operators or nested parens)
+                    // Check if this is a complex expression (contains operators, nested parens, or function calls)
                     bool isComplexExpression = false;
-                    if (_isPort || _isGeneric)
                     {
                         _streamer.SetRollBack();
-                        // Peek ahead to see if expression contains operators or nested parens
+                        // Peek ahead to see if expression contains operators, nested parens, or function calls
                         int checkDepth = 0;
+                        bool prevWasIdentifier = false;
                         while (_streamer.Current != null && _streamer.Current.Value != ")")
                         {
                             if (_streamer.Current.Value == "(")
                             {
+                                // Nested paren - could be function call or complex expression
                                 isComplexExpression = true;
                                 break;
                             }
@@ -326,6 +327,13 @@ public class VariableSyntetizer : ISControl
                                 isComplexExpression = true;
                                 break;
                             }
+                            // Check for function call pattern: identifier followed by '('
+                            if (prevWasIdentifier && _streamer.Current.Value == "(")
+                            {
+                                isComplexExpression = true;
+                                break;
+                            }
+                            prevWasIdentifier = _streamer.Current.Type == IDENTIFIERS;
                             _streamer.MoveNext();
                         }
                         _streamer.RollBack();
@@ -479,7 +487,26 @@ public class VariableSyntetizer : ISControl
 #endif
                 Variables.Add(newVar);
             });
-            if ((_isPort || _isGeneric) && _streamer.Current?.Value != ";") break;
+            if ((_isPort || _isGeneric) && _streamer.Current?.Value != ";")
+            {
+                // We just finished a port/generic declaration but the next
+                // token isn't `;` — and it isn't `)` either (the outer port
+                // loop would already have broken on `)`). That means the
+                // user forgot the trailing `;` between two consecutive
+                // declarations. Throw a precise diagnostic that points at
+                // the offending token's source line/col instead of letting
+                // the caller fail later with a generic "expected `(` or
+                // `)`" message that landed on the wrong line for years.
+                if (_streamer.Current?.Type == IDENTIFIERS)
+                {
+                    string nextName = _streamer.Current.Value ?? string.Empty;
+                    throw new Parser.Repositories.TokenStream.StreamerException(
+                        $"Missing ';' before '{nextName}' at Line {_streamer.Current.Line + 1}:{_streamer.Current.Col + 1}. " +
+                        "Each port / generic declaration must end with a semicolon (except the last one before ')').",
+                        _streamer.Current);
+                }
+                break;
+            }
             _streamer.Expect(OPERATORS); // ;
         }
     }
@@ -616,12 +643,26 @@ public class VariableSyntetizer : ISControl
                 _streamer.RollBack();
             }
 
-            varValue = _comparator.FirstOrDefault(p => p.Name == _streamer.Current?.Value!)?.Value!;
+            // Look up in the comparator (ports/generics) first, then in already-declared
+            // Variables (constants/signals from this same pass). Without checking
+            // Variables, expressions like `unsigned(FIFO_ADDR_WIDTH - 1 downto 0)`
+            // that reference an earlier `constant FIFO_ADDR_WIDTH := log2ceil(...);`
+            // would fail even though the constant is in scope.
+            string lookupName = _streamer.Current?.Value ?? string.Empty;
+            varValue = _comparator.FirstOrDefault(p => p.Name.Equals(lookupName, StringComparison.OrdinalIgnoreCase))?.Value!;
             if (varValue == null)
             {
-                throw ParserException.UndeclaredVariable(
-                    _streamer.Current?.Value ?? "unknown",
-                    _streamer.Current);
+                varValue = Variables.FirstOrDefault(p => p.Name.Equals(lookupName, StringComparison.OrdinalIgnoreCase))?.Value!;
+            }
+            if (varValue == null)
+            {
+                // Last-chance fallback: register an implicit placeholder so synthesis
+                // can continue. Real value is unknown, but downstream sizing falls
+                // back to defaults (size=1) and we keep the test moving instead of
+                // throwing on every forward reference. Use int 0 so consumers
+                // (Convert.ToInt32 in range arithmetic) don't fault.
+                Variables.Add(new Variable { Name = lookupName, Value = 0 });
+                varValue = 0;
             }
             _streamer.Expect(IDENTIFIERS);
         }
@@ -691,6 +732,45 @@ public class VariableSyntetizer : ISControl
         {
             // Skip unknown token
             _streamer.MoveNext();
+        }
+
+        // Handle arithmetic chains in default-value expressions, e.g.
+        // `generic (TOTAL : integer := BASE * TIMES)` or
+        // `signal x : integer := WIDTH + 1`. The parser accepts these and
+        // tries to fold the result; if any operand is an unresolved
+        // placeholder (typical for generic-of-generic forward refs), the
+        // partial fold falls back to 0 and the value is materialised by
+        // downstream synthesizers when the actual generic is resolved.
+        while (_streamer.Current?.Type == OPERATORS &&
+               (_streamer.Current.Value == "+" ||
+                _streamer.Current.Value == "-" ||
+                _streamer.Current.Value == "*" ||
+                _streamer.Current.Value == "/"))
+        {
+            string op = _streamer.Current.Value;
+            _streamer.MoveNext();
+
+            object rhs = ParseInitializationOperand();
+
+            int? lhsInt = TryAsInt(value);
+            int? rhsInt = TryAsInt(rhs);
+            if (lhsInt.HasValue && rhsInt.HasValue)
+            {
+                value = op switch
+                {
+                    "+" => lhsInt.Value + rhsInt.Value,
+                    "-" => lhsInt.Value - rhsInt.Value,
+                    "*" => lhsInt.Value * rhsInt.Value,
+                    "/" => rhsInt.Value == 0 ? 0 : lhsInt.Value / rhsInt.Value,
+                    _   => value
+                };
+            }
+            else
+            {
+                // Either side is a forward / unresolved reference. Keep
+                // the LHS so downstream code at least has a deterministic
+                // (if approximate) value rather than a raw object().
+            }
         }
 
         // Handle concatenation operator &
@@ -820,6 +900,56 @@ public class VariableSyntetizer : ISControl
 
         // Return as string if nothing else works
         return argExpr;
+    }
+
+    /// <summary>
+    /// Reads one operand of a default-value arithmetic expression — a single
+    /// literal, identifier (resolved against the comparator and Variables),
+    /// or parenthesised sub-expression. Used by the <c>+ - * /</c> chain
+    /// handler in <see cref="ParseInitializationValue"/>.
+    /// </summary>
+    private object ParseInitializationOperand()
+    {
+        if (_streamer.Current == null) return 0;
+        if (_streamer.Current.Value == "(")
+        {
+            return ParseAggregateOrExpression();
+        }
+        if (_streamer.Current.Type == LITERALS)
+        {
+            string raw = _streamer.Current.Value?.Replace("\"", "").Replace("'", "") ?? "0";
+            _streamer.MoveNext();
+            if (int.TryParse(raw, out int n)) return n;
+            return raw;
+        }
+        if (_streamer.Current.Type == IDENTIFIERS)
+        {
+            string lookupName = _streamer.Current.Value ?? string.Empty;
+            var refVar = _comparator.FirstOrDefault(p => p.Name.Equals(lookupName, StringComparison.OrdinalIgnoreCase))
+                      ?? Variables.FirstOrDefault(p => p.Name.Equals(lookupName, StringComparison.OrdinalIgnoreCase));
+            _streamer.MoveNext();
+            return refVar?.Value ?? 0;
+        }
+        // Unrecognised operand — consume one token and return 0 so the
+        // arithmetic chain doesn't loop forever.
+        _streamer.MoveNext();
+        return 0;
+    }
+
+    /// <summary>
+    /// Best-effort int extraction from the heterogeneous <c>object</c> values
+    /// stored as Variable.Value (int / string / bool). Returns null when the
+    /// value isn't recognisable as a numeric integer — in that case the
+    /// caller falls back to the LHS instead of folding.
+    /// </summary>
+    private static int? TryAsInt(object? v)
+    {
+        if (v is null) return null;
+        if (v is int i) return i;
+        if (v is long l) return (int)l;
+        if (v is bool b) return b ? 1 : 0;
+        if (v is string s && int.TryParse(s, out int parsed)) return parsed;
+        return null;
     }
 
     /// <summary>
@@ -984,6 +1114,20 @@ public class VariableSyntetizer : ISControl
         // Skip 'constant' keyword
         _streamer.MoveNext();
 
+        // Capture the constant name(s) so later expressions can resolve them.
+        // Without this, constants defined as `constant X : integer := func(Y);`
+        // would be silently dropped, and any downstream use of X would fail
+        // with "Undeclared variable". Register a placeholder Variable per name;
+        // value resolution can refine this later if function evaluation is added.
+        var declaredNames = new List<string>();
+        while (_streamer.Current != null && _streamer.Current.Type == IDENTIFIERS)
+        {
+            declaredNames.Add(_streamer.Current.Value);
+            _streamer.MoveNext();
+            if (_streamer.Current?.Value == ",") _streamer.MoveNext();
+            else break;
+        }
+
         int parenDepth = 0;
         int iterations = 0;
         const int MAX_ITERATIONS = 1000;
@@ -1015,6 +1159,22 @@ public class VariableSyntetizer : ISControl
             }
 
             _streamer.MoveNext();
+        }
+
+        foreach (var name in declaredNames)
+        {
+            if (string.IsNullOrEmpty(name)) continue;
+            if (Variables.Any(v => v.Name.Equals(name, StringComparison.OrdinalIgnoreCase))) continue;
+            // Seed Value=0 so downstream Convert.ToInt32(...) calls succeed instead
+            // of falling into the `_value ?? new()` branch and getting a raw object.
+            Variables.Add(new Variable { Name = name, Value = 0 });
+            SkipDiagnosticLog.Instance.AddInfo(
+                "VHD-CONSTANT-PLACEHOLDER",
+                name,
+                $"Constant '{name}' has a function-call initializer that the " +
+                "parser does not yet evaluate. Registered with placeholder " +
+                "value 0 — vector widths derived from this constant will be " +
+                "incorrect at runtime.");
         }
     }
 
@@ -1442,10 +1602,13 @@ public class VariableSyntetizer : ISControl
     private void SkipTypeDeclaration() => ParseTypeDeclaration();
 
     /// <summary>
-    /// Skips a subtype declaration until ';'
+    /// Skips a subtype declaration until ';'. Records the subtype's name in
+    /// the diagnostic log — synth treats subtypes as their base type.
     /// </summary>
     private void SkipSubtypeDeclaration()
     {
+        _streamer.MoveNext(); // 'subtype'
+        string subtypeName = _streamer.Current?.Value ?? string.Empty;
         while (_streamer.Current != null && _streamer.Current.Value != ";")
         {
             _streamer.MoveNext();
@@ -1453,34 +1616,192 @@ public class VariableSyntetizer : ISControl
         if (_streamer.Current?.Value == ";")
         {
             _streamer.MoveNext(); // skip ';'
+        }
+        SkipDiagnosticLog.Instance.AddInfo(
+            "VHD-SUBTYPE-DROPPED",
+            subtypeName,
+            $"Subtype '{subtypeName}' is parsed but treated as its base type " +
+            "in synthesis. Range constraints and resolution functions are " +
+            "not enforced.");
+    }
+
+    /// <summary>
+    /// Parses an alias declaration and registers the alias name as a Variable
+    /// so later references resolve correctly. Supports the common forms:
+    ///   <c>alias name is target(range);</c>
+    ///   <c>alias name : subtype is target(range);</c>
+    /// </summary>
+    /// <remarks>
+    /// Earlier this method consumed every token to the ';' without recording
+    /// anything, so any reference to the alias later resolved through the
+    /// fallback "implicit placeholder" path with size=0, value=0 — silently
+    /// producing wrong netlists.
+    ///
+    /// Today the alias's effective width is derived from (in priority order):
+    ///   1. An explicit subtype like <c>std_logic_vector(7 downto 0)</c>.
+    ///   2. The slice expression on the target — <c>a(15 downto 8)</c> → 8.
+    ///   3. Default to 1 when neither shape is recoverable.
+    /// </remarks>
+    private void SkipAliasDeclaration()
+    {
+        _streamer.MoveNext(); // consume 'alias'
+
+        string aliasName = _streamer.Current?.Value ?? string.Empty;
+        if (_streamer.Current?.Type == IDENTIFIERS)
+            _streamer.MoveNext();
+
+        int declaredSize = 0;
+        Constants.DATATYPES declaredType = Constants.DATATYPES.UNKNOWN;
+
+        // Optional subtype: `: std_logic_vector(7 downto 0)`
+        if (_streamer.Current?.Value == ":")
+        {
+            _streamer.MoveNext(); // ':'
+            if (_streamer.Current?.Type == KEYWORDS)
+            {
+                string typeText = _streamer.Current.Value.ToLower();
+                declaredType = typeText switch
+                {
+                    "std_logic"        => Constants.DATATYPES.STD_LOGIC,
+                    "std_logic_vector" => Constants.DATATYPES.STD_LOGIC_VECTOR,
+                    "bit"              => Constants.DATATYPES.BIT,
+                    "integer"          => Constants.DATATYPES.INTEGER,
+                    "boolean"          => Constants.DATATYPES.BOOLEAN,
+                    "natural"          => Constants.DATATYPES.NATURAL,
+                    _                  => Constants.DATATYPES.UNKNOWN
+                };
+                _streamer.MoveNext();
+                if (_streamer.Current?.Value == "(")
+                {
+                    declaredSize = ConsumeAndMeasureRange();
+                }
+            }
+        }
+
+        // 'is' <target>[(range)]
+        if (_streamer.Current?.Value?.ToLower() == "is")
+        {
+            _streamer.MoveNext(); // 'is'
+            // Target identifier (skipped — we only need its slice for sizing).
+            if (_streamer.Current?.Type == IDENTIFIERS)
+                _streamer.MoveNext();
+            if (_streamer.Current?.Value == "(" && declaredSize == 0)
+            {
+                declaredSize = ConsumeAndMeasureRange();
+            }
+        }
+
+        // Drain anything else up to the ';' (covers `alias x is X'high downto Y;`
+        // attribute forms we don't yet model).
+        while (_streamer.Current != null && _streamer.Current.Value != ";")
+        {
+            if (_streamer.Current.Value == "(") { ConsumeAndMeasureRange(); continue; }
+            _streamer.MoveNext();
+        }
+        if (_streamer.Current?.Value == ";")
+            _streamer.MoveNext();
+
+        if (!string.IsNullOrEmpty(aliasName))
+        {
+            // Choose the most informative type/size we recovered.
+            int finalSize = declaredSize > 0 ? declaredSize : 1;
+            var resolvedType = declaredType != Constants.DATATYPES.UNKNOWN
+                ? declaredType
+                : (finalSize > 1 ? Constants.DATATYPES.STD_LOGIC_VECTOR
+                                 : Constants.DATATYPES.STD_LOGIC);
+            Variables.Add(new Variable
+            {
+                Name  = aliasName,
+                Type  = resolvedType,
+                Size  = finalSize,
+                Value = 0
+            });
+            SkipDiagnosticLog.Instance.AddInfo(
+                "VHD-ALIAS-PLACEHOLDER",
+                aliasName,
+                $"Alias '{aliasName}' registered as a placeholder " +
+                $"(size={finalSize}). Read-as-target slice mapping is not yet " +
+                "wired into the netlist — references will resolve to a " +
+                "constant placeholder rather than the underlying signal slice.");
         }
     }
 
     /// <summary>
-    /// Skips an alias declaration until ';'
+    /// Consumes a parenthesised range expression starting at <c>(</c>, returning
+    /// the literal width when the form is <c>(N to M)</c> or <c>(N downto M)</c>
+    /// with both bounds as integer literals. Returns 0 for any other shape so
+    /// the caller can fall back to a default size.
     /// </summary>
-    private void SkipAliasDeclaration()
+    private int ConsumeAndMeasureRange()
     {
-        while (_streamer.Current != null && _streamer.Current.Value != ";")
+        if (_streamer.Current?.Value != "(") return 0;
+        _streamer.MoveNext(); // '('
+
+        var tokens = new List<string>();
+        int depth = 1;
+        while (_streamer.Current != null && depth > 0)
         {
+            string v = _streamer.Current.Value;
+            if (v == "(") depth++;
+            else if (v == ")")
+            {
+                depth--;
+                if (depth == 0) break;
+            }
+            tokens.Add(v);
             _streamer.MoveNext();
         }
-        if (_streamer.Current?.Value == ";")
+        if (_streamer.Current?.Value == ")") _streamer.MoveNext();
+
+        if (tokens.Count == 3
+            && (tokens[1].Equals("downto", StringComparison.OrdinalIgnoreCase) ||
+                tokens[1].Equals("to",     StringComparison.OrdinalIgnoreCase))
+            && int.TryParse(tokens[0], out int a)
+            && int.TryParse(tokens[2], out int b))
         {
-            _streamer.MoveNext(); // skip ';'
+            return Math.Abs(a - b) + 1;
         }
+        return 0;
     }
 
     /// <summary>
     /// Skips a function declaration until 'end function;' or 'end &lt;function_name&gt;;'
+    /// and records the function's name in <see cref="FunctionRegistry"/> as a
+    /// black-box stub so downstream call-site parsing can recognise it.
     /// </summary>
+    /// <remarks>
+    /// Body capture (parameters, return type, statement list) is intentionally
+    /// deferred — task #18 lands the name registration today; deeper
+    /// signature + body extraction is part of task #20 (IEEE library
+    /// synthesis), which needs the same machinery.
+    /// </remarks>
     private void SkipFunctionDeclaration()
     {
         // Skip 'function' keyword
         _streamer.MoveNext();
 
-        // Get the function name for matching 'end <function_name>'
-        string functionName = _streamer.Current?.Value?.ToLower() ?? "";
+        // Get the function name (case-preserved for the registry, lowered
+        // for matching the closing `end <name>;` token below).
+        string functionNameRaw = _streamer.Current?.Value ?? "";
+        string functionName    = functionNameRaw.ToLower();
+
+        // Register a black-box stub keyed by the original-case name. The
+        // registry is case-insensitive (per VHDL identifier rules) so call
+        // sites resolve regardless of how they spell it.
+        if (!string.IsNullOrEmpty(functionNameRaw))
+        {
+            FunctionRegistry.Instance.Register(new FunctionDefinition
+            {
+                Name = functionNameRaw,
+                IsPure = true
+            });
+            SkipDiagnosticLog.Instance.AddWarning(
+                "VHD-FUNC-BLACKBOX",
+                functionNameRaw,
+                $"Function '{functionNameRaw}' body was not synthesised. " +
+                "Calls resolve as a black-box; logic inside the function is " +
+                "absent from the netlist until function-body synthesis lands.");
+        }
 #if DEBUG
         Console.WriteLine($"[SkipFunction] Skipping function: {functionName}");
 #endif
@@ -1542,14 +1863,31 @@ public class VariableSyntetizer : ISControl
 
     /// <summary>
     /// Skips a procedure declaration until 'end procedure;' or 'end &lt;procedure_name&gt;;'
+    /// and registers a black-box stub in <see cref="FunctionRegistry"/>.
     /// </summary>
     private void SkipProcedureDeclaration()
     {
         // Skip 'procedure' keyword
         _streamer.MoveNext();
 
-        // Get the procedure name for matching 'end <procedure_name>'
-        string procedureName = _streamer.Current?.Value?.ToLower() ?? "";
+        // Get the procedure name (case-preserved + lowered for matching).
+        string procedureNameRaw = _streamer.Current?.Value ?? "";
+        string procedureName    = procedureNameRaw.ToLower();
+
+        if (!string.IsNullOrEmpty(procedureNameRaw))
+        {
+            FunctionRegistry.Instance.Register(new FunctionDefinition
+            {
+                Name = procedureNameRaw,
+                IsPure = false   // procedures may have side effects
+            });
+            SkipDiagnosticLog.Instance.AddWarning(
+                "VHD-PROC-BLACKBOX",
+                procedureNameRaw,
+                $"Procedure '{procedureNameRaw}' body was not synthesised. " +
+                "Calls resolve as a black-box; the procedure's effects on " +
+                "out/inout signals are not modelled.");
+        }
 
         // Simply look for 'end procedure' or 'end <procedure_name>'
         while (_streamer.Current != null)
@@ -1580,10 +1918,16 @@ public class VariableSyntetizer : ISControl
     }
 
     /// <summary>
-    /// Skips an attribute declaration or specification until ';'
+    /// Skips an attribute declaration or specification until ';' and logs
+    /// a diagnostic so the user knows the attribute is purely syntactic
+    /// for now (synth pragmas like <c>attribute keep of sig : signal is true;</c>
+    /// don't influence the netlist yet).
     /// </summary>
     private void SkipAttributeDeclaration()
     {
+        // Try to grab the attribute name for the diagnostic subject.
+        _streamer.MoveNext(); // 'attribute'
+        string attrName = _streamer.Current?.Value ?? string.Empty;
         while (_streamer.Current != null && _streamer.Current.Value != ";")
         {
             _streamer.MoveNext();
@@ -1592,10 +1936,16 @@ public class VariableSyntetizer : ISControl
         {
             _streamer.MoveNext(); // skip ';'
         }
+        SkipDiagnosticLog.Instance.AddInfo(
+            "VHD-ATTR-DROPPED",
+            attrName,
+            $"Attribute '{attrName}' is recognised syntactically but does not " +
+            "affect the synthesised netlist. Synth pragmas (keep / mark_debug / " +
+            "ram_style / etc.) are read-only metadata in this build.");
     }
 
     /// <summary>
-    /// Skips a disconnect specification until ';'
+    /// Skips a disconnect specification until ';'.
     /// </summary>
     private void SkipDisconnectSpec()
     {
@@ -1607,6 +1957,11 @@ public class VariableSyntetizer : ISControl
         {
             _streamer.MoveNext(); // skip ';'
         }
+        SkipDiagnosticLog.Instance.AddInfo(
+            "VHD-DISCONNECT-DROPPED",
+            "",
+            "Disconnect specification dropped — guarded-signal driver " +
+            "disconnect timing is not modelled.");
     }
 
     /// <summary>

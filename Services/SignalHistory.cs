@@ -1,0 +1,618 @@
+using Parser.Models;
+
+namespace Interpreter.Services;
+
+/// <summary>
+/// Records signal/variable values over simulation time for waveform analysis.
+/// Stores a history of (time, value) pairs for each tracked signal.
+/// </summary>
+public class SignalHistory
+{
+    /// <summary>
+    /// The raw signal history data.
+    /// Key: Variable (signal)
+    /// Value: List of (timeMoment, value) tuples
+    /// </summary>
+    private readonly Dictionary<Variable, List<Tuple<int, object>>> _history = new();
+
+    /// <summary>
+    /// Lock for thread safety.
+    /// </summary>
+    private readonly object _lock = new();
+
+    /// <summary>
+    /// Whether recording is enabled.
+    /// </summary>
+    public bool IsRecording { get; set; } = true;
+
+    /// <summary>
+    /// Read-only view of the raw history dictionary. Returns the live
+    /// dictionary as <see cref="IReadOnlyDictionary{TKey,TValue}"/> so
+    /// callers can iterate without forcing a copy on every access — the
+    /// previous version cloned the entire map (multi-MB on long sims) on
+    /// every property read.
+    /// </summary>
+    public IReadOnlyDictionary<Variable, List<Tuple<int, object>>> RawHistory
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _history;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Registers a signal for tracking. Optionally records its initial value.
+    /// </summary>
+    /// <param name="signal">The signal to track.</param>
+    /// <param name="initialTime">The initial time moment (default 0).</param>
+    /// <param name="recordInitial">Whether to record the initial value.</param>
+    public void RegisterSignal(Variable signal, int initialTime = 0, bool recordInitial = true)
+    {
+        lock (_lock)
+        {
+            if (!_history.ContainsKey(signal))
+            {
+                _history[signal] = new List<Tuple<int, object>>();
+
+                if (recordInitial)
+                {
+                    _history[signal].Add(Tuple.Create(initialTime, signal.Value));
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Registers multiple signals for tracking.
+    /// </summary>
+    /// <param name="signals">The signals to track.</param>
+    /// <param name="initialTime">The initial time moment.</param>
+    /// <param name="recordInitial">Whether to record initial values.</param>
+    public void RegisterSignals(IEnumerable<Variable> signals, int initialTime = 0, bool recordInitial = true)
+    {
+        foreach (var signal in signals)
+        {
+            RegisterSignal(signal, initialTime, recordInitial);
+        }
+    }
+
+    /// <summary>
+    /// Records a value change for a signal at the specified time.
+    /// </summary>
+    /// <param name="signal">The signal that changed.</param>
+    /// <param name="timeMoment">The time moment (tick * 1000 + delta, or custom scheme).</param>
+    /// <param name="value">The new value.</param>
+    public void RecordChange(Variable signal, int timeMoment, object value)
+    {
+        if (!IsRecording) return;
+
+        lock (_lock)
+        {
+            if (!_history.ContainsKey(signal))
+            {
+                _history[signal] = new List<Tuple<int, object>>();
+            }
+
+            _history[signal].Add(Tuple.Create(timeMoment, value));
+        }
+    }
+
+    /// <summary>
+    /// Records the current value of a signal at the specified time.
+    /// </summary>
+    /// <param name="signal">The signal to record.</param>
+    /// <param name="timeMoment">The time moment.</param>
+    public void RecordCurrentValue(Variable signal, int timeMoment)
+    {
+        RecordChange(signal, timeMoment, signal.Value);
+    }
+
+    /// <summary>
+    /// Records value changes for multiple signals at the specified time.
+    /// </summary>
+    /// <param name="signals">The signals that changed.</param>
+    /// <param name="timeMoment">The time moment.</param>
+    public void RecordChanges(IEnumerable<Variable> signals, int timeMoment)
+    {
+        foreach (var signal in signals)
+        {
+            RecordCurrentValue(signal, timeMoment);
+        }
+    }
+
+    /// <summary>
+    /// Gets the history for a specific signal.
+    /// </summary>
+    /// <param name="signal">The signal to query.</param>
+    /// <returns>List of (time, value) tuples, or empty list if not tracked.</returns>
+    public List<Tuple<int, object>> GetSignalHistory(Variable signal)
+    {
+        lock (_lock)
+        {
+            if (_history.TryGetValue(signal, out var history))
+            {
+                return new List<Tuple<int, object>>(history);
+            }
+            return new List<Tuple<int, object>>();
+        }
+    }
+
+    /// <summary>
+    /// Reads new entries appended to a signal's history since the caller's
+    /// last watermark, under the internal lock — used by the live-waveform
+    /// path so that progress refreshes never copy the whole history list.
+    /// Returns the new high-water index (i.e. the current Count) so the
+    /// caller can pass it back next time.
+    /// </summary>
+    public int ReadSince(Variable signal, int fromIndex, Action<int, object> onEntry)
+    {
+        lock (_lock)
+        {
+            if (!_history.TryGetValue(signal, out var h)) return fromIndex;
+            int total = h.Count;
+            if (fromIndex < 0) fromIndex = 0;
+            for (int i = fromIndex; i < total; i++)
+            {
+                var e = h[i];
+                onEntry(e.Item1, e.Item2);
+            }
+            return total;
+        }
+    }
+
+    /// <summary>
+    /// Gets the history for a signal by name.
+    /// </summary>
+    /// <param name="signalName">The signal name.</param>
+    /// <returns>List of (time, value) tuples, or empty list if not found.</returns>
+    public List<Tuple<int, object>> GetSignalHistoryByName(string signalName)
+    {
+        lock (_lock)
+        {
+            var signal = _history.Keys.FirstOrDefault(v =>
+                v.Name.Equals(signalName, StringComparison.OrdinalIgnoreCase));
+
+            if (signal != null)
+            {
+                return new List<Tuple<int, object>>(_history[signal]);
+            }
+            return new List<Tuple<int, object>>();
+        }
+    }
+
+    /// <summary>
+    /// Gets the value of a signal at a specific time.
+    /// Returns the most recent value at or before the specified time.
+    /// </summary>
+    /// <param name="signal">The signal to query.</param>
+    /// <param name="timeMoment">The time moment.</param>
+    /// <returns>The value at that time, or null if not found.</returns>
+    public object? GetValueAtTime(Variable signal, int timeMoment)
+    {
+        lock (_lock)
+        {
+            if (!_history.TryGetValue(signal, out var history))
+                return null;
+
+            // Find the most recent value at or before the specified time
+            Tuple<int, object>? result = null;
+            foreach (var entry in history)
+            {
+                if (entry.Item1 <= timeMoment)
+                {
+                    result = entry;
+                }
+                else
+                {
+                    break; // Assuming history is ordered by time
+                }
+            }
+
+            return result?.Item2;
+        }
+    }
+
+    /// <summary>
+    /// Gets all tracked signal names.
+    /// </summary>
+    /// <returns>List of signal names.</returns>
+    public List<string> GetTrackedSignalNames()
+    {
+        lock (_lock)
+        {
+            return _history.Keys.Select(v => v.Name).ToList();
+        }
+    }
+
+    /// <summary>
+    /// Gets all tracked signals.
+    /// </summary>
+    /// <returns>List of tracked variables.</returns>
+    public List<Variable> GetTrackedSignals()
+    {
+        lock (_lock)
+        {
+            return _history.Keys.ToList();
+        }
+    }
+
+    /// <summary>
+    /// Gets the time range of recorded data.
+    /// </summary>
+    /// <returns>Tuple of (minTime, maxTime), or (0, 0) if no data.</returns>
+    public (int minTime, int maxTime) GetTimeRange()
+    {
+        lock (_lock)
+        {
+            int minTime = int.MaxValue;
+            int maxTime = int.MinValue;
+
+            foreach (var history in _history.Values)
+            {
+                foreach (var entry in history)
+                {
+                    if (entry.Item1 < minTime) minTime = entry.Item1;
+                    if (entry.Item1 > maxTime) maxTime = entry.Item1;
+                }
+            }
+
+            if (minTime == int.MaxValue)
+                return (0, 0);
+
+            return (minTime, maxTime);
+        }
+    }
+
+    /// <summary>
+    /// Gets the total number of recorded samples across all signals.
+    /// </summary>
+    public int TotalSamples
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _history.Values.Sum(h => h.Count);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets the number of tracked signals.
+    /// </summary>
+    public int SignalCount
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _history.Count;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Clears all recorded history.
+    /// </summary>
+    public void Clear()
+    {
+        lock (_lock)
+        {
+            _history.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Clears history but keeps signal registrations.
+    /// </summary>
+    public void ClearHistory()
+    {
+        lock (_lock)
+        {
+            foreach (var key in _history.Keys)
+            {
+                _history[key].Clear();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Exports the history to a simple text format for debugging.
+    /// </summary>
+    /// <returns>String representation of the history.</returns>
+    public string ExportToText()
+    {
+        lock (_lock)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("=== Signal History ===");
+            sb.AppendLine($"Signals: {_history.Count}, Total Samples: {TotalSamples}");
+            sb.AppendLine();
+
+            foreach (var kvp in _history.OrderBy(k => k.Key.Name))
+            {
+                sb.AppendLine($"Signal: {kvp.Key.Name} ({kvp.Key.Type})");
+                foreach (var entry in kvp.Value)
+                {
+                    sb.AppendLine($"  t={entry.Item1}: {entry.Item2}");
+                }
+                sb.AppendLine();
+            }
+
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>
+    /// Exports history to CSV format for external analysis.
+    /// </summary>
+    /// <returns>CSV string with time in first column, signals in subsequent columns.</returns>
+    public string ExportToCsv()
+    {
+        lock (_lock)
+        {
+            var sb = new System.Text.StringBuilder();
+
+            // Get all unique time points
+            var allTimes = _history.Values
+                .SelectMany(h => h.Select(e => e.Item1))
+                .Distinct()
+                .OrderBy(t => t)
+                .ToList();
+
+            // Header
+            var signals = _history.Keys.OrderBy(k => k.Name).ToList();
+            sb.Append("Time");
+            foreach (var signal in signals)
+            {
+                sb.Append($",{signal.Name}");
+            }
+            sb.AppendLine();
+
+            // Data rows
+            foreach (var time in allTimes)
+            {
+                sb.Append(time);
+                foreach (var signal in signals)
+                {
+                    var value = GetValueAtTime(signal, time);
+                    sb.Append($",{value ?? ""}");
+                }
+                sb.AppendLine();
+            }
+
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>
+    /// Exports history to VCD (Value Change Dump) format for GTKWave visualization.
+    /// </summary>
+    /// <param name="moduleName">The name of the module/entity.</param>
+    /// <param name="timescaleNs">The timescale in nanoseconds (default 1ns).</param>
+    /// <returns>VCD formatted string.</returns>
+    public string ExportToVcd(string moduleName = "top", int timescaleNs = 1)
+    {
+        lock (_lock)
+        {
+            var sb = new System.Text.StringBuilder();
+
+            // VCD Header
+            sb.AppendLine("$date");
+            sb.AppendLine($"   {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            sb.AppendLine("$end");
+            sb.AppendLine("$version");
+            sb.AppendLine("   VHDL Interpreter v0.17.0");
+            sb.AppendLine("$end");
+            sb.AppendLine("$timescale");
+            sb.AppendLine($"   {timescaleNs}ns");
+            sb.AppendLine("$end");
+
+            // Variable definitions
+            var signals = _history.Keys.OrderBy(k => k.Name).ToList();
+            var signalIds = new Dictionary<Variable, string>();
+
+            sb.AppendLine($"$scope module {moduleName} $end");
+
+            int idCounter = 0;
+            foreach (var signal in signals)
+            {
+                // Generate a unique short identifier (!, ", #, $, etc.)
+                string id = GenerateVcdId(idCounter++);
+                signalIds[signal] = id;
+
+                // Determine signal width
+                int width = GetSignalWidth(signal);
+                string vcdType = width == 1 ? "wire" : "reg";
+
+                sb.AppendLine($"$var {vcdType} {width} {id} {signal.Name} $end");
+            }
+
+            sb.AppendLine("$upscope $end");
+            sb.AppendLine("$enddefinitions $end");
+
+            // Get all unique time points sorted
+            var allTimes = _history.Values
+                .SelectMany(h => h.Select(e => e.Item1))
+                .Distinct()
+                .OrderBy(t => t)
+                .ToList();
+
+            if (allTimes.Count == 0)
+            {
+                return sb.ToString();
+            }
+
+            // Initial values ($dumpvars)
+            sb.AppendLine("$dumpvars");
+            foreach (var signal in signals)
+            {
+                var initialValue = GetValueAtTime(signal, allTimes[0]);
+                string vcdValue = FormatVcdValue(initialValue, GetSignalWidth(signal));
+                sb.AppendLine($"{vcdValue}{signalIds[signal]}");
+            }
+            sb.AppendLine("$end");
+
+            // Track last known values to only output changes
+            var lastValues = new Dictionary<Variable, object?>();
+            foreach (var signal in signals)
+            {
+                lastValues[signal] = GetValueAtTime(signal, allTimes[0]);
+            }
+
+            // Value changes at each timestamp
+            foreach (var time in allTimes)
+            {
+                bool hasChanges = false;
+                var changes = new System.Text.StringBuilder();
+
+                foreach (var signal in signals)
+                {
+                    var currentValue = GetValueAtTime(signal, time);
+                    var lastValue = lastValues[signal];
+
+                    // Only output if value changed
+                    if (!Equals(currentValue, lastValue))
+                    {
+                        if (!hasChanges)
+                        {
+                            // Convert internal time to VCD time
+                            // Our time format: tick * 1000 + delta
+                            // VCD time: in units of timescale
+                            long vcdTime = time * timescaleNs;
+                            sb.AppendLine($"#{vcdTime}");
+                            hasChanges = true;
+                        }
+
+                        string vcdValue = FormatVcdValue(currentValue, GetSignalWidth(signal));
+                        changes.AppendLine($"{vcdValue}{signalIds[signal]}");
+                        lastValues[signal] = currentValue;
+                    }
+                }
+
+                if (hasChanges)
+                {
+                    sb.Append(changes);
+                }
+            }
+
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>
+    /// Generates a VCD identifier from an index.
+    /// VCD uses printable ASCII characters (33-126) as identifiers.
+    /// </summary>
+    private static string GenerateVcdId(int index)
+    {
+        // Use characters ! through ~ (ASCII 33-126)
+        const int baseChar = 33;
+        const int range = 94; // 126 - 33 + 1
+
+        if (index < range)
+        {
+            return ((char)(baseChar + index)).ToString();
+        }
+
+        // For larger indices, use multiple characters
+        var result = new System.Text.StringBuilder();
+        while (index >= 0)
+        {
+            result.Insert(0, (char)(baseChar + (index % range)));
+            index = index / range - 1;
+            if (index < 0) break;
+        }
+        return result.ToString();
+    }
+
+    /// <summary>
+    /// Gets the width of a signal in bits.
+    /// </summary>
+    private static int GetSignalWidth(Variable signal)
+    {
+        if (signal.Size > 0)
+            return signal.Size;
+
+        // Infer from value
+        string? valueStr = signal.Value?.ToString();
+        if (string.IsNullOrEmpty(valueStr))
+            return 1;
+
+        // Check if it's a binary string
+        if (valueStr.All(c => c == '0' || c == '1' || c == 'X' || c == 'Z' || c == 'U'))
+            return valueStr.Length;
+
+        return 1;
+    }
+
+    /// <summary>
+    /// Formats a value for VCD output.
+    /// </summary>
+    private static string FormatVcdValue(object? value, int width)
+    {
+        if (value == null)
+            return width == 1 ? "x" : $"b{new string('x', width)} ";
+
+        string valueStr = value.ToString() ?? "";
+
+        // Handle boolean
+        if (value is bool b)
+            return b ? "1" : "0";
+
+        // Handle single bit (std_logic)
+        if (width == 1)
+        {
+            if (valueStr.Length == 1)
+            {
+                char c = char.ToLower(valueStr[0]);
+                return c switch
+                {
+                    '0' => "0",
+                    '1' => "1",
+                    'z' => "z",
+                    'x' => "x",
+                    'u' => "x",
+                    '-' => "x",
+                    _ => "x"
+                };
+            }
+            return "x";
+        }
+
+        // Handle multi-bit (std_logic_vector)
+        // VCD format: bVALUE IDENTIFIER (note the space before identifier)
+        var vcdBits = new System.Text.StringBuilder("b");
+        foreach (char c in valueStr)
+        {
+            char lc = char.ToLower(c);
+            vcdBits.Append(lc switch
+            {
+                '0' => '0',
+                '1' => '1',
+                'z' => 'z',
+                'x' => 'x',
+                'u' => 'x',
+                '-' => 'x',
+                _ => 'x'
+            });
+        }
+        vcdBits.Append(' ');
+        return vcdBits.ToString();
+    }
+
+    /// <summary>
+    /// Saves the VCD output to a file.
+    /// </summary>
+    /// <param name="filePath">The path to save the VCD file.</param>
+    /// <param name="moduleName">The name of the module/entity.</param>
+    /// <param name="timescaleNs">The timescale in nanoseconds.</param>
+    public void SaveToVcd(string filePath, string moduleName = "top", int timescaleNs = 1)
+    {
+        string vcdContent = ExportToVcd(moduleName, timescaleNs);
+        System.IO.File.WriteAllText(filePath, vcdContent);
+    }
+}

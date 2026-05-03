@@ -4,19 +4,80 @@ using Parser.Repositories;
 
 namespace Interpreter;
 
+/// <summary>
+/// Main entry point for the Kmila VHDL interpreter and simulator.
+/// Supports test file processing, delta cycle testing, and simulation with VCD export.
+/// </summary>
+/// <remarks>
+/// <para><strong>Command-line usage:</strong></para>
+/// <list type="bullet">
+/// <item><c>dotnet run</c> -- Process all test*.vhdl files in the current directory</item>
+/// <item><c>dotnet run -- --test-delta</c> -- Run delta cycle engine unit tests</item>
+/// <item><c>dotnet run -- --sim file.vhdl --cycles 100 --vcd output.vcd</c> -- Simulate and export VCD</item>
+/// <item><c>dotnet run -- --verbose</c> -- Enable verbose progress reporting</item>
+/// <item><c>dotnet run -- --progress</c> -- Show progress bar during batch processing</item>
+/// </list>
+/// </remarks>
 class Program
 {
-    // Flag to control verbose progress output
+    /// <summary>
+    /// Flag to control verbose progress output. Enabled with <c>--verbose</c> or <c>-v</c>.
+    /// </summary>
     static bool _verboseProgress = false;
 
-    // Cancellation token source for Ctrl+C handling
+    /// <summary>
+    /// Cancellation token source for graceful Ctrl+C handling.
+    /// </summary>
     static CancellationTokenSource _cts = new();
 
+    /// <summary>
+    /// Application entry point. Parses command-line arguments and dispatches to the
+    /// appropriate mode: batch test processing, delta cycle tests, or simulation.
+    /// </summary>
+    /// <param name="args">Command-line arguments.</param>
     static void Main(string[] args)
     {
         // Parse command line arguments
         _verboseProgress = args.Contains("--verbose") || args.Contains("-v");
         bool showProgressBar = args.Contains("--progress") || args.Contains("-p");
+
+        // Check for delta cycle test mode
+        if (args.Contains("--test-delta") || args.Contains("-td"))
+        {
+            RunDeltaCycleTests().Wait();
+            return;
+        }
+
+        // Check for simulation mode with VCD export
+        // Usage: --sim <file.vhdl> [--cycles N] [--vcd output.vcd]
+        int simIndex = Array.FindIndex(args, a => a == "--sim" || a == "-s");
+        if (simIndex >= 0 && simIndex + 1 < args.Length)
+        {
+            string vhdlFile = args[simIndex + 1];
+            int cycles = 10; // Default simulation cycles
+            string? vcdOutput = null;
+
+            // Parse optional arguments
+            int cyclesIndex = Array.FindIndex(args, a => a == "--cycles" || a == "-c");
+            if (cyclesIndex >= 0 && cyclesIndex + 1 < args.Length)
+            {
+                int.TryParse(args[cyclesIndex + 1], out cycles);
+            }
+
+            int vcdIndex = Array.FindIndex(args, a => a == "--vcd");
+            if (vcdIndex >= 0 && vcdIndex + 1 < args.Length)
+            {
+                vcdOutput = args[vcdIndex + 1];
+            }
+            else
+            {
+                // Default VCD filename based on VHDL file
+                vcdOutput = Path.ChangeExtension(vhdlFile, ".vcd");
+            }
+
+            RunSimulation(vhdlFile, cycles, vcdOutput).Wait();
+            return;
+        }
 
         // Setup Ctrl+C handling for graceful cancellation
         Console.CancelKeyPress += (sender, e) =>
@@ -66,6 +127,7 @@ class Program
         // This allows cross-file entity references to work correctly
         EntityRegistry.Instance.Clear();
         PackageRegistry.Instance.Clear();
+        FunctionRegistry.Instance.Clear();
         foreach (var file in testFiles)
         {
             EntityRegistry.Instance.ScanFile(file);
@@ -105,9 +167,16 @@ class Program
 
                 // Note: EntityRegistry already pre-scanned, just clear PackageRegistry per file
                 PackageRegistry.Instance.Clear();
+                // Same for FunctionRegistry — function/procedure names from a
+                // previous fixture must not leak into the next one.
+                FunctionRegistry.Instance.Clear();
+                // Reset the silent-skip diagnostic log so this fixture's
+                // entries are isolated from the previous one.
+                SkipDiagnosticLog.Instance.Clear();
 
                 string raw = File.ReadAllText(testFile);
                 var result = ProcessVhdlCode(raw, _cts.Token);
+                raw = null!;  // release the source string immediately
 
                 if (!showProgressBar)
                 {
@@ -133,8 +202,31 @@ class Program
                     }
 
                     Console.WriteLine($"  [PASS] {fileName} - Synthesized successfully!");
+
+                    // Surface silent-skip diagnostics so the user sees what was
+                    // dropped or stubbed during this fixture's parse.
+                    var diags = SkipDiagnosticLog.Instance.Drain();
+                    if (diags.Count > 0)
+                    {
+                        foreach (var d in diags)
+                        {
+                            string sev = d.Severity == SkipSeverity.Warning ? "WARN" : "INFO";
+                            string subj = string.IsNullOrEmpty(d.Subject) ? "" : $" [{d.Subject}]";
+                            Console.WriteLine($"    [{sev} {d.Code}]{subj} {d.Message}");
+                        }
+                    }
                 }
                 passedTests++;
+                // Release the per-fixture entity graph + its tokenizer/streamer
+                // before the next iteration so peak RSS doesn't accumulate
+                // proportionally to fixture count.
+                result = default;
+                if ((i & 7) == 7) GC.Collect(2, GCCollectionMode.Optimized, blocking: false);
+                if (Environment.GetEnvironmentVariable("KMILA_TRACE_HEAP") == "1")
+                {
+                    long alloc = GC.GetTotalMemory(forceFullCollection: false);
+                    Console.WriteLine($"    [heap] {alloc / 1024,8:n0} KB after {fileName}");
+                }
             }
             catch (OperationCanceledException)
             {
@@ -178,13 +270,198 @@ class Program
         }
     }
 
+    /// <summary>
+    /// Runs the delta cycle engine unit tests.
+    /// </summary>
+    static async Task RunDeltaCycleTests()
+    {
+        int failures = await Tests.DeltaCycleEngineTests.RunAllTests();
+        failures += await Tests.SynthesisTests.RunAllTests();
+        failures += Tests.IEEELibraryLoaderTests.RunAllTests();
+        failures += Tests.LibraryCompilerTests.RunAllTests();
+        failures += Tests.IEEEPrimitivesTests.RunAllTests();
+        failures += Tests.IEEELoweringEndToEndTests.RunAllTests();
+        failures += Tests.NestedIEEECallTests.RunAllTests();
+        Environment.ExitCode = failures;
+    }
+
+    /// <summary>
+    /// Runs a simulation on a VHDL file and exports waveforms to VCD.
+    /// </summary>
+    /// <param name="vhdlFile">The VHDL file to simulate.</param>
+    /// <param name="cycles">Number of simulation cycles to run.</param>
+    /// <param name="vcdOutput">Output VCD file path.</param>
+    static async Task RunSimulation(string vhdlFile, int cycles, string vcdOutput)
+    {
+        Console.WriteLine($"=== VHDL Simulation ===");
+        Console.WriteLine($"File: {vhdlFile}");
+        Console.WriteLine($"Cycles: {cycles}");
+        Console.WriteLine($"VCD Output: {vcdOutput}");
+        Console.WriteLine();
+
+        if (!File.Exists(vhdlFile))
+        {
+            Console.WriteLine($"Error: File not found: {vhdlFile}");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        try
+        {
+            // Read and process the VHDL file
+            string raw = File.ReadAllText(vhdlFile);
+            var (entities, archCount) = ProcessVhdlCode(raw);
+
+            if (entities.Count == 0)
+            {
+                Console.WriteLine("Error: No entities found in file");
+                Environment.ExitCode = 1;
+                return;
+            }
+
+            // Get the first entity with an architecture
+            var entity = entities.FirstOrDefault(e => e.Architecture != null);
+            if (entity == null)
+            {
+                Console.WriteLine("Error: No entity with architecture found");
+                Environment.ExitCode = 1;
+                return;
+            }
+
+            Console.WriteLine($"Simulating entity: {entity.Name}");
+            Console.WriteLine($"Ports: {entity.Ports.Count}");
+            Console.WriteLine($"Signals: {entity.Architecture!.Signals.Count}");
+            Console.WriteLine();
+
+            // Collect all signals for simulation
+            HashSet<Variable> allSignals = [.. entity.Ports, .. entity.Architecture.Signals];
+
+            // Set default values for input ports
+            Console.WriteLine("Setting up input signals:");
+            foreach (var signal in allSignals)
+            {
+                if (signal.PortType == Parser.Models.Constants.PortType.IN)
+                {
+                    string defaultVal = signal.Size > 1 ? new string('0', signal.Size) : "0";
+
+                    // Special handling for common signal names
+                    if (signal.Name.Equals("reset", StringComparison.OrdinalIgnoreCase) ||
+                        signal.Name.Equals("rst", StringComparison.OrdinalIgnoreCase))
+                    {
+                        defaultVal = "0"; // Active low reset, not asserted
+                    }
+                    else if (signal.Name.Equals("enable", StringComparison.OrdinalIgnoreCase) ||
+                             signal.Name.Equals("en", StringComparison.OrdinalIgnoreCase))
+                    {
+                        defaultVal = "1"; // Enable active
+                    }
+
+                    signal.Value = defaultVal;
+                    Console.WriteLine($"  {signal.Name} = {defaultVal}");
+                }
+            }
+            Console.WriteLine();
+
+            // Create delta cycle engine
+            var engine = new DeltaCycleEngine();
+            engine.Initialize(allSignals, entity.Architecture.Tasks);
+
+            Console.WriteLine("Running simulation...");
+
+            // Find clock signal
+            var clk = allSignals.FirstOrDefault(s =>
+                s.Name.Equals("clk", StringComparison.OrdinalIgnoreCase) ||
+                s.Name.Equals("clock", StringComparison.OrdinalIgnoreCase));
+
+            // Run simulation for specified cycles
+            for (int cycle = 0; cycle < cycles; cycle++)
+            {
+                if (clk != null)
+                {
+                    // Rising edge
+                    clk.Value = "1";
+                    engine.AdvanceTime((ulong)(cycle * 2));
+                    await engine.RunTimeStepAsync();
+
+                    // Falling edge
+                    clk.Value = "0";
+                    engine.AdvanceTime((ulong)(cycle * 2 + 1));
+                    await engine.RunTimeStepAsync();
+                }
+                else
+                {
+                    engine.AdvanceTime((ulong)cycle);
+                    await engine.RunTimeStepAsync();
+                }
+
+                // Progress indicator
+                if ((cycle + 1) % 10 == 0 || cycle == cycles - 1)
+                {
+                    Console.Write($"\rCycle {cycle + 1}/{cycles}");
+                }
+            }
+            Console.WriteLine();
+
+            // Export to VCD
+            Console.WriteLine($"\nExporting waveform to: {vcdOutput}");
+            engine.History.SaveToVcd(vcdOutput, entity.Name, timescaleNs: 10);
+
+            Console.WriteLine("Simulation complete!");
+            Console.WriteLine($"\nTo view waveforms:");
+            Console.WriteLine($"  gtkwave {vcdOutput}");
+
+            // Print summary of final signal values
+            Console.WriteLine("\n=== Final Signal Values ===");
+            foreach (var signal in allSignals.OrderBy(s => s.Name))
+            {
+                Console.WriteLine($"  {signal.Name} = {signal.Value}");
+            }
+
+            engine.Dispose();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error during simulation: {ex.Message}");
+            if (_verboseProgress)
+            {
+                Console.WriteLine(ex.StackTrace);
+            }
+            Environment.ExitCode = 1;
+        }
+    }
+
+    /// <summary>
+    /// Processes raw VHDL source code: tokenizes, parses entity declarations and architecture
+    /// bodies, and synthesizes behavioral descriptions.
+    /// </summary>
+    /// <param name="raw">The raw VHDL source code as a single string.</param>
+    /// <param name="cancellationToken">Optional cancellation token for long-running operations.</param>
+    /// <returns>
+    /// A tuple containing the list of parsed <see cref="Entity"/> objects and the number
+    /// of architecture bodies that were successfully synthesized.
+    /// </returns>
     static (List<Entity> entities, int architectureCount) ProcessVhdlCode(string raw, CancellationToken cancellationToken = default)
     {
+        // Seed the IEEE library symbol table once per process so calls into
+        // the IEEE.std_logic_1164 / IEEE.numeric_std API resolve through
+        // FunctionRegistry rather than falling back to the implicit-
+        // placeholder path (#20). Idempotent.
+        bool firstLoad = !IEEELibraryLoader.Instance.IsLoaded;
+        IEEELibraryLoader.Instance.EnsureLoaded();
+        if (firstLoad && Environment.GetEnvironmentVariable("KMILA_TRACE_IEEE") == "1")
+        {
+            Console.WriteLine($"[IEEE] stub root: {IEEELibraryLoader.Instance.StubRoot ?? "(not found — fallback names seeded)"}");
+        }
+
         Tokenizer tok = new("");
-        var prev = raw.Split("\n")
-                      .Where(p => !String.IsNullOrEmpty(p.Trim()) && p != " ")
-                      .ToList()
-                      .ToArray();
+        var lines = raw.Split("\n")
+                       .Where(p => !String.IsNullOrEmpty(p.Trim()) && p != " ")
+                       .ToArray();
+        // Pre-pass: VHDL has no continuation character. Join physical lines
+        // that belong to a single logical statement so the line-by-line
+        // state machine below (it=1/it=2 transitions, funcProcDepth tracking,
+        // arch-end detection) sees one statement per element.
+        var prev = JoinContinuationLines(lines);
 
         List<Entity> Entities = new();
         List<string> rawEntity = new();
@@ -311,33 +588,52 @@ class Program
             {
                 rawEntity.Add(item);
 
-                // v0.13.0 Fix: Track function/procedure depth to avoid premature architecture end detection
-                // When we see "function name(...) return type is" or "procedure name(...) is"
-                // increment the depth counter
+                // Track function/procedure depth so the matching `end <fn_name>;`
+                // line doesn't get classified as the architecture end.
+                //
+                // The previous heuristic decremented the counter on every `end <X>;`
+                // it saw inside a function — including `end if;`, `end loop;`,
+                // and `end case;`. That made the counter zero out before reaching
+                // the actual `end <fn_name>;`, after which the substring fallback
+                // below would happily match "end maxv;" against arch name "A"
+                // (because "maxv" contains an "a").
+                //
+                // New rule:
+                //   • Increment on `function ... is` / `procedure ... is`.
+                //   • Decrement ONLY on `end function;`, `end procedure;`, or
+                //     `end <name>;` where <name> is NOT a control-flow keyword.
+                //   • Control-flow ends (`end if`, `end loop`, `end case`,
+                //     `end for`, `end while`, `end generate`, `end record`) are
+                //     ignored at this layer.
                 if ((comparer.Contains("function ") && comparer.Contains(" is")) ||
                     (comparer.Contains("procedure ") && comparer.Contains(" is")))
                 {
                     funcProcDepth++;
                 }
-                // When we see "end function;", "end procedure;", or "end <name>;" while inside a function/procedure
-                // decrement the depth counter and don't check for architecture end yet
                 else if (comparer.StartsWith("end ") && comparer.EndsWith(";"))
                 {
                     var parts = comparer.Split(' ');
                     if (parts.Length >= 2)
                     {
                         var endName = parts[1].TrimEnd(';').ToLower();
-                        // Explicit "end function;" or "end procedure;"
+                        var controlFlow = new[] { "if", "loop", "case", "for",
+                                                  "while", "generate", "record" };
                         if (endName == "function" || endName == "procedure")
                         {
                             if (funcProcDepth > 0) funcProcDepth--;
-                            continue;  // Don't check for architecture end
+                            continue;
                         }
-                        // "end <function_name>;" pattern when we're inside a function/procedure
+                        if (controlFlow.Contains(endName))
+                        {
+                            // Control-flow end — does NOT close the enclosing
+                            // function/procedure. Leave funcProcDepth alone.
+                            continue;
+                        }
                         if (funcProcDepth > 0)
                         {
+                            // `end <fn_name>;` while inside a function — close it.
                             funcProcDepth--;
-                            continue;  // Don't check for architecture end
+                            continue;
                         }
                     }
                 }
@@ -355,16 +651,24 @@ class Program
                     if (parts.Length >= 2)
                     {
                         var endName = parts[1].TrimEnd(';').ToLower();
-                        // Check if it's the architecture name (not a control structure)
-                        var skipNames = new[] { "if", "process", "case", "loop", "for", "while", "generate", "function", "procedure" };
+                        // Skip control structures and inner-decl ends.
+                        var skipNames = new[] { "if", "process", "case", "loop",
+                                                "for", "while", "generate",
+                                                "function", "procedure", "record",
+                                                "component", "block", "units" };
                         if (!skipNames.Contains(endName))
                         {
-                            // Check if end matches either the architecture name OR the entity name
-                            // Supports both: "end behavioral;" and "end example;"
+                            // Exact-name match only. The previous code also
+                            // accepted any line containing the arch/entity
+                            // name as a substring, which made `end maxv;`
+                            // match arch name "A" via the embedded `a`.
+                            // Also accept the bare `end;` form (parts.Length==2,
+                            // endName == ""). And accept the explicit
+                            // `end architecture;` keyword form.
                             if (endName == currentArchName.ToLower() ||
                                 endName == currentEntityName.ToLower() ||
-                                comparer.Contains(currentArchName.ToLower()) ||
-                                comparer.Contains(currentEntityName.ToLower()))
+                                endName == "architecture" ||
+                                string.IsNullOrEmpty(endName))
                             {
                                 isEndOfArchitecture = true;
                             }
@@ -610,5 +914,88 @@ class Program
         int filled = (int)(progress * width);
         int empty = width - filled;
         return $"{"█".PadRight(filled, '█')}{"░".PadRight(empty, '░')}";
+    }
+
+    /// <summary>
+    /// Joins physical VHDL source lines that belong to one logical statement
+    /// before they reach the line-by-line state machine in <see cref="ProcessVhdlCode"/>.
+    /// </summary>
+    /// <remarks>
+    /// VHDL lacks an explicit continuation character — a statement is whatever
+    /// runs from one terminator to the next, regardless of how many physical
+    /// lines it spans. The downstream code uses string matching on individual
+    /// lines (StartsWith("end "), Contains("function ... is"), etc.), so a
+    /// statement broken across lines was silently mis-classified.
+    ///
+    /// A line is considered "complete" when:
+    ///   • parenthesis depth has returned to 0, AND
+    ///   • the trailing token is one of: <c>;</c>, <c>is</c>, <c>then</c>,
+    ///     <c>else</c>, <c>elsif</c>, <c>loop</c>, <c>begin</c>,
+    ///     <c>generate</c>, or <c>record</c>.
+    /// Comments (<c>--</c> to EOL) are stripped before the completion check
+    /// but preserved in the joined output so downstream tooling that reads
+    /// them still works.
+    /// </remarks>
+    static string[] JoinContinuationLines(string[] rawLines)
+    {
+        var joined = new List<string>();
+        var buffer = new System.Text.StringBuilder();
+        int parenDepth = 0;
+
+        foreach (var raw in rawLines)
+        {
+            string codeOnly = raw;
+            int commentIdx = codeOnly.IndexOf("--", StringComparison.Ordinal);
+            if (commentIdx >= 0) codeOnly = codeOnly[..commentIdx];
+            string trimmed = codeOnly.TrimEnd();
+
+            if (trimmed.Length == 0)
+            {
+                // Blank line or comment-only. Inside an open statement we skip
+                // it entirely; otherwise pass it through so existing diagnostics
+                // that read raw lines still see the comment.
+                if (parenDepth > 0 && buffer.Length > 0) continue;
+                joined.Add(raw);
+                continue;
+            }
+
+            foreach (char c in codeOnly)
+            {
+                if (c == '(') parenDepth++;
+                else if (c == ')') parenDepth = Math.Max(0, parenDepth - 1);
+            }
+
+            if (buffer.Length > 0) buffer.Append(' ');
+            buffer.Append(raw.Trim());
+
+            bool complete = parenDepth == 0 && IsLineTerminator(trimmed);
+            if (complete)
+            {
+                joined.Add(buffer.ToString());
+                buffer.Clear();
+            }
+        }
+
+        if (buffer.Length > 0) joined.Add(buffer.ToString());
+        return joined.ToArray();
+    }
+
+    /// <summary>
+    /// Whether <paramref name="trimmed"/> looks like the end of a VHDL
+    /// statement (assuming all opening parens have been balanced).
+    /// </summary>
+    static bool IsLineTerminator(string trimmed)
+    {
+        if (trimmed.EndsWith(";", StringComparison.Ordinal)) return true;
+        string lower = trimmed.ToLowerInvariant();
+        if (lower.EndsWith(" is")       || lower == "is")       return true;
+        if (lower.EndsWith(" then")     || lower == "then")     return true;
+        if (lower.EndsWith(" else")     || lower == "else")     return true;
+        if (lower.EndsWith(" elsif"))                           return true;
+        if (lower.EndsWith(" loop")     || lower == "loop")     return true;
+        if (lower.EndsWith(" begin")    || lower == "begin")    return true;
+        if (lower.EndsWith(" generate"))                        return true;
+        if (lower.EndsWith(" record"))                          return true;
+        return false;
     }
 }

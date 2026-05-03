@@ -1,3 +1,4 @@
+using Interpreter.Models;
 using Parser.Models;
 
 namespace Interpreter.Services;
@@ -41,6 +42,8 @@ public class PackageRegistry
 
     private readonly Dictionary<string, PackageDefinition> _packages = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Variable> _globalConstants = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, FunctionDefinition> _globalFunctions = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, ProcedureDefinition> _globalProcedures = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// Gets all registered packages.
@@ -51,6 +54,16 @@ public class PackageRegistry
     /// Gets all global constants from all packages.
     /// </summary>
     public IReadOnlyDictionary<string, Variable> GlobalConstants => _globalConstants;
+
+    /// <summary>
+    /// Gets all global functions from all packages.
+    /// </summary>
+    public IReadOnlyDictionary<string, FunctionDefinition> GlobalFunctions => _globalFunctions;
+
+    /// <summary>
+    /// Gets all global procedures from all packages.
+    /// </summary>
+    public IReadOnlyDictionary<string, ProcedureDefinition> GlobalProcedures => _globalProcedures;
 
     /// <summary>
     /// Registers a new package.
@@ -103,6 +116,104 @@ public class PackageRegistry
 #if DEBUG
         Console.WriteLine($"[PackageRegistry] Registered constant: {constant.Name} = {constant.Value} in package {packageName}");
 #endif
+    }
+
+    /// <summary>
+    /// Registers a function globally.
+    /// </summary>
+    /// <param name="function">The function definition to register.</param>
+    /// <param name="packageName">Optional package name to associate with.</param>
+    public void RegisterFunction(FunctionDefinition function, string packageName = "global")
+    {
+        _globalFunctions[function.Name] = function;
+        function.PackageName = packageName;
+
+        if (!_packages.ContainsKey(packageName))
+        {
+            _packages[packageName] = new PackageDefinition { Name = packageName };
+        }
+        _packages[packageName].RegisterFunction(function);
+
+#if DEBUG
+        Console.WriteLine($"[PackageRegistry] Registered function: {function.Name} in package {packageName}");
+#endif
+    }
+
+    /// <summary>
+    /// Registers a procedure globally.
+    /// </summary>
+    /// <param name="procedure">The procedure definition to register.</param>
+    /// <param name="packageName">Optional package name to associate with.</param>
+    public void RegisterProcedure(ProcedureDefinition procedure, string packageName = "global")
+    {
+        _globalProcedures[procedure.Name] = procedure;
+        procedure.PackageName = packageName;
+
+        if (!_packages.ContainsKey(packageName))
+        {
+            _packages[packageName] = new PackageDefinition { Name = packageName };
+        }
+        _packages[packageName].RegisterProcedure(procedure);
+
+#if DEBUG
+        Console.WriteLine($"[PackageRegistry] Registered procedure: {procedure.Name} in package {packageName}");
+#endif
+    }
+
+    /// <summary>
+    /// Checks if a function exists.
+    /// </summary>
+    /// <param name="functionName">The function name to check.</param>
+    /// <returns>True if the function is registered.</returns>
+    public bool ContainsFunction(string functionName) => _globalFunctions.ContainsKey(functionName);
+
+    /// <summary>
+    /// Gets a function by name.
+    /// </summary>
+    /// <param name="functionName">The function name to look up.</param>
+    /// <returns>The function definition, or null if not found.</returns>
+    public FunctionDefinition? GetFunction(string functionName)
+    {
+        return _globalFunctions.TryGetValue(functionName, out var func) ? func : null;
+    }
+
+    /// <summary>
+    /// Attempts to get a function by name.
+    /// </summary>
+    /// <param name="functionName">The function name to look up.</param>
+    /// <param name="function">The function definition if found.</param>
+    /// <returns>True if the function was found.</returns>
+    public bool TryGetFunction(string functionName, out FunctionDefinition? function)
+    {
+        return _globalFunctions.TryGetValue(functionName, out function);
+    }
+
+    /// <summary>
+    /// Checks if a procedure exists.
+    /// </summary>
+    /// <param name="procedureName">The procedure name to check.</param>
+    /// <returns>True if the procedure is registered.</returns>
+    public bool ContainsProcedure(string procedureName) => _globalProcedures.ContainsKey(procedureName);
+
+    /// <summary>
+    /// Gets a procedure by name.
+    /// </summary>
+    /// <param name="procedureName">The procedure name to look up.</param>
+    /// <returns>The procedure definition, or null if not found.</returns>
+    public ProcedureDefinition? GetProcedure(string procedureName)
+    {
+        return _globalProcedures.TryGetValue(procedureName, out var proc) ? proc : null;
+    }
+
+    /// <summary>
+    /// Attempts to get a procedure by name.
+    /// </summary>
+    /// <param name="procedureName">The procedure name to look up.</param>
+    /// <param name="procedure">The procedure definition if found.</param>
+    /// <returns>True if the procedure was found.</returns>
+    public bool TryGetProcedure(string procedureName, out ProcedureDefinition? procedure)
+    {
+        return _globalProcedures.TryGetValue(procedureName, out procedure);
     }
 
     /// <summary>
@@ -161,12 +272,14 @@ public class PackageRegistry
     }
 
     /// <summary>
-    /// Clears all registered packages and constants.
+    /// Clears all registered packages, constants, functions, and procedures.
     /// </summary>
     public void Clear()
     {
         _packages.Clear();
         _globalConstants.Clear();
+        _globalFunctions.Clear();
+        _globalProcedures.Clear();
     }
 
     /// <summary>
@@ -222,12 +335,66 @@ public class PackageDefinition
     public TypeRegistry Types { get; } = new();
 
     /// <summary>
-    /// Gets the functions defined in this package (names only for now).
+    /// Gets the function names defined in this package (for backwards compatibility).
     /// </summary>
-    public List<string> Functions { get; } = new();
+    public List<string> FunctionNames { get; } = new();
+
+    /// <summary>
+    /// Gets the function definitions in this package.
+    /// </summary>
+    public Dictionary<string, FunctionDefinition> Functions { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Gets the procedure definitions in this package.
+    /// </summary>
+    public Dictionary<string, ProcedureDefinition> Procedures { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Registers a function definition.
+    /// </summary>
+    /// <param name="function">The function definition to register.</param>
+    public void RegisterFunction(FunctionDefinition function)
+    {
+        function.PackageName = Name;
+        Functions[function.Name] = function;
+        if (!FunctionNames.Contains(function.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            FunctionNames.Add(function.Name);
+        }
+    }
+
+    /// <summary>
+    /// Registers a procedure definition.
+    /// </summary>
+    /// <param name="procedure">The procedure definition to register.</param>
+    public void RegisterProcedure(ProcedureDefinition procedure)
+    {
+        procedure.PackageName = Name;
+        Procedures[procedure.Name] = procedure;
+    }
+
+    /// <summary>
+    /// Gets a function by name.
+    /// </summary>
+    /// <param name="name">The function name.</param>
+    /// <returns>The function definition or null if not found.</returns>
+    public FunctionDefinition? GetFunction(string name)
+    {
+        return Functions.TryGetValue(name, out var func) ? func : null;
+    }
+
+    /// <summary>
+    /// Gets a procedure by name.
+    /// </summary>
+    /// <param name="name">The procedure name.</param>
+    /// <returns>The procedure definition or null if not found.</returns>
+    public ProcedureDefinition? GetProcedure(string name)
+    {
+        return Procedures.TryGetValue(name, out var proc) ? proc : null;
+    }
 
     /// <summary>
     /// Returns a string representation of the package.
     /// </summary>
-    public override string ToString() => $"Package '{Name}': {Constants.Count} constants, {Types.Count} types";
+    public override string ToString() => $"Package '{Name}': {Constants.Count} constants, {Functions.Count} functions, {Procedures.Count} procedures, {Types.Count} types";
 }

@@ -8,6 +8,8 @@ using static Parser.Models.Constants.TYPE;
 
 namespace Interpreter.Repositories;
 
+// Note: This file uses ExitException and NextException from ControlExceptions.cs
+
 /// <summary>
 /// Represents and manages the logic for a VHDL simple (infinite) loop statement.
 /// Parses and executes infinite loops that rely on exit statements to terminate.
@@ -63,8 +65,11 @@ namespace Interpreter.Repositories;
 /// </remarks>
 public class SimpleLoopStructure : ISControl
 {
+    /// <summary>The variables in scope during loop body execution.</summary>
     private readonly HashSet<Variable> _variables;
+    /// <summary>The token stream used for parsing the loop structure.</summary>
     private readonly TokenStream _streamer;
+    /// <summary>Detector used to classify operations found inside the loop body.</summary>
     private readonly OperationDetector _detector = new();
 
     /// <summary>
@@ -73,9 +78,14 @@ public class SimpleLoopStructure : ISControl
     public List<object> Tasks { get; private set; } = new();
 
     /// <summary>
-    /// Gets the list of exit conditions.
+    /// Gets the list of exit conditions (for legacy support).
     /// </summary>
     public List<ExitCondition> ExitConditions { get; private set; } = new();
+
+    /// <summary>
+    /// Gets or sets the optional loop label for targeted exit/next statements.
+    /// </summary>
+    public string? LoopLabel { get; set; }
 
     /// <summary>
     /// Maximum iterations to prevent infinite loops during simulation.
@@ -85,6 +95,8 @@ public class SimpleLoopStructure : ISControl
     /// <summary>
     /// Initializes a new instance of the <see cref="SimpleLoopStructure"/> class.
     /// </summary>
+    /// <param name="Variables">The set of variables available in the current scope.</param>
+    /// <param name="Tokenizer">The token stream to read the loop structure from.</param>
     public SimpleLoopStructure(HashSet<Variable> Variables, TokenStream Tokenizer)
     {
         _variables = Variables;
@@ -102,10 +114,33 @@ public class SimpleLoopStructure : ISControl
         while (iterations < MaxIterations && !shouldExit)
         {
             // Execute loop body
-            Executer executer = new(Tasks);
-            await executer.ExecuteAsync();
+            try
+            {
+                Executer executer = new(Tasks);
+                await executer.ExecuteAsync();
+            }
+            catch (ExitException ex)
+            {
+                // Check if this exit is for us (no label or matching label)
+                if (string.IsNullOrEmpty(ex.Label) || ex.Label == LoopLabel)
+                {
+                    shouldExit = true;
+                    break;
+                }
+                throw; // Re-throw for outer loop
+            }
+            catch (NextException ex)
+            {
+                // Check if this next is for us (no label or matching label)
+                if (string.IsNullOrEmpty(ex.Label) || ex.Label == LoopLabel)
+                {
+                    iterations++;
+                    continue; // Continue to next iteration
+                }
+                throw; // Re-throw for outer loop
+            }
 
-            // Check exit conditions
+            // Check legacy exit conditions (for backwards compatibility)
             foreach (var exitCondition in ExitConditions)
             {
                 if (exitCondition.IsUnconditional)
@@ -205,7 +240,27 @@ public class SimpleLoopStructure : ISControl
                         break;
 
                     case "exit":
-                        SyntetizeExitStatement();
+                        ExitStatement exitStmt = new(_variables, _streamer);
+                        exitStmt.Syntetize();
+                        Tasks.Add(exitStmt);
+                        break;
+
+                    case "next":
+                        NextStatement nextStmt = new(_variables, _streamer);
+                        nextStmt.Syntetize();
+                        Tasks.Add(nextStmt);
+                        break;
+
+                    case "null":
+                        NullStatement nullStmt = new(_streamer);
+                        nullStmt.Syntetize();
+                        Tasks.Add(nullStmt);
+                        break;
+
+                    case "return":
+                        ReturnStatement returnStmt = new(_variables, _streamer);
+                        returnStmt.Syntetize();
+                        Tasks.Add(returnStmt);
                         break;
 
                     default:
@@ -223,6 +278,7 @@ public class SimpleLoopStructure : ISControl
     /// <summary>
     /// Checks if we've reached the end of the loop.
     /// </summary>
+    /// <returns>True if the current token is 'end' or the stream is exhausted.</returns>
     private bool IsEndOfLoop()
     {
         if (_streamer.Current == null) return true;
@@ -232,6 +288,7 @@ public class SimpleLoopStructure : ISControl
     /// <summary>
     /// Consumes 'end keyword ;' tokens.
     /// </summary>
+    /// <param name="keyword">The keyword expected after 'end' (e.g., "if", "loop", "case").</param>
     private void ConsumeEndKeyword(string keyword)
     {
         if (_streamer.Current?.Value.ToLower() == "end")
@@ -245,42 +302,6 @@ public class SimpleLoopStructure : ISControl
             {
                 _streamer.MoveNext();
             }
-        }
-    }
-
-    /// <summary>
-    /// Synthesizes an exit statement and stores it as an ExitCondition.
-    /// </summary>
-    private void SyntetizeExitStatement()
-    {
-        _streamer.MoveNext(); // consume 'exit'
-
-        var exitCondition = new ExitCondition();
-
-        // Check for optional 'when' condition
-        if (_streamer.Current?.Value.ToLower() == "when")
-        {
-            _streamer.MoveNext(); // consume 'when'
-
-            var conditionBuilder = new StringBuilder();
-            while (_streamer.Current?.Value != ";")
-            {
-                conditionBuilder.Append(_streamer.Current?.Value + " ");
-                _streamer.MoveNext();
-            }
-            exitCondition.ConditionString = conditionBuilder.ToString().Trim();
-            exitCondition.IsUnconditional = false;
-        }
-        else
-        {
-            exitCondition.IsUnconditional = true;
-        }
-
-        ExitConditions.Add(exitCondition);
-
-        if (_streamer.Current?.Value == ";")
-        {
-            _streamer.MoveNext();
         }
     }
 
@@ -315,6 +336,7 @@ public class SimpleLoopStructure : ISControl
     /// <summary>
     /// Not implemented - use Syntetize() instead.
     /// </summary>
+    /// <param name="data">The raw data for synthesis (unused).</param>
     public void Syntetize(string[] data) => throw new NotImplementedException();
 }
 

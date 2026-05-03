@@ -52,6 +52,42 @@ public class Process : ISControl, IControl
     }
 
     /// <summary>
+    /// Executes the process with signal scheduling for delta cycle semantics.
+    /// Signal assignments are scheduled instead of applied immediately.
+    /// </summary>
+    /// <param name="scheduler">The signal scheduler to use for updates.</param>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    public async Task ExecuteWithSchedulerAsync(SignalScheduler scheduler)
+    {
+        // Create scheduled versions of operations
+        var scheduledTasks = new List<object>();
+        foreach (var task in Tasks)
+        {
+            if (task is Operation op)
+            {
+                scheduledTasks.Add(new ScheduledOperation(op, scheduler));
+            }
+            else
+            {
+                scheduledTasks.Add(task);
+            }
+        }
+
+        Executer executer = new(scheduledTasks);
+        await executer.ExecuteAsync();
+    }
+
+    /// <summary>
+    /// Checks if this process is sensitive to any of the changed signals.
+    /// </summary>
+    /// <param name="changedSignals">The set of signals that changed.</param>
+    /// <returns>True if the process should be re-executed.</returns>
+    public bool IsSensitiveTo(HashSet<Variable> changedSignals)
+    {
+        return SensitiveList.Overlaps(changedSignals);
+    }
+
+    /// <summary>
     /// Synthesizes the process.
     /// </summary>
     public void Syntetize() => Syntetize(CancellationToken.None);
@@ -191,6 +227,44 @@ public class Process : ISControl, IControl
                         ConsumeEndKeyword("loop");
                         break;
 
+                    case "exit":
+                        ExitStatement exitStmt = new(allVariables, _streamer);
+                        exitStmt.Syntetize();
+                        Tasks.Add(exitStmt);
+                        break;
+
+                    case "next":
+                        NextStatement nextStmt = new(allVariables, _streamer);
+                        nextStmt.Syntetize();
+                        Tasks.Add(nextStmt);
+                        break;
+
+                    case "null":
+                        NullStatement nullStmt = new(_streamer);
+                        nullStmt.Syntetize();
+                        Tasks.Add(nullStmt);
+                        break;
+
+                    case "return":
+                        ReturnStatement returnStmt = new(allVariables, _streamer);
+                        returnStmt.Syntetize();
+                        Tasks.Add(returnStmt);
+                        break;
+
+                    case "wait":
+                        // Testbench-only construct (wait for X ns; wait until cond; wait;).
+                        // Not synthesizable — consume tokens up to the terminating ';' so the
+                        // parser doesn't drift into the next statement and treat 'for' as a
+                        // ForLoopStructure (which previously caused runaway memory consumption).
+                        SkipWaitStatement();
+                        break;
+
+                    case "report":
+                    case "assert":
+                        // Simulation-only diagnostic statements. Skip to ';'.
+                        SkipToSemicolonInclusive();
+                        break;
+
                     default:
                         // Skip unknown keywords
                         _streamer.MoveNext();
@@ -213,6 +287,41 @@ public class Process : ISControl, IControl
         if (_streamer.Current?.Value == ";")
         {
             _streamer.MoveNext(); // consume ';'
+        }
+    }
+
+    /// <summary>
+    /// Consumes a VHDL <c>wait</c> statement up to and including its terminating
+    /// <c>;</c>. Handles all forms: <c>wait;</c>, <c>wait for X ns;</c>,
+    /// <c>wait until cond;</c>, <c>wait on sig_list;</c>, and combinations.
+    /// </summary>
+    /// <remarks>
+    /// Testbench-only — not synthesizable. Without this, <c>wait for DELAY</c>
+    /// caused the process synthesizer to misclassify the trailing <c>for</c> as
+    /// a ForLoop, then keep growing an expression buffer until OOM.
+    /// </remarks>
+    private void SkipWaitStatement()
+    {
+        _streamer.MoveNext(); // consume 'wait'
+        SkipToSemicolonInclusive();
+    }
+
+    /// <summary>
+    /// Skips tokens up to and including the next <c>;</c>. Stops early at
+    /// <c>end</c> as a safety net so a missing semicolon doesn't run off the
+    /// process body.
+    /// </summary>
+    private void SkipToSemicolonInclusive()
+    {
+        while (_streamer.Current != null
+            && _streamer.Current.Value != ";"
+            && _streamer.Current.Value.ToLower() != "end")
+        {
+            _streamer.MoveNext();
+        }
+        if (_streamer.Current?.Value == ";")
+        {
+            _streamer.MoveNext();
         }
     }
 

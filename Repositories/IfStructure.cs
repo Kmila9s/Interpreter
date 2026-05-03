@@ -60,8 +60,11 @@ public class IfBranch
 /// </remarks>
 public class IfStructure : ISControl
 {
+    /// <summary>The variables in scope during condition and body evaluation.</summary>
     private readonly HashSet<Variable> _variables = new();
+    /// <summary>The token stream used for parsing the if structure.</summary>
     private readonly TokenStream _streamer;
+    /// <summary>Detector used to classify operations found inside branch bodies.</summary>
     private readonly OperationDetector _detector = new();
 
     /// <summary>
@@ -227,6 +230,7 @@ public class IfStructure : ISControl
     /// <summary>
     /// Synthesizes the body of a branch until 'elsif', 'else', or 'end' is found.
     /// </summary>
+    /// <param name="branch">The branch whose body is being synthesized.</param>
     private void SyntetizeBranchBody(IfBranch branch)
     {
         int iterations = 0;
@@ -259,6 +263,51 @@ public class IfStructure : ISControl
                         ConsumeEndKeyword("case");
                         break;
 
+                    case "for":
+                        ForLoopStructure forLoop = new(_variables, _streamer);
+                        forLoop.Syntetize();
+                        branch.Tasks.Add(forLoop);
+                        ConsumeEndKeyword("loop");
+                        break;
+
+                    case "while":
+                        WhileLoopStructure whileLoop = new(_variables, _streamer);
+                        whileLoop.Syntetize();
+                        branch.Tasks.Add(whileLoop);
+                        ConsumeEndKeyword("loop");
+                        break;
+
+                    case "loop":
+                        SimpleLoopStructure simpleLoop = new(_variables, _streamer);
+                        simpleLoop.Syntetize();
+                        branch.Tasks.Add(simpleLoop);
+                        ConsumeEndKeyword("loop");
+                        break;
+
+                    case "exit":
+                        ExitStatement exitStmt = new(_variables, _streamer);
+                        exitStmt.Syntetize();
+                        branch.Tasks.Add(exitStmt);
+                        break;
+
+                    case "next":
+                        NextStatement nextStmt = new(_variables, _streamer);
+                        nextStmt.Syntetize();
+                        branch.Tasks.Add(nextStmt);
+                        break;
+
+                    case "null":
+                        NullStatement nullStmt = new(_streamer);
+                        nullStmt.Syntetize();
+                        branch.Tasks.Add(nullStmt);
+                        break;
+
+                    case "return":
+                        ReturnStatement returnStmt = new(_variables, _streamer);
+                        returnStmt.Syntetize();
+                        branch.Tasks.Add(returnStmt);
+                        break;
+
                     default:
                         // Other keywords - skip
                         _streamer.MoveNext();
@@ -276,6 +325,7 @@ public class IfStructure : ISControl
     /// <summary>
     /// Checks if we've reached the end of the current branch (elsif, else, or end).
     /// </summary>
+    /// <returns>True if the current token is 'elsif', 'else', 'end', or the stream is exhausted.</returns>
     private bool IsEndOfBranch()
     {
         if (_streamer.Current == null) return true;
@@ -289,6 +339,7 @@ public class IfStructure : ISControl
     /// <summary>
     /// Consumes 'end keyword ;' tokens after a nested structure.
     /// </summary>
+    /// <param name="keyword">The keyword expected after 'end' (e.g., "if", "loop", "case").</param>
     private void ConsumeEndKeyword(string keyword)
     {
         if (_streamer.Current?.Value.ToLower() == "end")
@@ -308,6 +359,7 @@ public class IfStructure : ISControl
     /// <summary>
     /// Synthesizes a simple assignment statement within a branch.
     /// </summary>
+    /// <param name="branch">The branch to add the parsed assignment to.</param>
     private void SyntetizeAssingation(IfBranch branch)
     {
         var rawDataBuilder = new StringBuilder();

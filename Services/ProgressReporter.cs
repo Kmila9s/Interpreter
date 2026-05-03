@@ -31,8 +31,14 @@ public readonly struct ProgressUpdate
     public DateTime Timestamp { get; init; }
 
     /// <summary>
-    /// Creates a new progress update.
+    /// Creates a new progress update with the given fraction, message, phase
+    /// and optional detail. <paramref name="progress"/> is clamped to [0, 1]
+    /// and <see cref="Timestamp"/> is set to <see cref="DateTime.Now"/>.
     /// </summary>
+    /// <param name="progress">Overall progress as a fraction in [0, 1].</param>
+    /// <param name="message">Short status message shown to the user.</param>
+    /// <param name="phase">Pipeline phase this update belongs to.</param>
+    /// <param name="detail">Optional sub-status string (e.g. current file).</param>
     public ProgressUpdate(float progress, string message, ProcessingPhase phase = ProcessingPhase.Unknown, string? detail = null)
     {
         Progress = Math.Clamp(progress, 0f, 1f);
@@ -98,8 +104,14 @@ public enum ProcessingPhase
 /// </summary>
 public class ProgressEventArgs : EventArgs
 {
+    /// <summary>The progress payload carried by this event.</summary>
     public ProgressUpdate Update { get; }
 
+    /// <summary>
+    /// Wraps a <see cref="ProgressUpdate"/> for delivery via the
+    /// <see cref="ProgressReporter.OnProgressChanged"/> event.
+    /// </summary>
+    /// <param name="update">The update to surface to subscribers.</param>
     public ProgressEventArgs(ProgressUpdate update)
     {
         Update = update;
@@ -401,6 +413,14 @@ public class ScopedProgressReporter
     private readonly float _range;
     private readonly ProcessingPhase _phase;
 
+    /// <summary>
+    /// Initializes a sub-range reporter that maps local 0..1 progress onto
+    /// a fixed slice of the parent's overall progress space.
+    /// </summary>
+    /// <param name="parent">Owning <see cref="ProgressReporter"/> that receives the mapped reports.</param>
+    /// <param name="start">Lower bound of the slice in the parent's progress space (0..1).</param>
+    /// <param name="end">Upper bound of the slice in the parent's progress space (0..1).</param>
+    /// <param name="phase">Phase tag stamped on every emitted update.</param>
     internal ScopedProgressReporter(ProgressReporter parent, float start, float end, ProcessingPhase phase)
     {
         _parent = parent;
@@ -433,6 +453,14 @@ public class ItemProgressReporter
     private readonly string _itemName;
     private int _currentItem = 0;
 
+    /// <summary>
+    /// Initializes a per-item progress helper that automatically derives the
+    /// fractional progress as <c>currentItem / totalItems</c>.
+    /// </summary>
+    /// <param name="parent">Owning <see cref="ProgressReporter"/> that receives the reports.</param>
+    /// <param name="totalItems">Total number of items to be processed (clamped to ≥ 1).</param>
+    /// <param name="phase">Phase tag stamped on every emitted update.</param>
+    /// <param name="itemName">Singular noun for the items, used in default messages (e.g. "file", "entity").</param>
     internal ItemProgressReporter(ProgressReporter parent, int totalItems, ProcessingPhase phase, string itemName)
     {
         _parent = parent;

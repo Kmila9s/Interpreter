@@ -96,6 +96,37 @@ public class Entity : ISControl, IControl{
     public void Syntetize(string[] RawEntity) => Syntetize(RawEntity, CancellationToken.None);
 
     /// <summary>
+    /// Synthesizes the entity using lines that carry their original 1-based
+    /// source-file line numbers. Diagnostics produced by the parser will
+    /// reference those numbers instead of the chronological tokenize-call
+    /// counter, which is what the user wanted to see.
+    /// </summary>
+    /// <param name="RawEntityWithLines">Pairs of (sourceLine, lineText).</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public void Syntetize(IReadOnlyList<(int sourceLine, string text)> RawEntityWithLines,
+                          CancellationToken cancellationToken = default)
+    {
+        var progress = ProgressReporter.Instance;
+        progress.ReportPhase(0f, "Tokenizing entity", ProcessingPhase.Tokenizing);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        foreach (var (line, text) in RawEntityWithLines)
+            _tokenizer.TokenizeLineAt(text, line);
+        _tokenizer.Evaluate();
+        _streamer = new(_tokenizer.GetDictionaryType());
+
+        cancellationToken.ThrowIfCancellationRequested();
+        progress.ReportPhase(0.3f, "Parsing entity declaration", ProcessingPhase.ParsingEntity);
+        _streamer.Expect(KEYWORDS);
+        Name = _streamer.Current?.Value ?? string.Empty;
+        progress.ReportPhase(0.5f, "Found entity", ProcessingPhase.ParsingEntity, Name);
+        _streamer.Expect(IDENTIFIERS);
+        _streamer.Expect(KEYWORDS);
+        SyntetizeBehaviour(cancellationToken);
+        progress.ReportPhase(1f, "Entity parsed", ProcessingPhase.ParsingEntity, Name);
+    }
+
+    /// <summary>
     /// Synthesizes the entity from raw data.
     /// </summary>
     /// <param name="RawEntity">The raw data of the entity.</param>

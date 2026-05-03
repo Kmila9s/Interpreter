@@ -43,6 +43,7 @@ public class EntityInfo
     /// </summary>
     public TokenStream? TokenStream { get; set; }
 
+    /// <summary>Diagnostic-friendly representation of the entity record.</summary>
     public override string ToString() => $"Entity '{Name}' from {Path.GetFileName(FilePath)} ({Ports.Count} ports, {Generics.Count} generics)";
 }
 
@@ -83,6 +84,7 @@ public class ComponentInstance
     /// </summary>
     public EntityInfo? ResolvedEntity { get; set; }
 
+    /// <summary>Diagnostic-friendly representation of the component instance.</summary>
     public override string ToString() => $"{InstanceName}: {LibraryName}.{EntityName}";
 }
 

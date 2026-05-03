@@ -9,9 +9,13 @@ namespace Interpreter.Repositories;
 /// </summary>
 public class Executer : ISControl, IDisposable
 {
+    /// <summary>Indicates whether the executer is currently running (true) or paused (false).</summary>
     private bool _isRunning = true;
+    /// <summary>The list of tasks (operations and control structures) to execute sequentially.</summary>
     private readonly List<object> Tasks = new();
+    /// <summary>Cancellation token source used to cancel the entire execution flow.</summary>
     private readonly CancellationTokenSource _cts = new();
+    /// <summary>Cancellation token source used to resume execution after a pause.</summary>
     private CancellationTokenSource _pauseCts = new();
 
     /// <summary>
@@ -38,6 +42,7 @@ public class Executer : ISControl, IDisposable
             {
                 var task = Tasks[i];
                 if (task is Operation operation) operation.Execute();
+                else if (task is ScheduledOperation scheduledOp) scheduledOp.Execute();
                 else if (task is ISControl sControl) await sControl.ExecuteAsync();
                 i++;
             }
@@ -80,9 +85,14 @@ public class Executer : ISControl, IDisposable
     /// </summary>
     public void Dispose()
     {
+        // Timer.OnPaused is a static event — without this -= every Executer
+        // instance stays rooted for the lifetime of the process, leaking the
+        // executer + everything it transitively references on each new run.
+        TimeMachine.Repositories.Timer.OnPaused -= OnPaused;
+
         _cts?.Cancel();
         _pauseCts?.Cancel();
         _cts?.Dispose();
-        _pauseCts?.Dispose();   
+        _pauseCts?.Dispose();
     }
 }

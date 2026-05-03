@@ -50,7 +50,15 @@ public class Operation : IOperation {
     private static readonly Regex _arithOperators = new(Constants.ARITH_OPERATORS, _optionsCompiled);
     private static readonly LiteralsFinder _finder = new();
 
+    // v0.17.0: Atomic counter for literal names - replaces expensive Guid.NewGuid()
+    private static int _literalCounter = 0;
+
     private string _rawData = string.Empty;
+
+    /// <summary>
+    /// Gets the raw data string of the operation for debugging.
+    /// </summary>
+    public string RawData => _rawData;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="Operation"/> class.
@@ -146,6 +154,12 @@ public class Operation : IOperation {
         foreach(var item in Items){
             if(item is Variable newVar){
                 variables.Push(newVar);
+            }
+            // v0.17.0: Handle deferred function evaluation at execution time
+            // This allows rising_edge/falling_edge to be evaluated with current signal state
+            else if(item is Models.DeferredFunction deferredFunc){
+                var result = deferredFunc.Evaluate();
+                variables.Push(result);
             }
             else if(item is Operator op){
                 // Only treat as unary NOT if it's actually a logic operation with NOT precedence
@@ -286,7 +300,7 @@ public class Operation : IOperation {
             var functionResult = TryParseStandardFunction(currentItem);
             if (functionResult.isFunction)
             {
-                item = functionResult.variable;
+                item = functionResult.result;  // Can be Variable or DeferredFunction
                 items.Add(item);
                 _currentSyntetizeIndex++;
                 continue;
@@ -304,7 +318,8 @@ public class Operation : IOperation {
             else if (_finder.IsLiteral(currentItem))
             {
                 Constants.DATATYPES type = _finder.GetDataType(currentItem);
-                item = new Variable($"Literal-{Guid.NewGuid()}", currentItem, type);
+                // v0.17.0: Use atomic counter instead of expensive Guid.NewGuid()
+                item = new Variable($"Literal-{Interlocked.Increment(ref _literalCounter)}", currentItem, type);
             }
             else if (_variableRegex.IsMatch(currentItem))
             {
@@ -318,7 +333,7 @@ public class Operation : IOperation {
                         var funcResult = ParseFunctionCall(currentItem);
                         if (funcResult.success)
                         {
-                            items.Add(funcResult.variable);
+                            items.Add(funcResult.result);  // Can be Variable or DeferredFunction
                             continue;
                         }
                     }
@@ -458,7 +473,11 @@ public class Operation : IOperation {
     /// Attempts to parse a standard function call like "rising_edge(clk)".
     /// This handles the case where the function call is a single token.
     /// </summary>
-    private (bool isFunction, Variable variable) TryParseStandardFunction(string token)
+    /// <returns>
+    /// A tuple where the result can be either a Variable (for functions evaluated at parse time)
+    /// or a DeferredFunction (for functions that must be evaluated at execution time).
+    /// </returns>
+    private (bool isFunction, object result) TryParseStandardFunction(string token)
     {
         // Check if token contains parentheses (function call pattern: funcname(arg))
         int openParen = token.IndexOf('(');
@@ -503,10 +522,7 @@ public class Operation : IOperation {
             }
         }
 
-        // Evaluate the function
-        object result = StandardFunctions.EvaluateFunction(functionName, args.ToArray(), Variables);
-
-        // Create result variable
+        // Determine result type
         Constants.DATATYPES resultType = functionName switch
         {
             "rising_edge" or "falling_edge" => Constants.DATATYPES.BOOLEAN,
@@ -514,9 +530,24 @@ public class Operation : IOperation {
             _ => Constants.DATATYPES.STD_LOGIC_VECTOR
         };
 
+        // v0.17.0 Fix: For edge detection functions, defer evaluation until execution time
+        // These functions depend on the current simulation state which isn't available at parse time
+        if (Models.DeferredFunction.ShouldDefer(functionName))
+        {
+            return (true, new Models.DeferredFunction(functionName, args.ToArray(), resultType, Variables));
+        }
+
+        // Evaluate the function immediately for other functions
+        object result = StandardFunctions.EvaluateFunction(functionName, args.ToArray(), Variables);
+
+        // v0.17.0 Fix: Preserve actual boolean value instead of converting to string
+        object resultValue = resultType == Constants.DATATYPES.BOOLEAN
+            ? (result ?? false)
+            : (result?.ToString() ?? "false");
+
         var resultVar = new Variable(
             $"Function-{functionName}",
-            result?.ToString() ?? "false",
+            resultValue,
             resultType
         );
         resultVar.PortType = Constants.PortType.OUT;
@@ -527,7 +558,11 @@ public class Operation : IOperation {
     /// <summary>
     /// Parses a function call where the function name and parentheses are separate tokens.
     /// </summary>
-    private (bool success, Variable variable) ParseFunctionCall(string functionName)
+    /// <returns>
+    /// A tuple where the result can be either a Variable (for functions evaluated at parse time)
+    /// or a DeferredFunction (for functions that must be evaluated at execution time).
+    /// </returns>
+    private (bool success, object result) ParseFunctionCall(string functionName)
     {
         // Skip the function name
         _currentSyntetizeIndex++;
@@ -566,7 +601,44 @@ public class Operation : IOperation {
             }
             else if (token != ";" && parenDepth == 1)
             {
-                // This is an argument
+                // Detect a nested function call:
+                //   <fn_name> (              ← we want to recurse so the
+                //                              inner call's args don't get
+                //                              swallowed by the outer loop's
+                //                              depth tracking.
+                // The `_currentSyntetizeIndex+1 < _data.Length` guard avoids
+                // walking off the end on a malformed expression. Function
+                // identity is established via:
+                //   • StandardFunctions.IsStandardFunction — covers IEEE
+                //     names + clog2 + the legacy aliases (to_integer,
+                //     unsigned, signed, conv_*, …);
+                //   • Models.FunctionRegistry.IsKnown — covers user-defined
+                //     functions registered by the IEEE library compiler or
+                //     by the user's own package source.
+                // When the recursive call succeeds, _currentSyntetizeIndex
+                // already advanced past the inner `)`, so we `continue` to
+                // skip the trailing index increment and let the outer loop
+                // re-check `parenDepth > 0` against the next token.
+                bool nextIsParen = _currentSyntetizeIndex + 1 < _data.Length
+                                && _data[_currentSyntetizeIndex + 1] == "(";
+                bool isKnownFn = nextIsParen && _variableRegex.IsMatch(token)
+                              && (StandardFunctions.IsStandardFunction(token)
+                               || Services.FunctionRegistry.Instance.IsKnown(token));
+                if (isKnownFn)
+                {
+                    var nested = ParseFunctionCall(token);
+                    if (nested.success)
+                    {
+                        args.Add(nested.result);
+                        continue;
+                    }
+                    // Recursive parse failed — fall through to the legacy
+                    // bare-string path so the original behaviour (silent
+                    // arg drop) is preserved on error paths.
+                }
+
+                // This is an argument (legacy path: identifier resolves to
+                // a Variable, integer literal, or bare token).
                 var variable = Variables.Where(v => !ReferenceEquals(v, null))
                     .FirstOrDefault(v => !string.IsNullOrEmpty(v.Name) &&
                         v.Name.Equals(token, StringComparison.OrdinalIgnoreCase));
@@ -587,10 +659,7 @@ public class Operation : IOperation {
             _currentSyntetizeIndex++;
         }
 
-        // Evaluate the function
-        object result = StandardFunctions.EvaluateFunction(functionName, args.ToArray(), Variables);
-
-        // Create result variable
+        // Determine result type
         Constants.DATATYPES resultType = functionName.ToLower() switch
         {
             "rising_edge" or "falling_edge" => Constants.DATATYPES.BOOLEAN,
@@ -598,9 +667,23 @@ public class Operation : IOperation {
             _ => Constants.DATATYPES.STD_LOGIC_VECTOR
         };
 
+        // v0.17.0 Fix: For edge detection functions, defer evaluation until execution time
+        if (Models.DeferredFunction.ShouldDefer(functionName))
+        {
+            return (true, new Models.DeferredFunction(functionName, args.ToArray(), resultType, Variables));
+        }
+
+        // Evaluate the function immediately for other functions
+        object result = StandardFunctions.EvaluateFunction(functionName, args.ToArray(), Variables);
+
+        // v0.17.0 Fix: Preserve actual boolean value instead of converting to string
+        object resultValue = resultType == Constants.DATATYPES.BOOLEAN
+            ? (result ?? false)
+            : (result?.ToString() ?? "false");
+
         var resultVar = new Variable(
             $"Function-{functionName}",
-            result?.ToString() ?? "false",
+            resultValue,
             resultType
         );
         resultVar.PortType = Constants.PortType.OUT;

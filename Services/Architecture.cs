@@ -40,6 +40,11 @@ public class Architecture : ISControl, IControl
     private HashSet<Variable> _signals = new();
 
     /// <summary>
+    /// Gets the internal signals of the architecture (read-only access).
+    /// </summary>
+    public IReadOnlyCollection<Variable> Signals => _signals;
+
+    /// <summary>
     /// Gets the list of tasks.
     /// </summary>
     public List<object> Tasks { get; private set; } = new();
@@ -52,6 +57,11 @@ public class Architecture : ISControl, IControl
     private Tokenizer _tokenizer = new(string.Empty);
     private TokenStream _streamer = default!;
     private readonly OperationDetector _detector = new();
+
+    /// <summary>
+    /// Delta cycle engine for proper VHDL simulation semantics.
+    /// </summary>
+    private DeltaCycleEngine? _deltaEngine;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="Architecture"/> class.
@@ -93,14 +103,57 @@ public class Architecture : ISControl, IControl
     }
 
     /// <summary>
-    /// Executes the architecture asynchronously.
+    /// Executes the architecture asynchronously using delta cycle simulation.
     /// </summary>
     /// <returns>A task representing the asynchronous operation.</returns>
     public async Task ExecuteAsync()
     {
+        InitializeDeltaEngine();
+
+        // Connect to TimeMachine for time-driven simulation
+        _deltaEngine!.ConnectToTimeMachine();
+
+        // Run simulation (driven by TimeMachine ticks)
+        // For now, run a single time step to maintain backward compatibility
+        await _deltaEngine.RunTimeStepAsync();
+    }
+
+    /// <summary>
+    /// Creates and initializes the delta cycle engine without connecting to TimeMachine.
+    /// Used by SimulationRunner for direct engine control.
+    /// </summary>
+    /// <returns>The initialized DeltaCycleEngine.</returns>
+    public DeltaCycleEngine InitializeDeltaEngine()
+    {
+        _deltaEngine = new DeltaCycleEngine();
+        HashSet<Variable> allSignals = GetAllSignals();
+        _deltaEngine.Initialize(allSignals, Tasks);
+        return _deltaEngine;
+    }
+
+    /// <summary>
+    /// Returns all signals in this architecture: ports, generics, and internal signals.
+    /// </summary>
+    public HashSet<Variable> GetAllSignals()
+    {
+        return [.. _ports, .. _generics, .. _signals];
+    }
+
+    /// <summary>
+    /// Executes the architecture asynchronously using the legacy sequential executor.
+    /// Use this method when delta cycle semantics are not required.
+    /// </summary>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    public async Task ExecuteLegacyAsync()
+    {
         Executer executer = new(Tasks);
         await executer.ExecuteAsync();
     }
+
+    /// <summary>
+    /// Gets the delta cycle engine for external control.
+    /// </summary>
+    public DeltaCycleEngine? DeltaEngine => _deltaEngine;
 
     /// <summary>
     /// Synthesizes the architecture.
@@ -118,6 +171,52 @@ public class Architecture : ISControl, IControl
     /// </summary>
     /// <param name="RawArchitecture">The raw data of the architecture.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
+    /// <summary>
+    /// Synthesizes the architecture using lines that carry their original
+    /// 1-based source-file line numbers, so diagnostics reference the
+    /// user's file rather than a re-indexed slice.
+    /// </summary>
+    public void Syntetize(IReadOnlyList<(int sourceLine, string text)> RawArchitectureWithLines,
+                          CancellationToken cancellationToken = default)
+    {
+        var progress = ProgressReporter.Instance;
+        progress.ReportPhase(0f, "Tokenizing architecture", ProcessingPhase.Tokenizing);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        foreach (var (line, text) in RawArchitectureWithLines)
+            _tokenizer.TokenizeLineAt(text, line);
+        _tokenizer.Evaluate();
+        _streamer = new(_tokenizer.GetDictionaryType());
+        var tokens = _tokenizer.GetDictionaryType();
+
+        cancellationToken.ThrowIfCancellationRequested();
+        progress.ReportPhase(0.2f, "Parsing architecture header", ProcessingPhase.ParsingArchitecture);
+        _streamer.Expect(KEYWORDS);
+        Name = _streamer.Current?.Value ?? string.Empty;
+        _streamer.Expect(IDENTIFIERS);
+        _streamer.Expect(KEYWORDS);
+        EntityName = _streamer.Current?.Value ?? string.Empty;
+        _streamer.Expect(IDENTIFIERS);
+        _streamer.Expect(KEYWORDS);
+        progress.ReportPhase(0.3f, "Found architecture", ProcessingPhase.ParsingArchitecture, $"{Name} of {EntityName}");
+        progress.ReportPhase(0.4f, "Parsing signals and types", ProcessingPhase.ParsingSignals);
+        VariableSyntetizer syntetizer = new(_streamer, [.._ports, .._generics], IsSignal: true, TypeRegistry: CustomTypes);
+        syntetizer.Syntetize(cancellationToken);
+        _signals = syntetizer.Variables;
+        progress.ReportPhase(0.6f, $"Parsed {_signals.Count} signal(s)", ProcessingPhase.ParsingSignals);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (syntetizer.ParsedTypes.Count > 0)
+        {
+            progress.ReportPhase(0.7f, $"Registering {syntetizer.ParsedTypes.Count} custom type(s)", ProcessingPhase.ParsingTypes);
+            foreach (var typeDef in syntetizer.ParsedTypes.Types.Values)
+                CustomTypes.TryRegister(typeDef);
+        }
+        _streamer.Expect(KEYWORDS); // begin
+        progress.ReportPhase(0.8f, "Synthesizing behavior", ProcessingPhase.SynthesizingBehavior);
+        SyntetizeBehaviour(cancellationToken);
+        progress.ReportPhase(1f, $"Architecture complete ({Tasks.Count} tasks)", ProcessingPhase.ParsingArchitecture, Name);
+    }
+
     public void Syntetize(string[] RawArchitecture, CancellationToken cancellationToken)
     {
         var progress = ProgressReporter.Instance;
@@ -231,12 +330,35 @@ public class Architecture : ISControl, IControl
                                 Tasks.Add(process);
                                 continue;
                             case "for":
-                                // For generate - skip for now
-                                SkipGenerateOrLoop();
+                                // For-generate. Nested or feature-rich generate blocks
+                                // (multi-level nesting, embedded processes, with/select
+                                // bodies) sometimes blow up the synthesizer; treat the
+                                // failure as "blackbox this generate" and skip to its
+                                // matching `end generate <label>;` so the rest of the
+                                // architecture still gets synthesized.
+                                try
+                                {
+                                    GenerateBlock forGen = new(comparators, _streamer, label);
+                                    forGen.Syntetize();
+                                    Tasks.Add(forGen);
+                                }
+                                catch
+                                {
+                                    SkipGenerateBody(label);
+                                }
                                 continue;
                             case "if":
-                                // If generate - skip for now
-                                SkipGenerateOrLoop();
+                                // If-generate — same skip-on-failure policy as for-generate.
+                                try
+                                {
+                                    GenerateBlock ifGen = new(comparators, _streamer, label);
+                                    ifGen.Syntetize();
+                                    Tasks.Add(ifGen);
+                                }
+                                catch
+                                {
+                                    SkipGenerateBody(label);
+                                }
                                 continue;
                             default:
                                 _streamer.MoveNext();
@@ -289,6 +411,12 @@ public class Architecture : ISControl, IControl
                         // Consume 'end if ;' after the if structure
                         ConsumeEndIf();
                         break;
+                    case "with":
+                        // With...select statement
+                        SelectedAssignment selectedAssign = new(comparators, _streamer);
+                        selectedAssign.Syntetize();
+                        Tasks.Add(selectedAssign);
+                        break;
                     default:
                         // Skip unknown keywords
                         _streamer.MoveNext();
@@ -300,6 +428,45 @@ public class Architecture : ISControl, IControl
                 // FOR SIMPLE ASSIGNATIONS
                 SyntetizeAssingations();
             }
+        }
+    }
+
+    /// <summary>
+    /// Skips the body of a generate block whose synthesis failed, advancing the
+    /// streamer past the matching <c>end generate [label] ;</c>. Tracks nesting
+    /// depth so a containing block isn't terminated by an inner block's end.
+    /// </summary>
+    private void SkipGenerateBody(string label)
+    {
+        int depth = 1;
+        while (_streamer.Current != null && depth > 0)
+        {
+            string val = _streamer.Current.Value.ToLower();
+            // Nested labeled `<id> : if|for ... generate` increments depth.
+            // We don't know the iterator-vs-condition tail length, so detect
+            // the trailing `generate` keyword instead of the leading `:`.
+            if (val == "generate" && _streamer.Previous?.Value?.ToLower() != "end")
+            {
+                depth++;
+                _streamer.MoveNext();
+                continue;
+            }
+            if (val == "end")
+            {
+                _streamer.MoveNext();
+                if (_streamer.Current?.Value.ToLower() == "generate")
+                {
+                    _streamer.MoveNext(); // 'generate'
+                    if (_streamer.Current?.Type == IDENTIFIERS)
+                        _streamer.MoveNext(); // optional label
+                    if (_streamer.Current?.Value == ";")
+                        _streamer.MoveNext();
+                    depth--;
+                    continue;
+                }
+                continue;
+            }
+            _streamer.MoveNext();
         }
     }
 
@@ -660,11 +827,21 @@ public class Architecture : ISControl, IControl
         switch (type)
         {
             case OperationType.ASSIGNATION:
-                Operation op;
-                // NEEDS CHANGE UP FOR AVOIDING OR SILENT EXCEPTIONS
-                // LIKE OUT OF INDEX ON VECTORS
                 List<Variable> variables = [.. _ports, .. _signals, .. _generics];
-                op = new(operation, variables.ToHashSet());
+
+                // Check for conditional assignment (when...else pattern)
+                if (operation.Contains("when", StringComparison.OrdinalIgnoreCase))
+                {
+                    var condAssign = ConditionalAssignment.TryParse(operation, variables.ToHashSet());
+                    if (condAssign != null)
+                    {
+                        Tasks.Add(condAssign);
+                        break;
+                    }
+                }
+
+                // Regular assignment
+                Operation op = new(operation, variables.ToHashSet());
                 Tasks.Add(op);
                 break;
         }

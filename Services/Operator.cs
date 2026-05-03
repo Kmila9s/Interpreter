@@ -237,34 +237,81 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                 switch (OperatorName.ToLower())
                 {
                     case "=":
-                        return bool.Parse((string)var1.Value) == bool.Parse((string)var2.Value);
+                    {
+                        bool b1Ok = bool.TryParse(var1.Value?.ToString(), out bool b1);
+                        bool b2Ok = bool.TryParse(var2.Value?.ToString(), out bool b2);
+                        if (!b1Ok || !b2Ok) return false;
+                        return b1 == b2;
+                    }
                     case "!=":
-                        return bool.Parse((string)var1.Value) != bool.Parse((string)var2.Value);
+                    {
+                        bool b1Ok = bool.TryParse(var1.Value?.ToString(), out bool b1);
+                        bool b2Ok = bool.TryParse(var2.Value?.ToString(), out bool b2);
+                        if (!b1Ok || !b2Ok) return true;
+                        return b1 != b2;
+                    }
                     default:
                         throw new Exception($"Operator type do not detected or even supported: {OperatorName}");
                 }
             case DATATYPES.STD_LOGIC:
-            case DATATYPES.INTEGER:
             case DATATYPES.BIT:
-            case DATATYPES.NATURAL:
+            {
+                // STD_LOGIC/BIT: use string comparison to handle meta-values ('U','X','Z','W','L','H','-')
+                string s1 = var1.Value?.ToString() ?? "U";
+                string s2 = var2.Value?.ToString() ?? "U";
+                bool isMetaValue = !int.TryParse(s1, out _) || !int.TryParse(s2, out _);
                 switch (OperatorName.ToLower())
                 {
                     case "=":
-                        return int.Parse((string)var1.Value) == int.Parse((string)var2.Value);
+                        return !isMetaValue && s1 == s2;
                     case "!=":
                     case "/=":
-                        return int.Parse((string)var1.Value) != int.Parse((string)var2.Value);
+                        return isMetaValue || s1 != s2;
                     case ">":
-                        return int.Parse((string)var1.Value) > int.Parse((string)var2.Value);
                     case "<":
-                        return int.Parse((string)var1.Value) < int.Parse((string)var2.Value);
                     case ">=":
-                        return int.Parse((string)var1.Value) >= int.Parse((string)var2.Value);
                     case "<=":
-                        return int.Parse((string)var1.Value) <= int.Parse((string)var2.Value);
+                        // Relational ops on meta-values always return false
+                        if (isMetaValue) return false;
+                        return OperatorName.ToLower() switch
+                        {
+                            ">" => int.Parse(s1) > int.Parse(s2),
+                            "<" => int.Parse(s1) < int.Parse(s2),
+                            ">=" => int.Parse(s1) >= int.Parse(s2),
+                            "<=" => int.Parse(s1) <= int.Parse(s2),
+                            _ => false
+                        };
                     default:
                         throw new Exception($"Operator type do not detected or even supported: {OperatorName}");
                 }
+            }
+            case DATATYPES.INTEGER:
+            case DATATYPES.NATURAL:
+            {
+                // INTEGER/NATURAL: safe parsing with fallback to 0 for meta-values
+                string s1 = var1.Value?.ToString() ?? "0";
+                string s2 = var2.Value?.ToString() ?? "0";
+                if (!int.TryParse(s1, out int i1)) i1 = 0;
+                if (!int.TryParse(s2, out int i2)) i2 = 0;
+                switch (OperatorName.ToLower())
+                {
+                    case "=":
+                        return i1 == i2;
+                    case "!=":
+                    case "/=":
+                        return i1 != i2;
+                    case ">":
+                        return i1 > i2;
+                    case "<":
+                        return i1 < i2;
+                    case ">=":
+                        return i1 >= i2;
+                    case "<=":
+                        return i1 <= i2;
+                    default:
+                        throw new Exception($"Operator type do not detected or even supported: {OperatorName}");
+                }
+            }
             case DATATYPES.STD_LOGIC_VECTOR:
                 switch (OperatorName.ToLower())
                 {
@@ -344,6 +391,14 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             case "xor":
                 result = (a != b) ? '1' : '0';
                 break;
+            case "xnor":
+                // Previously fell through to 'U' — the precedence / token
+                // recognition was fine (Operator.cs:63), but the bit-level
+                // evaluator never had a case for it, so `a xnor b` always
+                // produced undefined. This restores the missing branch;
+                // vectors pick it up transparently via SolveVectorLogicOperation.
+                result = (a == b) ? '1' : '0';
+                break;
             case "nand":
                 result = (a == '1' && b == '1') ? '0' : '1';
                 break;
@@ -372,7 +427,7 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// <returns>The result of the arithmetic operation.</returns>
     public object SolveArithOperation(Variable leftVariable, Variable rightVariable){
         object result = new();
-        // Helper to safely get integer from variable value
+        // Helper to safely get integer from variable value, handling VHDL meta-values
         int GetInt(Variable v) {
             if (v.Value == null || v.Value.GetType() == typeof(object))
             {
@@ -381,7 +436,17 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                     return parsed;
                 return 0;
             }
-            return Convert.ToInt32(v.Value);
+            string str = v.Value.ToString() ?? "0";
+            // Handle VHDL meta-values ('U', 'X', 'Z', etc.)
+            if (int.TryParse(str, out int intVal))
+                return intVal;
+            // Try binary string conversion for vectors
+            if (str.Length > 0 && str.All(c => c == '0' || c == '1'))
+            {
+                try { return Convert.ToInt32(str, 2); }
+                catch { return 0; }
+            }
+            return 0;
         }
         double GetDouble(Variable v) {
             if (v.Value == null || v.Value.GetType() == typeof(object))
@@ -390,7 +455,10 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                     return parsed;
                 return 0.0;
             }
-            return Convert.ToDouble(v.Value);
+            string str = v.Value.ToString() ?? "0";
+            if (double.TryParse(str, out double dblVal))
+                return dblVal;
+            return 0.0;
         }
 
         if(leftVariable.Type != rightVariable.Type){
@@ -546,10 +614,11 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         string vecStr = vector.Value?.ToString() ?? new string('0', vector.Size);
         int shiftAmt;
 
-        // Get shift amount from the variable
+        // Get shift amount from the variable (safe parsing for meta-values)
         if (amount.Type == DATATYPES.INTEGER || amount.Type == DATATYPES.NATURAL)
         {
-            shiftAmt = Convert.ToInt32(amount.Value);
+            if (!int.TryParse(amount.Value?.ToString() ?? "0", out shiftAmt))
+                shiftAmt = 0;
         }
         else
         {

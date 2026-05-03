@@ -32,6 +32,12 @@ namespace Interpreter.Services;
 public static class StandardFunctions
 {
     /// <summary>
+    /// Checks if a string contains VHDL meta-values ('U', 'X', 'Z', 'W', 'L', 'H', '-').
+    /// </summary>
+    private static bool ContainsMetaValues(string s) =>
+        s.IndexOfAny(['U', 'X', 'Z', 'W', 'L', 'H', '-']) >= 0;
+
+    /// <summary>
     /// IEEE standard rising_edge function.
     /// Returns true if signal has an event and current value is '1'.
     /// Usage: rising_edge(clk)
@@ -102,47 +108,64 @@ public static class StandardFunctions
         if (cleaned.Contains('U') || cleaned.Contains('X') || cleaned.Contains('Z'))
             return 0;
 
-        // Handle decimal numbers directly (e.g., from integer literals)
+        // v3.2 (#29) ordering fix:
+        //   Binary first when the string is multi-character and all 0s/1s.
+        //   The previous order tried decimal-parse first, which silently
+        //   converted "01010101" to 1,010,101 instead of 85 — every
+        //   STD_LOGIC_VECTOR-shaped value carrying real bit patterns
+        //   came out wrong by orders of magnitude.
+        //   Single-char "0"/"1" stays in either branch (binary == decimal == 0/1).
+        if (cleaned.Length > 1 && cleaned.All(c => c == '0' || c == '1'))
+        {
+            try { return Convert.ToInt32(cleaned, 2); }
+            catch { /* fall through to decimal */ }
+        }
+
+        // Decimal interpretation (integer literals, signed values, etc.).
         if (int.TryParse(cleaned, out int decimalValue))
             return decimalValue;
 
-        // Try to convert from binary (e.g., "1010" -> 10)
-        // v0.13.0 Fix: Added try-catch for robustness
-        try
-        {
-            return Convert.ToInt32(cleaned, 2);
-        }
-        catch
-        {
-            return 0; // Invalid binary format
-        }
+        // Final fallback: treat as binary even at length 1, with a try-
+        // catch in case the string contains other characters.
+        try { return Convert.ToInt32(cleaned, 2); }
+        catch { return 0; }
     }
 
     /// <summary>
     /// Converts unsigned to integer.
+    /// Handles VHDL meta-values ('U', 'X', 'Z') by returning 0.
     /// </summary>
     public static int ToIntegerUnsigned(string slv)
     {
-        string cleaned = slv.Replace("\"", "").Replace("'", "");
-        return Convert.ToInt32(cleaned, 2);
+        string cleaned = slv.Replace("\"", "").Replace("'", "").Trim();
+        if (string.IsNullOrEmpty(cleaned)) return 0;
+        if (ContainsMetaValues(cleaned)) return 0;
+        try { return Convert.ToInt32(cleaned, 2); }
+        catch { return 0; }
     }
 
     /// <summary>
     /// Converts signed to integer (2's complement).
+    /// Handles VHDL meta-values ('U', 'X', 'Z') by returning 0.
     /// </summary>
     public static int ToIntegerSigned(string slv)
     {
-        string cleaned = slv.Replace("\"", "").Replace("'", "");
-        if (cleaned.Length == 0) return 0;
+        string cleaned = slv.Replace("\"", "").Replace("'", "").Trim();
+        if (string.IsNullOrEmpty(cleaned)) return 0;
+        if (ContainsMetaValues(cleaned)) return 0;
 
-        // Check sign bit
-        if (cleaned[0] == '1')
+        try
         {
-            // Negative number - 2's complement
-            int magnitude = Convert.ToInt32(cleaned, 2);
-            return magnitude - (1 << cleaned.Length);
+            // Check sign bit
+            if (cleaned[0] == '1')
+            {
+                // Negative number - 2's complement
+                int magnitude = Convert.ToInt32(cleaned, 2);
+                return magnitude - (1 << cleaned.Length);
+            }
+            return Convert.ToInt32(cleaned, 2);
         }
-        return Convert.ToInt32(cleaned, 2);
+        catch { return 0; }
     }
 
     /// <summary>
@@ -249,18 +272,25 @@ public static class StandardFunctions
         string cleanB = b.Replace("\"", "").Replace("'", "");
 
         int maxLen = Math.Max(cleanA.Length, cleanB.Length);
+        // Handle meta-values: treat as zero
+        if (ContainsMetaValues(cleanA)) cleanA = new string('0', maxLen);
+        if (ContainsMetaValues(cleanB)) cleanB = new string('0', maxLen);
         cleanA = cleanA.PadLeft(maxLen, '0');
         cleanB = cleanB.PadLeft(maxLen, '0');
 
-        int valA = Convert.ToInt32(cleanA, 2);
-        int valB = Convert.ToInt32(cleanB, 2);
-        int result = valA + valB;
-
-        return ToStdLogicVector(result, maxLen);
+        try
+        {
+            int valA = Convert.ToInt32(cleanA, 2);
+            int valB = Convert.ToInt32(cleanB, 2);
+            int result = valA + valB;
+            return ToStdLogicVector(result, maxLen);
+        }
+        catch { return new string('0', maxLen); }
     }
 
     /// <summary>
     /// Vector subtraction.
+    /// Handles VHDL meta-values ('U', 'X', 'Z') by treating them as zero.
     /// </summary>
     public static string SubtractVectors(string a, string b)
     {
@@ -268,18 +298,25 @@ public static class StandardFunctions
         string cleanB = b.Replace("\"", "").Replace("'", "");
 
         int maxLen = Math.Max(cleanA.Length, cleanB.Length);
+        // Handle meta-values: treat as zero
+        if (ContainsMetaValues(cleanA)) cleanA = new string('0', maxLen);
+        if (ContainsMetaValues(cleanB)) cleanB = new string('0', maxLen);
         cleanA = cleanA.PadLeft(maxLen, '0');
         cleanB = cleanB.PadLeft(maxLen, '0');
 
-        int valA = Convert.ToInt32(cleanA, 2);
-        int valB = Convert.ToInt32(cleanB, 2);
-        int result = valA - valB;
+        try
+        {
+            int valA = Convert.ToInt32(cleanA, 2);
+            int valB = Convert.ToInt32(cleanB, 2);
+            int result = valA - valB;
 
-        // Handle negative results (2's complement)
-        if (result < 0)
-            result += (1 << maxLen);
+            // Handle negative results (2's complement)
+            if (result < 0)
+                result += (1 << maxLen);
 
-        return ToStdLogicVector(result, maxLen);
+            return ToStdLogicVector(result, maxLen);
+        }
+        catch { return new string('0', maxLen); }
     }
 
     /// <summary>

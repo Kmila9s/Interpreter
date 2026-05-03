@@ -8,6 +8,7 @@ namespace Interpreter.Repositories;
 /// Provides functionality to identify and determine the data type of literal values using regular expressions.
 /// </summary>
 public class LiteralsFinder : IFinder{
+    /// <summary>Compiled regex patterns for each literal type recognized by the finder.</summary>
     private readonly Regex _literals, _decimalOrInteger, _quotedInteger, _singleQuotedInteger, _stdLogicChar, _stdLogicVector, _hex, _boolean, _stdLogic;
 
     /// <summary>

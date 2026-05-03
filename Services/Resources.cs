@@ -335,21 +335,114 @@ public class Resources
 
     /// <summary>
     /// Estimates LUT usage from combinational logic operations.
-    /// Accuracy: ~60-80% (synthesis optimization affects this)
+    /// Walks every Operation inside the architecture (concurrent assignments
+    /// + everything nested in Process bodies, if-structures, case-structures,
+    /// loops) and weights each operator by the result's bit width.
+    /// Accuracy: ~60-80% (synthesis optimization affects this).
     /// </summary>
+    /// <remarks>
+    /// Per-operator cost model (matches the guidance originally sketched as
+    /// TODO comments in this method):
+    /// <list type="bullet">
+    ///   <item><c>and / or / xor / nand / nor / xnor</c> → 1 LUT × result_bits</item>
+    ///   <item><c>not</c> → 0 (inverters fold into LUT inputs for free on FPGAs)</item>
+    ///   <item><c>+ / -</c> → ~3 LUTs × result_bits (ripple-carry, matches Xilinx/Intel estimators)</item>
+    ///   <item><c>* / /</c> → 0 (mapped to DSP slices, counted by <see cref="CalculateDSPSlices"/>)</item>
+    ///   <item><c>sll / srl / sla / sra / rol / ror</c> → 1 LUT × result_bits (mux-chain)</item>
+    ///   <item><c>= / /= / &lt; / &gt; / &lt;= / &gt;=</c> → max(1, bits/2) LUTs per comparator</item>
+    /// </list>
+    /// </remarks>
     private void CalculateLUTs()
     {
         if (_entity.Architecture == null)
             return;
 
         LUTs = 0;
+        foreach (var task in _entity.Architecture.Tasks)
+            LUTs += CountLutsInTask(task);
+    }
 
-        // TODO: Scan all operations in architecture and processes
-        // Estimate LUTs per operation type:
-        // - and/or/xor: 1 LUT per bit
-        // - Adder: ~3 LUTs per bit
-        // - Mux: bitwidth LUTs per mux
-        // - Comparator: bitwidth/2 LUTs
+    /// <summary>
+    /// Recursively sums LUTs for a task — dispatches <see cref="Operation"/>
+    /// directly, walks any nested containers (Process body, if/else branches,
+    /// case-when arms, loop bodies) via their known <c>Tasks</c> collections.
+    /// Unknown container types are skipped silently; the estimator stays
+    /// resilient to parser additions.
+    /// </summary>
+    private int CountLutsInTask(object task)
+    {
+        if (task is Operation op)
+            return CountLutsInOperation(op);
+
+        // Discovered at parse time: Process exposes its body as
+        // List&lt;object&gt; Tasks. Reflect via a duck-typed "Tasks" property so
+        // we also pick up IfStructure / CaseStructure / ForLoop / WhileLoop
+        // without needing to know every concrete type here.
+        if (task == null) return 0;
+        var tasksProp = task.GetType().GetProperty("Tasks");
+        if (tasksProp?.GetValue(task) is System.Collections.IEnumerable inner)
+        {
+            int sum = 0;
+            foreach (var t in inner) sum += CountLutsInTask(t);
+            return sum;
+        }
+
+        // Some structures expose their branches under different names
+        // (e.g. Then / Else / Cases). Catch the common ones.
+        foreach (var propName in new[] { "Then", "Else", "Body", "Cases", "Branches" })
+        {
+            var prop = task.GetType().GetProperty(propName);
+            if (prop?.GetValue(task) is System.Collections.IEnumerable branch)
+            {
+                int sum = 0;
+                foreach (var t in branch) sum += CountLutsInTask(t);
+                return sum;
+            }
+        }
+        return 0;
+    }
+
+    /// <summary>
+    /// Sums operator weights across the postfix <see cref="Operation.Items"/>
+    /// stream, scaling by the bit width of <see cref="Operation.Result"/>.
+    /// </summary>
+    private int CountLutsInOperation(Operation op)
+    {
+        int bits = Math.Max(1, op.Result?.Size ?? 1);
+        int lutCount = 0;
+        foreach (var item in op.Items)
+        {
+            if (item is Operator @operator)
+                lutCount += WeightOfOperator(@operator, bits);
+        }
+        return lutCount;
+    }
+
+    /// <summary>Per-operator LUT weight. See <see cref="CalculateLUTs"/> remarks for the model.</summary>
+    private static int WeightOfOperator(Operator op, int bits)
+    {
+        switch (op.OperatorType)
+        {
+            case Constants.OperatorType.LOGIC_OPERATION:
+            {
+                var name = op.OperatorName?.ToLowerInvariant() ?? string.Empty;
+                if (name == "not" || name == "abs") return 0;
+                // Everything else in this bucket (and/or/xor/nand/nor/xnor,
+                // shifts, rotates) is one LUT per bit of the result.
+                return bits;
+            }
+            case Constants.OperatorType.ARITH_OPERATION:
+            {
+                var name = op.OperatorName ?? string.Empty;
+                if (name == "*" || name == "/" || name == "mod" || name == "**") return 0;
+                // +, - map to carry chains.
+                return bits * 3;
+            }
+            case Constants.OperatorType.COMPARATION:
+                return Math.Max(1, bits / 2);
+            default:
+                return 0;
+        }
     }
 
     /// <summary>

@@ -9,6 +9,8 @@ using Constants = Parser.Models.Constants;
 
 namespace Interpreter.Repositories;
 
+// Note: This file uses ExitException and NextException from ControlExceptions.cs
+
 /// <summary>
 /// Represents and manages the logic for a VHDL 'for' loop statement.
 /// Parses and executes for loops with ascending (to) or descending (downto) iteration.
@@ -55,8 +57,11 @@ namespace Interpreter.Repositories;
 /// </remarks>
 public class ForLoopStructure : ISControl
 {
+    /// <summary>The variables in scope during range evaluation and loop body execution.</summary>
     private readonly HashSet<Variable> _variables;
+    /// <summary>The token stream used for parsing the for loop structure.</summary>
     private readonly TokenStream _streamer;
+    /// <summary>Detector used to classify operations found inside the loop body.</summary>
     private readonly OperationDetector _detector = new();
 
     /// <summary>
@@ -87,11 +92,18 @@ public class ForLoopStructure : ISControl
     /// <summary>
     /// Initializes a new instance of the <see cref="ForLoopStructure"/> class.
     /// </summary>
+    /// <param name="Variables">The set of variables available in the current scope.</param>
+    /// <param name="Tokenizer">The token stream to read the for loop structure from.</param>
     public ForLoopStructure(HashSet<Variable> Variables, TokenStream Tokenizer)
     {
         _variables = Variables;
         _streamer = Tokenizer;
     }
+
+    /// <summary>
+    /// Gets or sets the optional loop label for targeted exit/next statements.
+    /// </summary>
+    public string? LoopLabel { get; set; }
 
     /// <summary>
     /// Executes the for loop asynchronously.
@@ -109,8 +121,29 @@ public class ForLoopStructure : ISControl
             for (int i = RangeStart; i <= RangeEnd; i++)
             {
                 loopVar.Value = i.ToString();
-                Executer executer = new(Tasks);
-                await executer.ExecuteAsync();
+                try
+                {
+                    Executer executer = new(Tasks);
+                    await executer.ExecuteAsync();
+                }
+                catch (ExitException ex)
+                {
+                    // Check if this exit is for us (no label or matching label)
+                    if (string.IsNullOrEmpty(ex.Label) || ex.Label == LoopLabel)
+                    {
+                        break; // Exit the loop
+                    }
+                    throw; // Re-throw for outer loop
+                }
+                catch (NextException ex)
+                {
+                    // Check if this next is for us (no label or matching label)
+                    if (string.IsNullOrEmpty(ex.Label) || ex.Label == LoopLabel)
+                    {
+                        continue; // Continue to next iteration
+                    }
+                    throw; // Re-throw for outer loop
+                }
             }
         }
         else
@@ -118,8 +151,27 @@ public class ForLoopStructure : ISControl
             for (int i = RangeStart; i >= RangeEnd; i--)
             {
                 loopVar.Value = i.ToString();
-                Executer executer = new(Tasks);
-                await executer.ExecuteAsync();
+                try
+                {
+                    Executer executer = new(Tasks);
+                    await executer.ExecuteAsync();
+                }
+                catch (ExitException ex)
+                {
+                    if (string.IsNullOrEmpty(ex.Label) || ex.Label == LoopLabel)
+                    {
+                        break;
+                    }
+                    throw;
+                }
+                catch (NextException ex)
+                {
+                    if (string.IsNullOrEmpty(ex.Label) || ex.Label == LoopLabel)
+                    {
+                        continue;
+                    }
+                    throw;
+                }
             }
         }
     }
@@ -139,6 +191,41 @@ public class ForLoopStructure : ISControl
         if (_streamer.Current?.Value.ToLower() == "in")
         {
             _streamer.MoveNext(); // consume 'in'
+        }
+
+        // Special case: <signal>'range / <signal>'reverse_range — the
+        // tokenizer emits these as a single VECTORS_ATTRIBUTES token, and
+        // they expand to the signal's whole declared bit range with no
+        // separate `to` / `downto` keyword. Detect and resolve here so the
+        // loop body sees consistent RangeStart / RangeEnd / IsAscending.
+        if (_streamer.Current?.Type == VECTORS_ATTRIBUTES &&
+            (_streamer.Current.Value.EndsWith("'range",         StringComparison.OrdinalIgnoreCase) ||
+             _streamer.Current.Value.EndsWith("'reverse_range", StringComparison.OrdinalIgnoreCase)))
+        {
+            string attrToken = _streamer.Current.Value;
+            string sigName   = attrToken.Substring(0, attrToken.IndexOf('\''));
+            bool reverse     = attrToken.EndsWith("'reverse_range", StringComparison.OrdinalIgnoreCase);
+            _streamer.MoveNext();
+
+            var sig = _variables.FirstOrDefault(v => v.Name.Equals(sigName, StringComparison.OrdinalIgnoreCase));
+            int width = sig?.Size ?? 0;
+            if (width <= 0) width = 1;
+
+            // We don't preserve the original `to` vs `downto` direction on
+            // a Variable today, so we assume the conventional downto form
+            // (size-1 downto 0). 'reverse_range flips it.
+            if (reverse) { RangeStart = 0; RangeEnd = width - 1; IsAscending = true;  }
+            else         { RangeStart = width - 1; RangeEnd = 0; IsAscending = false; }
+
+            if (_streamer.Current?.Value.ToLower() == "loop")
+            {
+                _streamer.MoveNext();
+            }
+
+            Variable loopVar2 = new(LoopVariableName, RangeStart.ToString(), Constants.DATATYPES.INTEGER);
+            HashSet<Variable> loopVariables2 = [.. _variables, loopVar2];
+            SyntetizeLoopBody(loopVariables2);
+            return;
         }
 
         // Parse range start
@@ -177,6 +264,7 @@ public class ForLoopStructure : ISControl
     /// Parses a range value (integer literal, variable reference, or expression).
     /// v0.13.0: Added support for expressions like "TREE_DEPTH - 1".
     /// </summary>
+    /// <returns>The parsed integer value, or 0 if parsing fails.</returns>
     private int ParseRangeValue()
     {
         // Collect tokens until we hit 'to', 'downto', 'loop', or 'generate'
@@ -231,6 +319,7 @@ public class ForLoopStructure : ISControl
     /// <summary>
     /// Synthesizes the loop body.
     /// </summary>
+    /// <param name="loopVariables">The variables in scope including the loop variable.</param>
     private void SyntetizeLoopBody(HashSet<Variable> loopVariables)
     {
         int iterations = 0;
@@ -279,8 +368,27 @@ public class ForLoopStructure : ISControl
                         break;
 
                     case "exit":
-                        // Handle exit statement
-                        SyntetizeExitStatement();
+                        ExitStatement exitStmt = new(loopVariables, _streamer);
+                        exitStmt.Syntetize();
+                        Tasks.Add(exitStmt);
+                        break;
+
+                    case "next":
+                        NextStatement nextStmt = new(loopVariables, _streamer);
+                        nextStmt.Syntetize();
+                        Tasks.Add(nextStmt);
+                        break;
+
+                    case "null":
+                        NullStatement nullStmt = new(_streamer);
+                        nullStmt.Syntetize();
+                        Tasks.Add(nullStmt);
+                        break;
+
+                    case "return":
+                        ReturnStatement returnStmt = new(loopVariables, _streamer);
+                        returnStmt.Syntetize();
+                        Tasks.Add(returnStmt);
                         break;
 
                     default:
@@ -298,6 +406,7 @@ public class ForLoopStructure : ISControl
     /// <summary>
     /// Checks if we've reached the end of the loop.
     /// </summary>
+    /// <returns>True if the current token is 'end' or the stream is exhausted.</returns>
     private bool IsEndOfLoop()
     {
         if (_streamer.Current == null) return true;
@@ -307,6 +416,7 @@ public class ForLoopStructure : ISControl
     /// <summary>
     /// Consumes 'end keyword ;' tokens.
     /// </summary>
+    /// <param name="keyword">The keyword expected after 'end' (e.g., "if", "loop", "case").</param>
     private void ConsumeEndKeyword(string keyword)
     {
         if (_streamer.Current?.Value.ToLower() == "end")
@@ -324,32 +434,9 @@ public class ForLoopStructure : ISControl
     }
 
     /// <summary>
-    /// Synthesizes an exit statement.
-    /// </summary>
-    private void SyntetizeExitStatement()
-    {
-        _streamer.MoveNext(); // consume 'exit'
-
-        // Check for optional 'when' condition
-        if (_streamer.Current?.Value.ToLower() == "when")
-        {
-            _streamer.MoveNext(); // consume 'when'
-            // Skip the condition for now
-            while (_streamer.Current?.Value != ";")
-            {
-                _streamer.MoveNext();
-            }
-        }
-
-        if (_streamer.Current?.Value == ";")
-        {
-            _streamer.MoveNext();
-        }
-    }
-
-    /// <summary>
     /// Synthesizes a simple assignment statement.
     /// </summary>
+    /// <param name="variables">The variables in scope for expression evaluation.</param>
     private void SyntetizeAssignment(HashSet<Variable> variables)
     {
         var rawDataBuilder = new StringBuilder();
@@ -381,5 +468,6 @@ public class ForLoopStructure : ISControl
     /// <summary>
     /// Not implemented - use Syntetize() instead.
     /// </summary>
+    /// <param name="data">The raw data for synthesis (unused).</param>
     public void Syntetize(string[] data) => throw new NotImplementedException();
 }
