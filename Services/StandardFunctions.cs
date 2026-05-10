@@ -439,6 +439,29 @@ public static class StandardFunctions
                 }
                 return "";
 
+            // numeric_std rotate functions — declared in the bundled stub
+            // but previously absent from the runtime evaluator, so any user
+            // code that called rotate_left/rotate_right would receive a
+            // null result and downstream "datatypes do not match" failures
+            // when the outer expression tried to consume that null.
+            case "rotate_left":
+                if (arguments.Length >= 2)
+                {
+                    string val = GetStringValue(arguments[0], variables);
+                    int amount = GetIntValue(arguments[1], variables);
+                    return RotateLeft(val, amount);
+                }
+                return "";
+
+            case "rotate_right":
+                if (arguments.Length >= 2)
+                {
+                    string val = GetStringValue(arguments[0], variables);
+                    int amount = GetIntValue(arguments[1], variables);
+                    return RotateRight(val, amount);
+                }
+                return "";
+
             case "to_unsigned":
             case "unsigned":
             case "conv_std_logic_vector":

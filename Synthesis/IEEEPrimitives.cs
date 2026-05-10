@@ -160,6 +160,7 @@ internal static class IEEEPrimitives
     // table rather than constructing emitters directly. The table is the
     // canonical entry point.
 
+    /// <summary>Lowers <c>rising_edge(clk)</c> to a single <see cref="CellKind.EDGE_DETECT"/> cell with <c>Edge=rising</c>.</summary>
     internal sealed class RisingEdgePrimitive : IIEEEPrimitive
     {
         public string CanonicalName => "rising_edge";
@@ -183,6 +184,7 @@ internal static class IEEEPrimitives
         }
     }
 
+    /// <summary>Lowers <c>falling_edge(clk)</c> to a single <see cref="CellKind.EDGE_DETECT"/> cell with <c>Edge=falling</c>.</summary>
     internal sealed class FallingEdgePrimitive : IIEEEPrimitive
     {
         public string CanonicalName => "falling_edge";
@@ -256,6 +258,13 @@ internal static class IEEEPrimitives
         public IEEEPrimitiveResult Lower(IEEEPrimitiveArgs a) => LowerToVector(a, signed: true);
     }
 
+    /// <summary>
+    /// Shared lowering for <see cref="ToUnsignedPrimitive"/> / <see cref="ToSignedPrimitive"/>:
+    /// emits a single <see cref="CellKind.TO_VECTOR"/> cell with the requested width and the
+    /// <c>Signed</c> attribute set per <paramref name="signed"/>.
+    /// </summary>
+    /// <param name="a">Primitive argument bundle (context + arg nets + source line).</param>
+    /// <param name="signed">When <c>true</c>, marks the cell as sign-extending.</param>
     private static IEEEPrimitiveResult LowerToVector(IEEEPrimitiveArgs a, bool signed)
     {
         if (a.Args.Count < 2)
@@ -317,6 +326,7 @@ internal static class IEEEPrimitives
         public IEEEPrimitiveResult Lower(IEEEPrimitiveArgs a) => LowerShift(a, CellKind.SHL);
     }
 
+    /// <summary>Lowers <c>shift_right(v, n)</c> to a barrel-shifter <see cref="CellKind.SHR"/> cell.</summary>
     internal sealed class ShiftRightPrimitive : IIEEEPrimitive
     {
         public string CanonicalName => "shift_right";
@@ -325,6 +335,7 @@ internal static class IEEEPrimitives
         public IEEEPrimitiveResult Lower(IEEEPrimitiveArgs a) => LowerShift(a, CellKind.SHR);
     }
 
+    /// <summary>Lowers <c>rotate_left(v, n)</c> to a <see cref="CellKind.ROL"/> cell.</summary>
     internal sealed class RotateLeftPrimitive : IIEEEPrimitive
     {
         public string CanonicalName => "rotate_left";
@@ -333,6 +344,7 @@ internal static class IEEEPrimitives
         public IEEEPrimitiveResult Lower(IEEEPrimitiveArgs a) => LowerShift(a, CellKind.ROL);
     }
 
+    /// <summary>Lowers <c>rotate_right(v, n)</c> to a <see cref="CellKind.ROR"/> cell.</summary>
     internal sealed class RotateRightPrimitive : IIEEEPrimitive
     {
         public string CanonicalName => "rotate_right";
@@ -341,6 +353,12 @@ internal static class IEEEPrimitives
         public IEEEPrimitiveResult Lower(IEEEPrimitiveArgs a) => LowerShift(a, CellKind.ROR);
     }
 
+    /// <summary>
+    /// Shared lowering for the four shift/rotate primitives: emits a single cell of
+    /// <paramref name="kind"/> with inputs <c>A</c> (value) and <c>N</c> (shift amount).
+    /// </summary>
+    /// <param name="a">Primitive argument bundle.</param>
+    /// <param name="kind">Cell kind to emit (<see cref="CellKind.SHL"/>, <see cref="CellKind.SHR"/>, <see cref="CellKind.ROL"/> or <see cref="CellKind.ROR"/>).</param>
     private static IEEEPrimitiveResult LowerShift(IEEEPrimitiveArgs a, CellKind kind)
     {
         if (a.Args.Count < 2)

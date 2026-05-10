@@ -54,8 +54,18 @@ public class ShuntingYard {
                     // - PrecedencesLogicOperators (for AND, OR, NOT, etc.)
                     // - PrecedencesArithOperators (for +, -, *, /, **, mod)
                     // Direct casting (int) fails when the object contains an enum value
+                    //
+                    // v3.4 Fix: never pop a `(` from the operator stack while
+                    // pushing a regular operator. Only the matching `)` should
+                    // pop a `(`. Without this guard, any operator whose
+                    // precedence value is ≥ PARENTHESIS (4) — `&`, `=`, `<`,
+                    // `<=` (signal-assign), etc. — flushed the enclosing `(`
+                    // straight to the output, leaving stray `(` Operators in
+                    // the postfix that later tried to Pop two operands and
+                    // produced the classic "Stack empty" runtime error.
                     while(
                         _operators.Count > 0 &&
+                        _operators.Peek().OperatorName != "(" &&
                         Convert.ToInt32(_operators.Peek().Precedence) <= Convert.ToInt32(operation.Precedence)
                     )
                         Result.Add(_operators.Pop());

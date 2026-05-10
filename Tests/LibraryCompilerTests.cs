@@ -22,6 +22,7 @@ public static class LibraryCompilerTests
             ("Resolver knows IEEE builtins",                                Test_ResolverKnowsIEEE),
             ("Resolver topologically orders deps",                          Test_ResolverTopologicalOrder),
             ("Resolver merges host-supplied additional sources",            Test_ResolverMergesAdditional),
+            ("Resolver unregisters by name",                                Test_ResolverUnregister),
             ("Builder reads bytes via host callback",                       Test_BuilderUsesHostCallback),
             ("Builder falls back to embedded IEEE resources",               Test_BuilderEmbeddedFallback),
             ("Builder hard-coded fallback when no source available",        Test_BuilderHardCodedFallback),
@@ -97,6 +98,24 @@ public static class LibraryCompilerTests
         var custom = new LibrarySource("my_pkg", "WORK", "fake-key", Array.Empty<string>());
         var r = new LibraryResolver(new[] { custom });
         return r.Resolve("my_pkg") is { Vendor: "WORK" };
+    }
+
+    private static bool Test_ResolverUnregister()
+    {
+        var custom = new LibrarySource("ghost", "WORK", "k", Array.Empty<string>());
+        var r = new LibraryResolver(new[] { custom });
+
+        // Round 1: present, then removed.
+        if (r.Resolve("ghost") is null) return false;
+        if (!r.Unregister("ghost")) return false;
+        if (r.Resolve("ghost") is not null) return false;
+
+        // Round 2: idempotent — second call returns false but doesn't throw.
+        if (r.Unregister("ghost")) return false;
+
+        // Round 3: IEEE builtins must survive an unrelated unregister.
+        if (r.Resolve("std_logic_1164") is null) return false;
+        return true;
     }
 
     // ---- Builder --------------------------------------------------------

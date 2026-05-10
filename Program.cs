@@ -282,6 +282,7 @@ class Program
         failures += Tests.IEEEPrimitivesTests.RunAllTests();
         failures += Tests.IEEELoweringEndToEndTests.RunAllTests();
         failures += Tests.NestedIEEECallTests.RunAllTests();
+        failures += Tests.PracticeExerciseTests.RunAllTests();
         Environment.ExitCode = failures;
     }
 
@@ -373,10 +374,13 @@ class Program
                 s.Name.Equals("clk", StringComparison.OrdinalIgnoreCase) ||
                 s.Name.Equals("clock", StringComparison.OrdinalIgnoreCase));
 
-            // Run simulation for specified cycles
+            // Run simulation for specified cycles. NOTE: use `is not null`
+            // (pattern match) — Variable's overloaded `operator !=(Variable, string)`
+            // wrongly returns true when both operands are null because of an
+            // implicit string-conversion path picked up by overload resolution.
             for (int cycle = 0; cycle < cycles; cycle++)
             {
-                if (clk != null)
+                if (clk is not null)
                 {
                     // Rising edge
                     clk.Value = "1";
@@ -440,7 +444,13 @@ class Program
     /// A tuple containing the list of parsed <see cref="Entity"/> objects and the number
     /// of architecture bodies that were successfully synthesized.
     /// </returns>
-    static (List<Entity> entities, int architectureCount) ProcessVhdlCode(string raw, CancellationToken cancellationToken = default)
+    // Marked `internal` (was implicit private) so the in-assembly test
+    // suite at Interpreter/Tests/PracticeExerciseTests.cs can run the
+    // same parsing pipeline the --sim CLI flag uses, without copying its
+    // ~300-line line-state-machine + private helpers (JoinContinuationLines,
+    // ParsePackageConstants, …) into the test file. Still invisible
+    // outside the assembly.
+    internal static (List<Entity> entities, int architectureCount) ProcessVhdlCode(string raw, CancellationToken cancellationToken = default)
     {
         // Seed the IEEE library symbol table once per process so calls into
         // the IEEE.std_logic_1164 / IEEE.numeric_std API resolve through
@@ -966,7 +976,18 @@ class Program
             }
 
             if (buffer.Length > 0) buffer.Append(' ');
-            buffer.Append(raw.Trim());
+            // Append the comment-stripped form, not the raw line. Otherwise an
+            // inline `-- …` comment on one continued line (e.g. mid-port-list:
+            //   dir : in STD_LOGIC;  -- '1' = up, '0' = down
+            //   q   : out STD_LOGIC_VECTOR(3 downto 0)
+            // );)
+            // ends up inside the joined buffer; the tokenizer's
+            // `line.Split("--")[0]` then deletes the rest of the joined
+            // string — including subsequent ports and the closing `);` —
+            // and the streamer reports the next `end entity …` as an
+            // unexpected keyword. Using `codeOnly` keeps the comment out
+            // of the buffer entirely.
+            buffer.Append(codeOnly.Trim());
 
             bool complete = parenDepth == 0 && IsLineTerminator(trimmed);
             if (complete)

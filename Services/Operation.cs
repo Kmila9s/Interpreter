@@ -183,6 +183,15 @@ public class Operation : IOperation {
                         vari.Type = Constants.DATATYPES.BOOLEAN;
                         vari.Value = bool.Parse((string)vari.Value);
                     }
+                    else if (string.Equals(op.OperatorName, "&", StringComparison.Ordinal))
+                    {
+                        // The Operator's `&` path bypasses the type-check and
+                        // always returns a bit string; retag the wrapper so
+                        // downstream operators (and the LHS assignment) see a
+                        // proper STD_LOGIC_VECTOR with the correct Size.
+                        vari.Type = Constants.DATATYPES.STD_LOGIC_VECTOR;
+                        if (vari.Value is string concat) vari.Size = concat.Length;
+                    }
                     variables.Push(vari);
                 }
             }
@@ -245,6 +254,24 @@ public class Operation : IOperation {
             // Handle aggregate expressions like (others => '0')
             if (currentItem.ToLower() == "others")
             {
+                // The leading `(` of the aggregate was already pushed onto
+                // `items` by a previous loop iteration that fell through to
+                // the generic operator path. ParseOthersAggregate consumes
+                // the closing `)` token but not the opening `(` from items —
+                // so without this step, the postfix output ends up with an
+                // unmatched `(` operator that later tries to pop two
+                // operands and stack-empties (cycle 7 of the m3-counter-wrap
+                // / clk-divider-toggle exercises was the real-world repro:
+                // the aggregate body fired the moment the wrap condition
+                // evaluated true). Drop the trailing `(` so the aggregate
+                // becomes a single self-contained operand.
+                if (items.Count > 0 &&
+                    items[^1] is Operator stray &&
+                    stray.OperatorName == "(")
+                {
+                    items.RemoveAt(items.Count - 1);
+                }
+
                 // Parse (others => value) and create a variable with the aggregate value
                 var aggregateResult = ParseOthersAggregate();
                 if (aggregateResult.success)

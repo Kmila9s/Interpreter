@@ -1,43 +1,64 @@
 namespace Interpreter.Models;
 
 /// <summary>
-/// Defines the precedence levels for logical operators. Lower integer values indicate higher precedence.
+/// Defines the precedence levels for logical operators. Lower integer values
+/// indicate higher precedence (tighter binding).
 /// </summary>
+/// <remarks>
+/// v3.4: corrected to match the VHDL operator-precedence chart. Previously
+/// <see cref="AND"/> et al. had value 1 (highest precedence) while
+/// <see cref="COMPARATION"/> had 5 (lowest), which inverted the standard:
+/// `d = '1' and d_prev = '0'` parsed as `d = ('1' and d_prev) = '0'` and
+/// then threw "Type mismatch: expected BOOLEAN, got STD_LOGIC" downstream.
+/// The fix flips the bands so `=` binds tighter than `and`.
+///
+/// Reference (VHDL spec, highest precedence to lowest):
+/// 1. **, abs, not                                 — value 0
+/// 2. *, /, mod, rem                               — value 1 (PrecedencesArithOperators)
+/// 3. + (sign), - (sign)                           — value 0 (PrecedencesArithOperators.UNARY)
+/// 4. + (binary), - (binary), &amp; (concatenate)  — value 2
+/// 5. sll, srl, sla, sra, rol, ror                 — value 3
+/// 6. =, /=, &lt;, &lt;=, &gt;, &gt;=              — value 4
+/// 7. and, or, nand, nor, xor, xnor                — value 5
+/// 8. assignment (&lt;=, :=)                       — value 6
+/// </remarks>
 public enum PrecedencesLogicOperators : int {
-    /// <summary>Comparation operators (e.g., =, /=, less than, greater than).</summary>
-    COMPARATION = 5,
-    /// <summary>Signal or variable assignment (e.g., less than or equal, :=). Lowest precedence.</summary>
-    ASSIGNATION = 5, // LOWEST PRECEDENCE
-    /// <summary>Parenthesis for grouping expressions.</summary>
-    PARENTHESIS = 4,
-    /// <summary>Exclusive OR operator.</summary>
-    XOR = 3,
-    /// <summary>Exclusive NOR operator.</summary>
-    XNOR = 3,
-    /// <summary>OR operator.</summary>
-    OR = 2,
-    /// <summary>NOR operator.</summary>
-    NOR = 2,
-    /// <summary>AND operator.</summary>
-    AND = 1,
-    /// <summary>NAND operator.</summary>
-    NAND = 1,
-    /// <summary>Shift left logical operator (sll).</summary>
-    SLL = 1,
-    /// <summary>Shift right logical operator (srl).</summary>
-    SRL = 1,
-    /// <summary>Shift left arithmetic operator (sla).</summary>
-    SLA = 1,
-    /// <summary>Shift right arithmetic operator (sra).</summary>
-    SRA = 1,
-    /// <summary>Rotate left operator (rol).</summary>
-    ROL = 1,
-    /// <summary>Rotate right operator (ror).</summary>
-    ROR = 1,
-    /// <summary>Absolute value operator.</summary>
+    /// <summary>Absolute value operator. Highest precedence.</summary>
     ABS = 0,
     /// <summary>Logical NOT operator. Highest precedence.</summary>
-    NOT = 0, // HIGHERST PRECEDENCE
+    NOT = 0,
+    /// <summary>Concatenation (&amp;) — sits at adder-precedence in VHDL.</summary>
+    CONCAT = 2,
+    /// <summary>Shift left logical operator (sll).</summary>
+    SLL = 3,
+    /// <summary>Shift right logical operator (srl).</summary>
+    SRL = 3,
+    /// <summary>Shift left arithmetic operator (sla).</summary>
+    SLA = 3,
+    /// <summary>Shift right arithmetic operator (sra).</summary>
+    SRA = 3,
+    /// <summary>Rotate left operator (rol).</summary>
+    ROL = 3,
+    /// <summary>Rotate right operator (ror).</summary>
+    ROR = 3,
+    /// <summary>Comparation operators (e.g., =, /=, less than, greater than).</summary>
+    COMPARATION = 4,
+    /// <summary>AND operator.</summary>
+    AND = 5,
+    /// <summary>NAND operator.</summary>
+    NAND = 5,
+    /// <summary>OR operator.</summary>
+    OR = 5,
+    /// <summary>NOR operator.</summary>
+    NOR = 5,
+    /// <summary>Exclusive OR operator.</summary>
+    XOR = 5,
+    /// <summary>Exclusive NOR operator.</summary>
+    XNOR = 5,
+    /// <summary>Parenthesis for grouping expressions. Value is irrelevant — ShuntingYard never pops `(` from the operator stack via precedence comparison.</summary>
+    PARENTHESIS = 6,
+    /// <summary>Signal or variable assignment (e.g., &lt;=, :=). Lowest precedence.</summary>
+    ASSIGNATION = 6,
 }
 
 /// <summary>

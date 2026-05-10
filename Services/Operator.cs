@@ -122,7 +122,15 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                 Precedence = PrecedencesLogicOperators.COMPARATION;
             break;
             case OperatorType.UNKNOWN:
-                Precedence = PrecedencesLogicOperators.PARENTHESIS;
+                // `&` (concatenation) and the parens land here — they don't
+                // match any of the four operator regexes. `&` needs a
+                // precedence at adder-level so a chain like
+                // `'0' & x + y` orders correctly; `(` and `)` get a low
+                // precedence value but ShuntingYard skips `(` regardless,
+                // so the value doesn't matter for them.
+                Precedence = Operator == "&"
+                    ? PrecedencesLogicOperators.CONCAT
+                    : PrecedencesLogicOperators.PARENTHESIS;
             break;
             case OperatorType.ASSIGNATION:
                 Precedence = PrecedencesLogicOperators.ASSIGNATION;
@@ -180,6 +188,19 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// <param name="rightSideOperator">The right side operator.</param>
     /// <returns>The result of the operation.</returns>
     public object Execute(Variable leftSideOperator, Variable rightSideOperator){
+        // VHDL & (concatenation) — bypass the matching-types check below.
+        // The whole point of & is to glue STD_LOGIC and STD_LOGIC_VECTOR
+        // operands together: `'0' & unsigned(a)` widens an N-bit vector
+        // by 1 bit, `r(6 downto 0) & din` shifts a register left, etc.
+        // The result is always a STD_LOGIC_VECTOR-shaped bit string;
+        // the wrapping caller (Operation.Execute / ScheduledOperation.Execute)
+        // is responsible for retagging the resulting Variable's Type to
+        // STD_LOGIC_VECTOR — see the OperatorName == "&" branch there.
+        if (string.Equals(OperatorName, "&", StringComparison.Ordinal))
+        {
+            return ConcatenateBits(leftSideOperator, rightSideOperator);
+        }
+
         // v0.13.0: Relax type checking when one operand is a stub (undeclared identifier)
         // This allows parsing to continue even with missing package definitions
         // v0.16.1: Add type coercion support for INTEGER <-> STD_LOGIC_VECTOR
@@ -231,6 +252,14 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// <returns>The result of the comparation.</returns>
     public object SolveComparation(Variable var1, Variable var2)
     {
+        // v3.3: when EITHER side is a vector, route through the vector
+        // comparison path so a literal like `8` doesn't get compared against
+        // a binary string like "0010" via int.TryParse — which would parse
+        // the vector as decimal 10 instead of the actual unsigned value 2.
+        if (var1.Type == DATATYPES.STD_LOGIC_VECTOR || var2.Type == DATATYPES.STD_LOGIC_VECTOR)
+        {
+            return SolveVectorComparation(var1, var2);
+        }
         switch (var1.Type)
         {
             case DATATYPES.BOOLEAN:
@@ -312,20 +341,132 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                         throw new Exception($"Operator type do not detected or even supported: {OperatorName}");
                 }
             }
-            case DATATYPES.STD_LOGIC_VECTOR:
-                switch (OperatorName.ToLower())
-                {
-                    case "=":
-                        return ((string)var1.Value).Equals((string)var2.Value);
-                    case "!=":
-                    case "/=":
-                        return !((string)var1.Value).Equals((string)var2.Value);
-                    default:
-                        throw new Exception($"Operator type do not detected or even supported for vectors: {OperatorName}");
-                }
             default:
                 throw new Exception($"Datatype do not detected or even supported: {OperatorName}");
         }
+    }
+
+    /// <summary>
+    /// Comparison helper that handles any combination of operand types
+    /// where at least one side is a STD_LOGIC_VECTOR. Both operands are
+    /// normalised to integers via <see cref="ParseAsUnsignedInt"/> (binary
+    /// string for vectors, plain decimal for INTEGER literals) before
+    /// comparison, matching numeric_std unsigned semantics. Equality keeps
+    /// string comparison so a vector with width drift compares cleanly.
+    /// </summary>
+    private object SolveVectorComparation(Variable var1, Variable var2)
+    {
+        string s1 = var1.Value?.ToString() ?? string.Empty;
+        string s2 = var2.Value?.ToString() ?? string.Empty;
+
+        switch (OperatorName.ToLower())
+        {
+            case "=":
+                // For vector ⇆ integer equality, compare numerically — the
+                // string forms ("0010" vs "2") would otherwise miscompare.
+                if (var1.Type != var2.Type)
+                {
+                    return ParseAsUnsignedInt(var1) == ParseAsUnsignedInt(var2);
+                }
+                return s1.Equals(s2, StringComparison.Ordinal);
+            case "!=":
+            case "/=":
+                if (var1.Type != var2.Type)
+                {
+                    return ParseAsUnsignedInt(var1) != ParseAsUnsignedInt(var2);
+                }
+                return !s1.Equals(s2, StringComparison.Ordinal);
+            case "<":
+            case ">":
+            case "<=":
+            case ">=":
+            {
+                int i1 = ParseAsUnsignedInt(var1);
+                int i2 = ParseAsUnsignedInt(var2);
+                return OperatorName.ToLower() switch
+                {
+                    "<"  => i1 <  i2,
+                    ">"  => i1 >  i2,
+                    "<=" => i1 <= i2,
+                    ">=" => i1 >= i2,
+                    _    => false
+                };
+            }
+            default:
+                throw new Exception($"Operator type do not detected or even supported for vectors: {OperatorName}");
+        }
+    }
+
+    /// <summary>
+    /// Reads a Variable's value as a non-negative integer, honouring the
+    /// VHDL convention that STD_LOGIC_VECTOR values are written MSB-first
+    /// in binary. Plain decimal integers and natural numbers parse the
+    /// usual way; meta-values ('U' / 'X' / 'Z' / …) collapse to 0 so a
+    /// stale uninitialised signal can't crash a comparison.
+    /// </summary>
+    /// <summary>
+    /// VHDL & (concatenation) implementation. Joins two operands as
+    /// MSB-first bit strings and returns the combined string. The result
+    /// length is always (left bits + right bits) so chained patterns like
+    /// <c>'0' &amp; unsigned(a) &amp; '1'</c> grow predictably; the caller
+    /// retags the wrapping Variable as STD_LOGIC_VECTOR with this length
+    /// as its Size.
+    /// </summary>
+    /// <remarks>
+    /// Operand encoding: STD_LOGIC ports / signals carry their value as a
+    /// 1-character string ("0", "1", "U", …). STD_LOGIC_VECTOR signals
+    /// carry the full N-character bit string. Either way we read
+    /// <c>.Value.ToString()</c> and strip any quote chars left over from
+    /// VHDL literals like <c>'0'</c> or <c>"0011"</c>. INTEGER operands
+    /// (rare in real concat usage but supported defensively) encode as
+    /// the integer's binary representation.
+    /// </remarks>
+    private static string ConcatenateBits(Variable l, Variable r)
+        => AsConcatBits(l) + AsConcatBits(r);
+
+    private static string AsConcatBits(Variable v)
+    {
+        if (v?.Value == null) return "0";
+        var s = v.Value.ToString() ?? string.Empty;
+
+        // Strip VHDL literal quotes so '1' → "1" and "0011" → "0011".
+        s = s.Replace("\"", string.Empty).Replace("'", string.Empty);
+
+        // INTEGER literal coming through the concat path — render as
+        // unsigned binary using the variable's declared Size when set,
+        // else the minimum width to represent the value.
+        if (v.Type == DATATYPES.INTEGER || v.Type == DATATYPES.NATURAL)
+        {
+            if (int.TryParse(s, out int iv))
+            {
+                int width = v.Size > 0 ? v.Size : Math.Max(1, (int)Math.Ceiling(Math.Log2(iv + 1)));
+                return Convert.ToString(iv, 2).PadLeft(width, '0');
+            }
+        }
+
+        return s.Length == 0 ? "0" : s;
+    }
+
+    private static int ParseAsUnsignedInt(Variable v)
+    {
+        if (v.Value == null) return 0;
+        string s = v.Value.ToString() ?? string.Empty;
+
+        // Vector-typed signals always come in as binary strings — interpret
+        // them that way regardless of int.TryParse's decimal interpretation.
+        if (v.Type == DATATYPES.STD_LOGIC_VECTOR &&
+            s.Length > 0 && s.All(c => c == '0' || c == '1'))
+        {
+            try { return Convert.ToInt32(s, 2); } catch { return 0; }
+        }
+
+        if (int.TryParse(s, out int direct)) return direct;
+
+        if (s.Length > 0 && s.All(c => c == '0' || c == '1'))
+        {
+            try { return Convert.ToInt32(s, 2); } catch { return 0; }
+        }
+        return 0;
     }
 
     /// <summary>
@@ -461,6 +602,50 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             return 0.0;
         }
 
+        // v3.3 (numeric_std runtime): when either operand is a vector, do
+        // width-aware modular arithmetic and return a STD_LOGIC_VECTOR string
+        // of the wider operand's width. This is the simulation-side mirror
+        // of the synth path's ADD/SUB/MUL cells — `count <= count + 1` where
+        // `count : unsigned(3 downto 0)` now produces a 4-bit string the
+        // signal scheduler can write back without a type round-trip,
+        // including correct wraparound at the bit boundary.
+        bool leftVec  = leftVariable.Type == DATATYPES.STD_LOGIC_VECTOR;
+        bool rightVec = rightVariable.Type == DATATYPES.STD_LOGIC_VECTOR;
+        if (leftVec || rightVec)
+        {
+            if (leftVariable.IsStub || rightVariable.IsStub)
+            {
+                // Stubs preserve the legacy "return 0" behaviour — we don't
+                // know the intended width, so any vector-formatted answer
+                // would be a guess.
+                result = 0;
+            }
+            else
+            {
+                int width = Math.Max(
+                    leftVec  ? Math.Max(1, leftVariable.Size)  : 1,
+                    rightVec ? Math.Max(1, rightVariable.Size) : 1);
+                int li  = GetInt(leftVariable);
+                int ri  = GetInt(rightVariable);
+                int raw = SolveIntOperation(li, ri);
+
+                // Modular wrap to the result width — matches numeric_std
+                // unsigned semantics where overflow rolls over inside the
+                // declared bit width.
+                if (width >= 31)
+                {
+                    result = Convert.ToString(raw, 2).PadLeft(width, '0');
+                }
+                else
+                {
+                    int mask    = (1 << width) - 1;
+                    int wrapped = raw & mask;
+                    result = Convert.ToString(wrapped, 2).PadLeft(width, '0');
+                }
+            }
+            return result;
+        }
+
         if(leftVariable.Type != rightVariable.Type){
             if(
                 (leftVariable.Type == DATATYPES.INTEGER || leftVariable.Type == DATATYPES.NATURAL) &&
@@ -483,19 +668,6 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                 break;
                 case DATATYPES.NATURAL:
                     result = SolveRealOperation(GetDouble(leftVariable), GetDouble(rightVariable));
-                break;
-                case DATATYPES.STD_LOGIC_VECTOR:
-                    // v0.13.0: Handle STD_LOGIC_VECTOR arithmetic (common with stub variables)
-                    // Return 0 for stub operations; for real vectors, attempt integer interpretation
-                    if (leftVariable.IsStub || rightVariable.IsStub)
-                    {
-                        result = 0;
-                    }
-                    else
-                    {
-                        // Try to interpret vectors as integers for arithmetic
-                        result = SolveIntOperation(GetInt(leftVariable), GetInt(rightVariable));
-                    }
                 break;
                 default:
                     // Default to integer operation or return 0 for unhandled types
@@ -562,14 +734,30 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// <param name="variable">The variable.</param>
     /// <returns>The result of the logic operation.</returns>
     public object SolveLogicOperation(Variable variable){
-        object result = new();
-        char item = Convert.ToChar(variable.Value);
-        switch(OperatorName.ToLower()){
-            case "not":
-                result = item == '1' ? '0' : '1';
-            break;
+        // Unary `not` — works on any of:
+        //   • BOOLEAN (true / false)             — `if not found then …`
+        //   • STD_LOGIC ('0' / '1' / meta)        — `q <= not q`
+        //   • STD_LOGIC_VECTOR (full bit string)  — handled by SolveVectorLogicOperation
+        // The previous Convert.ToChar(variable.Value) blew up with
+        // InvalidCastException whenever the Value was a `bool` or an
+        // uninitialised `new object()` — the arbiter exercises hit this
+        // every time `not found` was evaluated.
+        if (variable.Value is bool b)
+        {
+            return !b;
         }
-        return result;
+
+        string s = variable.Value?.ToString() ?? string.Empty;
+        if (string.Equals(s, "True",  StringComparison.OrdinalIgnoreCase)) return false;
+        if (string.Equals(s, "False", StringComparison.OrdinalIgnoreCase)) return true;
+        if (s.Length == 0) return '1';   // uninitialised — treat as `not 0` = '1'
+
+        char item = s[0];
+        return OperatorName.ToLower() switch
+        {
+            "not" => item == '1' ? '0' : '1',
+            _     => (object)'0'
+        };
     }
 
     /// <summary>

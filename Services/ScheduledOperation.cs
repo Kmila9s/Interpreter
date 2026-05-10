@@ -80,6 +80,13 @@ public class ScheduledOperation
                         vari.Type = DATATYPES.BOOLEAN;
                         vari.Value = bool.Parse((string)vari.Value);
                     }
+                    else if (string.Equals(op.OperatorName, "&", StringComparison.Ordinal))
+                    {
+                        // Mirror Operation.Execute: `&` returns a bit string
+                        // regardless of operand types — retag the wrapper.
+                        vari.Type = DATATYPES.STD_LOGIC_VECTOR;
+                        if (vari.Value is string concat) vari.Size = concat.Length;
+                    }
                     variables.Push(vari);
                 }
             }
