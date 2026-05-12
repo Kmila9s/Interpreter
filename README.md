@@ -1668,6 +1668,295 @@ The following VHDL features require additional development:
 
 ---
 
+## Audit diagrams (2026-05-09)
+
+The Interpreter README previously had no Mermaid diagrams (only ASCII trees). The
+audit identified that several behaviors of the simulation engine were either
+misrepresented in TT1 (`fig_5_5_10`, `fig_4_5`) or undocumented entirely. Sources
+also live in `Documentacion/TT1/diagrams/`.
+
+### `fig_5_5_10_clases_motor_simulacion` — Engine class diagram (rewritten)
+
+```mermaid
+classDiagram
+    direction TB
+
+    class SimulationRunner {
+        +DeltaCycleEngine Engine
+        +bool IsRunning
+        +bool IsPaused
+        +RunAsync(SimulationConfig) Task
+        +Pause() void
+        +Resume() void
+        +Stop() void
+        +OnProgressChanged EventHandler
+        +OnSimulationEnded EventHandler
+        +OnError EventHandler
+    }
+
+    class DeltaCycleEngine {
+        -int _currentTick
+        -int _currentDelta
+        -int MAX_DELTA_CYCLES
+        +SignalHistory History
+        +Initialize(signals, tasks) void
+        +RunTimeStepAsync() Task~bool~
+        +RunDeltaCycleAsync() Task~bool~
+        +AdvanceTime(tick) void
+        +ConnectToTimeMachine(timer) void
+    }
+
+    class ProcessScheduler {
+        -Dictionary _sensitivityMap
+        -List _allProcesses
+        -Queue _pending
+        +RegisterProcess(p) void
+        +InitializeAllProcesses() void
+        +NotifySignalChanges(changed) void
+        +GetPendingProcesses() IEnumerable
+    }
+
+    class SignalScheduler {
+        -Dictionary _currentDeltaUpdates
+        -Dictionary _futureUpdates
+        +Schedule(signal, value) void
+        +ScheduleAfter(signal, value, ticks) void
+        +ApplyCurrentUpdates() ISet~Variable~
+        +AdvanceTime(tick) void
+    }
+
+    class SignalHistory {
+        +RegisterSignal(signal, time, record) void
+        +RecordChanges(signals, time) void
+        +ExportToVcd(module, ns) string
+        +SaveToVcd(path, module, ns) void
+        +ExportToCsv() string
+    }
+
+    class SignalAttributeHandler {
+        <<singleton>>
+        +RegisterSignal(signal) void
+        +UpdateAllPreviousValues() void
+        +HasEvent(signal) bool
+        +LastValue(signal) object
+    }
+
+    class ProcessSynthesizer {
+        +Synthesize(entity) Netlist
+    }
+
+    class SimulationConfig {
+        +Entity Entity
+        +int TotalTicks
+        +List Clocks
+        +List Stimuli
+    }
+
+    SimulationRunner "1" *-- "1" DeltaCycleEngine : compone
+    DeltaCycleEngine "1" *-- "1" SignalHistory : registra en
+    DeltaCycleEngine "1" *-- "1" ProcessScheduler : delega procesos
+    DeltaCycleEngine "1" *-- "1" SignalScheduler : delega senales
+    DeltaCycleEngine ..> SignalAttributeHandler : consulta atributos
+    SimulationRunner ..> SimulationConfig : recibe
+    ProcessSynthesizer ..> SignalHistory : independiente
+```
+
+### `fig_5_5_11_clases_planificadores` — Schedulers detail (new)
+
+```mermaid
+classDiagram
+    direction TB
+
+    class ProcessScheduler {
+        -Dictionary~Variable, List~Process~~ _sensitivityMap
+        -List~Process~ _allProcesses
+        -HashSet~Process~ _pending
+        +RegisterProcess(p: Process) void
+        +InitializeAllProcesses() void
+        +NotifySignalChanges(changed: ISet) void
+        +GetPendingProcesses() IEnumerable~Process~
+        +HasPendingProcesses bool
+    }
+
+    class SignalScheduler {
+        -Dictionary~Variable, object~ _currentDeltaUpdates
+        -SortedDictionary~int, Dictionary~ _futureUpdates
+        +Schedule(signal, value) void
+        +ScheduleAfter(signal, value, ticks) void
+        +ApplyCurrentUpdates() ISet~Variable~
+        +AdvanceTime(tick) void
+        +HasPendingUpdates bool
+    }
+
+    class ScheduledOperation {
+        +IOperation Source
+        +Execute() void
+    }
+
+    class Process {
+        +List~Variable~ SensitiveList
+        +List~Variable~ SignalsPorts
+        +List~ITask~ Tasks
+        +SyntentizeSensitiveList(tokens) void
+    }
+
+    class Variable {
+        +string Name
+        +DATATYPES Type
+        +object Value
+        +event OnValueChange
+    }
+
+    ProcessScheduler "1" o-- "*" Process : registra
+    ProcessScheduler "1" --> "*" Variable : indexa por sensibilidad
+    SignalScheduler "1" --> "*" Variable : programa updates
+    SignalScheduler "1" *-- "*" ScheduledOperation : cachea
+    Process "1" o-- "*" Variable : SensitiveList
+```
+
+### `fig_5_8_4_seq_resolucion_sensitivity` — Sensitivity-list resolution (new)
+
+```mermaid
+sequenceDiagram
+    participant DCE as DeltaCycleEngine
+    participant P as Process
+    participant SP as SignalsPorts (scope)
+    participant PS as ProcessScheduler
+    participant SAH as SignalAttributeHandler
+
+    Note over DCE: Elaboracion (Initialize)
+    DCE->>P: VariableSyntetizer (declaraciones)
+    DCE->>P: SyntentizeSensitiveList(rawTokens)
+    loop Por cada nombre en lista de sensibilidad
+        P->>SP: Buscar Variable por nombre
+        SP-->>P: Variable referencia (o stub si no existe)
+        P->>P: Agregar a SensitiveList
+    end
+    DCE->>SAH: RegisterSignal por cada senal
+    DCE->>PS: RegisterProcess(P)
+    PS->>PS: Por cada signal en P.SensitiveList:<br/>_sensitivityMap[signal].Add(P)
+
+    Note over DCE: Tiempo t=0
+    DCE->>PS: InitializeAllProcesses
+    PS-->>DCE: Todos los Process en pendientes
+    DCE->>P: ExecuteProcessWithSchedulingAsync
+    P-->>DCE: Cambios de senal (en SignalScheduler)
+
+    Note over DCE: Cambio de senal mas tarde
+    DCE->>PS: NotifySignalChanges(changedSignals)
+    PS->>PS: Para cada signal:<br/>marcar Process en _sensitivityMap[signal]<br/>como pending para siguiente delta
+```
+
+### `fig_5_11_10_state_delta_cycle` — Delta-cycle state machine (new)
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Initializing : RunAsync(config)
+    Initializing --> TimeStep : Initialize completo
+    TimeStep --> DeltaCycle : InitializeAllProcesses (t=0)<br/>or procesos pendientes
+
+    state DeltaCycle {
+        [*] --> ExecPending
+        ExecPending --> ExecConcurrent : pending procesados
+        ExecConcurrent --> ApplyUpdates : asignaciones encoladas
+        ApplyUpdates --> RecordHistory : SignalScheduler.ApplyCurrentUpdates
+        RecordHistory --> NotifyScheduler : SignalHistory.RecordChanges
+        NotifyScheduler --> [*] : ProcessScheduler.NotifySignalChanges
+    }
+
+    DeltaCycle --> DeltaCycle : HasPendingProcesses<br/>or HasPendingUpdates<br/>(_currentDelta < MAX)
+    DeltaCycle --> Aborted : _currentDelta > MAX_DELTA_CYCLES<br/>(bucle combinacional)
+    DeltaCycle --> AdvanceTick : Estable (sin pendientes)
+    AdvanceTick --> TimeStep : tick < TotalTicks
+    AdvanceTick --> Done : tick = TotalTicks
+    Done --> [*] : OnSimulationEnded
+    Aborted --> [*] : OnError
+
+    Idle --> Paused : OnPaused(true) (TimeMachine)
+    Paused --> Idle : OnPaused(false)
+```
+
+### `fig_5_10_1_seq_vcd_id_alloc` — VCD identifier allocation (new)
+
+```mermaid
+sequenceDiagram
+    participant SR as SimulationRunner
+    participant SH as SignalHistory
+    participant Map as signalIds (Dict)
+    participant FS as Filesystem
+
+    SR->>SH: ExportToVcd(moduleName, timescaleNs)
+    SH->>SH: Escribir $date / $version / $timescale
+    SH->>Map: idCounter = 0
+    loop Por cada Senal ordenada por nombre
+        SH->>SH: GenerateVcdId(idCounter)
+        Note right of SH: ASCII 33..126 con<br/>wraparound: !, ", #, ...,<br/>~, !!, "!, ...
+        SH->>Map: signalIds[signal] = id
+        SH->>SH: Emitir $var wire/reg width id name $end
+        SH->>SH: idCounter++
+    end
+    SH->>SH: Escribir $dumpvars (valor inicial por senal)
+    loop Por cada tiempo unico en el historial
+        SH->>SH: Emitir #tiempo (en timescaleNs)
+        loop Senales con cambio en este tiempo
+            SH->>Map: Lookup id por senal
+            Map-->>SH: id
+            SH->>SH: Emitir nuevoValor + id
+        end
+    end
+    SH-->>SR: string VCD
+    SR->>FS: SaveToVcd(path) escribe string
+```
+
+### `fig_4_5_dominio_simulacion` — Simulation domain (rewritten)
+
+```mermaid
+classDiagram
+    direction TB
+
+    class ConfigSimulacion {
+        +Int totalTicks
+        +Int timescaleNs
+        +List clocks
+        +List stimuli
+    }
+    class DispositivoFPGA {
+        +String familia
+        +String fabricante
+        +Int celdasLogicas
+    }
+    class Senal {
+        +String nombre
+        +Tipo tipo
+        +Int ancho
+    }
+    class HistorialDeSenales {
+        +Map~Senal, List~ transiciones
+        +Int tickActual
+    }
+    class FormaDeOnda {
+        +List valoresTemporales
+    }
+    class VisualizadorDeOndas {
+        +List senalesMostradas
+        +Int zoom
+    }
+    class ArchivoVCD {
+        +String contenido
+        +Int timescaleNs
+    }
+
+    ConfigSimulacion "1" --> "0..1" DispositivoFPGA : se calcula sobre
+    ConfigSimulacion "1" --> "0..*" Senal : estimula
+    HistorialDeSenales "1" --> "0..*" Senal : muestrea
+    Senal "1" --> "1" FormaDeOnda : produce
+    VisualizadorDeOndas "1" ..> "0..*" FormaDeOnda : presenta
+    HistorialDeSenales "1" --> "1" ArchivoVCD : exporta a
+```
+
+---
+
 ## Changelog
 
 ### Version 1.14.0 (2026-04-19)
