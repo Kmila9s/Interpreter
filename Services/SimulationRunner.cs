@@ -46,6 +46,16 @@ public class SimulationRunner : IDisposable
     public event Action<string>? OnError;
 
     /// <summary>
+    /// Phase B (2026-05-19): fires once per <see cref="RunAsync"/> right
+    /// after <see cref="_engine"/> is constructed + initialised. Lets the UI
+    /// (Editor's Replay tab) grab a reference to the engine for the live
+    /// pause/resume controls. The reference becomes invalid once the run
+    /// completes — pair this with <see cref="OnSimulationEnded"/> for the
+    /// detach.
+    /// </summary>
+    public event Action<DeltaCycleEngine>? OnEngineReady;
+
+    /// <summary>
     /// Runs the simulation to completion based on the provided config.
     /// Follows the proven pattern from Interpreter/Program.cs:RunSimulation.
     /// </summary>
@@ -81,6 +91,19 @@ public class SimulationRunner : IDisposable
                 if (configuredSignals.Contains(signal))
                     continue;
 
+                // Bug #5E: respect declared initial values. If
+                // VariableSyntetizer populated a non-trivial Value (e.g.
+                // `signal r : std_logic_vector(3 downto 0) := "0001";` or
+                // `signal state : state_t := sA;`), don't clobber it. Only
+                // seed signals that arrived here uninitialized.
+                string? existing = signal.Value?.ToString();
+                bool needsDefault =
+                    string.IsNullOrEmpty(existing) ||
+                    existing.All(c => c == 'U' || c == 'u') ||
+                    existing == "System.Object";
+                if (!needsDefault && !signal.IsPort)
+                    continue;
+
                 string defaultVal = signal.Size > 1 ? new string('0', signal.Size) : "0";
 
                 // Smart defaults for common signal names
@@ -98,7 +121,16 @@ public class SimulationRunner : IDisposable
                 signal.Value = defaultVal;
             }
 
-            // Apply clock initial states
+            // Bug #15 fix: register signals BEFORE applying clock initial
+            // states / tick-0 stim. Otherwise the U→initial transition is
+            // masked at registration time and `rising_edge(clk)` returns
+            // false at tick 0, so process bodies that depend on it (e.g.
+            // a 052-style PISO with `Q<=r(3)` outside the edge gate) miss
+            // their first load.
+            _engine = new DeltaCycleEngine();
+            _engine.Initialize(allSignals, arch.Tasks);
+
+            // Apply clock initial states (observed as a real transition)
             foreach (var clk in config.Clocks)
             {
                 clk.Signal.Value = clk.InitialHigh ? "1" : "0";
@@ -110,9 +142,10 @@ public class SimulationRunner : IDisposable
                 stim.Signal.Value = stim.Value;
             }
 
-            // Create and initialize the delta cycle engine
-            _engine = new DeltaCycleEngine();
-            _engine.Initialize(allSignals, arch.Tasks);
+            // Phase B: expose the engine to subscribers (Editor's Replay tab
+            // uses this to wire pause / resume / step buttons to the engine).
+            // Fired AFTER Initialize so subscribers see a fully-formed engine.
+            OnEngineReady?.Invoke(_engine);
 
             // (t=0 is already recorded by DeltaCycleEngine.Initialize via
             // SignalHistory.RegisterSignals with recordInitial:true; no need

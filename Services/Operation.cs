@@ -61,12 +61,53 @@ public class Operation : IOperation {
     public string RawData => _rawData;
 
     /// <summary>
+    /// Phase B+ Deep AST (2026-05-19): 1-based source-line number captured
+    /// at parse time. Zero means "unknown" (synthetic operations, legacy
+    /// construction paths). Plumbed through <see cref="ScheduledOperation"/>
+    /// into the <c>SignalScheduler</c> so each signal transition carries
+    /// the line of the statement that caused it — used by the live replay
+    /// to highlight only the firing branch, not every assignment to the
+    /// signal across the source file.
+    /// </summary>
+    public int SourceLine { get; set; }
+
+    /// <summary>
+    /// When the assignment target is an indexed element of a vector signal
+    /// (e.g. <c>output(0) &lt;= …</c>), this is the integer index. Null for
+    /// whole-signal assignments. Only literal-integer indices are supported
+    /// for now — runtime/variable indices fall through to a parse failure.
+    /// Bench Phase E bug #5 fix (2026-06-03).
+    /// </summary>
+    public int? ResultBitIndex { get; set; }
+
+    /// <summary>
+    /// Nanosecond inertial-delay captured from `after N <unit>` clauses on
+    /// the RHS of a signal assignment. 0 means "no delay" (the default).
+    /// `ScheduledOperation.Execute` routes through
+    /// `SignalScheduler.ScheduleAfter` when this is set. Bench bug #8.
+    /// </summary>
+    public long AfterDelayNs { get; set; }
+
+    /// <summary>
+    /// True for variable assignments (<c>:=</c>) inside a process body.
+    /// VHDL variable semantics require immediate update visible to the
+    /// next statement (within the same delta cycle), unlike signal
+    /// assignments (<c>&lt;=</c>) which are scheduled to a later delta.
+    /// `ScheduledOperation.Execute` writes the result directly to
+    /// <see cref="Result.Value"/> when this is true rather than queuing
+    /// through `SignalScheduler.Schedule`. Bug #14 follow-up.
+    /// </summary>
+    public bool IsVariableAssignment { get; private set; }
+
+    /// <summary>
     /// Initializes a new instance of the <see cref="Operation"/> class.
     /// </summary>
     /// <param name="RawData">The raw data of the operation.</param>
     /// <param name="Variables">The variables of the operation.</param>
-    public Operation(string RawData, HashSet<Variable> Variables)
+    /// <param name="sourceLine">Optional 1-based source line; 0 = unknown.</param>
+    public Operation(string RawData, HashSet<Variable> Variables, int sourceLine = 0)
     {
+        SourceLine = sourceLine;
         this.Variables = Variables;
         _rawData = RawData;
         Tokenizer tokenizer = new(string.Empty);
@@ -74,6 +115,7 @@ public class Operation : IOperation {
         // v0.16.1: Support both signal assignment (<=) and variable assignment (:=)
         bool isSignalAssignment = RawData.Contains("<=");
         bool isVariableAssignment = RawData.Contains(":=");
+        IsVariableAssignment = isVariableAssignment && !isSignalAssignment;
 
         if (isSignalAssignment || isVariableAssignment)
         {
@@ -84,9 +126,25 @@ public class Operation : IOperation {
             if (splitted.Length >= 2)
             {
                 string varName = splitted[0].Trim();
+
+                // Indexed-target detection: `output(0)` or `output ( 0 )` →
+                // base name "output", ResultBitIndex 0. Bench bug #5.
+                int? bitIndex = null;
+                string baseName = varName;
+                {
+                    var m = System.Text.RegularExpressions.Regex.Match(
+                        varName, @"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*(\d+)\s*\)\s*$");
+                    if (m.Success)
+                    {
+                        baseName = m.Groups[1].Value;
+                        if (int.TryParse(m.Groups[2].Value, out int parsedIdx))
+                            bitIndex = parsedIdx;
+                    }
+                }
                 var foundVar = this.Variables.Where(p => !ReferenceEquals(p, null)).FirstOrDefault(p =>
                     !string.IsNullOrEmpty(p.Name) &&
-                    p.Name.Equals(varName, StringComparison.OrdinalIgnoreCase));
+                    p.Name.Equals(baseName, StringComparison.OrdinalIgnoreCase));
+                if (foundVar != null) ResultBitIndex = bitIndex;
 
                 if (ReferenceEquals(foundVar, null))
                 {
@@ -160,6 +218,15 @@ public class Operation : IOperation {
             else if(item is Models.DeferredFunction deferredFunc){
                 var result = deferredFunc.Evaluate();
                 variables.Push(result);
+            }
+            // Bench bug #5 sub-cause D: indexed vector reads re-read live.
+            else if(item is Models.DeferredIndex deferredIdx){
+                variables.Push(deferredIdx.Evaluate());
+            }
+            // Bug #14: runtime-variable index — read the index variable's
+            // current value at evaluation time, then extract the source bit.
+            else if(item is Models.DynamicIndex dynIdx){
+                variables.Push(dynIdx.Evaluate());
             }
             else if(item is Operator op){
                 // Only treat as unary NOT if it's actually a logic operation with NOT precedence
@@ -238,16 +305,40 @@ public class Operation : IOperation {
                 continue;
             }
 
-            // Skip 'after' timing clause (not implemented for simulation)
-            // Format: signal <= value after TIME UNIT;
+            // `after N <unit>` inertial delay. Capture the delay (in ns)
+            // onto the Operation so `ScheduledOperation.Execute` can route
+            // through `SignalScheduler.ScheduleAfter`. The RHS expression
+            // before the `after` keyword is what we'll evaluate at apply
+            // time; everything from `after` onward is metadata.
+            // Bench Phase E bug #8 fix (2026-06-03).
             if (currentItem.ToLower() == "after")
             {
-                // Skip 'after', time value, and time unit
                 _currentSyntetizeIndex++; // skip 'after'
-                if (_currentSyntetizeIndex < _data.Length)
-                    _currentSyntetizeIndex++; // skip time value
-                if (_currentSyntetizeIndex < _data.Length && IsTimeUnit(_data[_currentSyntetizeIndex]))
-                    _currentSyntetizeIndex++; // skip time unit
+                long delayNs = 0;
+                if (_currentSyntetizeIndex < _data.Length &&
+                    long.TryParse(_data[_currentSyntetizeIndex], out long value))
+                {
+                    _currentSyntetizeIndex++;
+                    if (_currentSyntetizeIndex < _data.Length && IsTimeUnit(_data[_currentSyntetizeIndex]))
+                    {
+                        string unit = _data[_currentSyntetizeIndex].ToLower();
+                        _currentSyntetizeIndex++;
+                        AfterDelayNs = unit switch
+                        {
+                            "fs" => value / 1_000_000L,
+                            "ps" => value / 1_000L,
+                            "ns" => value,
+                            "us" => value * 1_000L,
+                            "ms" => value * 1_000_000L,
+                            "sec" or "s" => value * 1_000_000_000L,
+                            _ => value,
+                        };
+                    }
+                    else
+                    {
+                        AfterDelayNs = value; // assume ns when unit is missing
+                    }
+                }
                 continue;
             }
 
@@ -397,13 +488,25 @@ public class Operation : IOperation {
                     variable = Variables.First(p => p.Name.ToLower().Equals(currentItem.ToLower()));
                 }
 
-                // Check for array/vector element access: var(index)
+                // Check for array/vector element access: var(index). Use
+                // the deferred form so the bit is re-read at expression
+                // evaluation time rather than frozen at parse time.
+                // Bench Phase F bug #5 sub-cause D fix.
                 if (_currentSyntetizeIndex + 1 < _data.Length && _data[_currentSyntetizeIndex + 1] == "(")
                 {
-                    var indexedAccess = ParseIndexedAccess(variable);
-                    if (indexedAccess.success)
+                    _pendingDynamicIndexSource = null;
+                    _pendingDynamicIndexVar = null;
+                    var idx = ParseIndexedAccessDeferred(variable);
+                    if (idx.success)
                     {
-                        items.Add(indexedAccess.variable);
+                        items.Add(idx.deferred!);
+                        continue;
+                    }
+                    if (_pendingDynamicIndexSource != null && _pendingDynamicIndexVar != null)
+                    {
+                        items.Add(new Models.DynamicIndex(_pendingDynamicIndexSource, _pendingDynamicIndexVar));
+                        _pendingDynamicIndexSource = null;
+                        _pendingDynamicIndexVar = null;
                         continue;
                     }
                 }
@@ -812,13 +915,30 @@ public class Operation : IOperation {
     /// </summary>
     /// <param name="variable">The variable being indexed.</param>
     /// <returns>Tuple indicating success and the resulting indexed variable.</returns>
+    // Backward-compatible Variable-returning wrapper used by call sites
+    // that don't care about evaluation timing. Internally promotes to the
+    // deferred path so the value re-reads at execution time.
     private (bool success, Variable variable) ParseIndexedAccess(Variable variable)
+    {
+        var deferred = ParseIndexedAccessDeferred(variable);
+        if (!deferred.success) return (false, null!);
+        return (true, deferred.deferred!.Evaluate());
+    }
+
+    /// <summary>
+    /// Parses `name(N)` or `name(H downto L)` and returns a
+    /// <see cref="Models.DeferredIndex"/> that re-reads the source variable's
+    /// bits each time the containing expression is evaluated. The legacy
+    /// <see cref="ParseIndexedAccess"/> entry point still resolves
+    /// immediately for non-engine callers (e.g. tests).
+    /// </summary>
+    private (bool success, Models.DeferredIndex? deferred) ParseIndexedAccessDeferred(Variable variable)
     {
         // Skip the variable name (already processed), move to "("
         _currentSyntetizeIndex++;
 
         if (_currentSyntetizeIndex >= _data.Length || _data[_currentSyntetizeIndex] != "(")
-            return (false, null!);
+            return (false, null);
 
         _currentSyntetizeIndex++; // skip "("
 
@@ -853,14 +973,6 @@ public class Operation : IOperation {
                 {
                     startIndex = idx;
                 }
-                else if (Variables.Contains(expr))
-                {
-                    var idxVar = Variables.First(p => p.Name.ToLower().Equals(expr.ToLower()));
-                    if (int.TryParse(idxVar.Value?.ToString(), out idx))
-                    {
-                        startIndex = idx;
-                    }
-                }
                 else if (expr.Contains("-") || expr.Contains("+") || expr.Contains("*") || expr.Contains("/"))
                 {
                     // It's an arithmetic expression
@@ -878,6 +990,27 @@ public class Operation : IOperation {
                         }
                     }
                     catch { /* ignore errors */ }
+                }
+                else if (!expr.Contains(' '))
+                {
+                    // Bug #14: runtime-variable index. Only fires when the
+                    // index is a single identifier referring to an INTEGER
+                    // variable in scope (typically a for-loop counter).
+                    var candidate = Variables.FirstOrDefault(v =>
+                        v != null && !string.IsNullOrEmpty(v.Name) &&
+                        v.Name.Equals(expr, StringComparison.OrdinalIgnoreCase));
+                    if (candidate != null && candidate.Type == Constants.DATATYPES.INTEGER)
+                    {
+                        _pendingDynamicIndexSource = variable;
+                        _pendingDynamicIndexVar = candidate;
+                        // Swallow remaining tokens up to and including ')'
+                        // so the outer Syntetize stream stays aligned.
+                        while (_currentSyntetizeIndex < _data.Length && _data[_currentSyntetizeIndex] != ")")
+                            _currentSyntetizeIndex++;
+                        if (_currentSyntetizeIndex < _data.Length && _data[_currentSyntetizeIndex] == ")")
+                            _currentSyntetizeIndex++;
+                        return (false, null);
+                    }
                 }
             }
         }
@@ -914,63 +1047,29 @@ public class Operation : IOperation {
             _currentSyntetizeIndex++;
         }
 
-        // Extract the value from the vector
-        string vectorValue = variable.Value?.ToString() ?? "";
-        object resultValue;
-        Constants.DATATYPES resultType;
-
-        if (isDownto || isTo)
+        // Build a DeferredIndex so the bits are re-read from the source
+        // variable each time the containing expression evaluates. Bench
+        // Phase F bug #5 sub-cause D fix.
+        bool isSlice = isDownto || isTo;
+        int high, low;
+        if (isSlice)
         {
-            // Range access - extract a slice
-            int high = isDownto ? startIndex : endIndex;
-            int low = isDownto ? endIndex : startIndex;
-            int sliceLength = high - low + 1;
-
-            if (vectorValue.Length > 0)
-            {
-                // Vector is stored MSB first, so index from the left
-                int startPos = vectorValue.Length - 1 - high;
-                if (startPos >= 0 && startPos + sliceLength <= vectorValue.Length)
-                {
-                    resultValue = vectorValue.Substring(startPos, sliceLength);
-                }
-                else
-                {
-                    resultValue = new string('U', sliceLength);
-                }
-            }
-            else
-            {
-                resultValue = new string('U', sliceLength);
-            }
-            resultType = Constants.DATATYPES.STD_LOGIC_VECTOR;
+            high = isDownto ? startIndex : endIndex;
+            low  = isDownto ? endIndex   : startIndex;
         }
         else
         {
-            // Single element access
-            if (startIndex >= 0 && vectorValue.Length > 0)
-            {
-                // Vector is stored MSB first, so index from the right
-                int pos = vectorValue.Length - 1 - startIndex;
-                if (pos >= 0 && pos < vectorValue.Length)
-                {
-                    resultValue = vectorValue[pos].ToString();
-                }
-                else
-                {
-                    resultValue = "U";
-                }
-            }
-            else
-            {
-                resultValue = "U";
-            }
-            resultType = Constants.DATATYPES.STD_LOGIC;
+            high = startIndex;
+            low  = startIndex;
         }
-
-        var resultVar = new Variable($"{variable.Name}_idx_{startIndex}", resultValue, resultType);
-        resultVar.PortType = Constants.PortType.OUT;
-
-        return (true, resultVar);
+        if (startIndex < 0) return (false, null);
+        return (true, new Models.DeferredIndex(variable, high, low, isSlice));
     }
+
+    // Bug #14 side-channel: ParseIndexedAccessDeferred writes the source +
+    // index Variable pair here when it detects a runtime-variable index;
+    // Syntetize() reads + clears them right after the call to install a
+    // DynamicIndex operand instead of a frozen DeferredIndex.
+    private Variable? _pendingDynamicIndexSource;
+    private Variable? _pendingDynamicIndexVar;
 }

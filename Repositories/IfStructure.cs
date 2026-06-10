@@ -27,6 +27,14 @@ public class IfBranch
     /// Gets or sets whether this is an else branch (no condition).
     /// </summary>
     public bool IsElse { get; set; } = false;
+
+    /// <summary>
+    /// 1-based source line of the <c>if</c> / <c>elsif</c> keyword for this
+    /// branch (#5). Lets the live engine emit a condition-evaluation signal
+    /// tagged with the line so a breakpoint dropped on the condition pauses
+    /// when the branch is taken. Zero means unknown.
+    /// </summary>
+    public int ConditionLine { get; set; }
 }
 
 /// <summary>
@@ -163,9 +171,10 @@ public class IfStructure : ISControl
     /// </summary>
     private void SyntetizeIfBranch()
     {
+        int condLine = _streamer.Current?.Line ?? 0; // line of 'if' keyword (#5)
         _streamer.Expect(KEYWORDS); // consume 'if'
 
-        var branch = new IfBranch();
+        var branch = new IfBranch { ConditionLine = condLine };
 
         // Parse condition (up to 'then')
         var rawDataBuilder = new StringBuilder();
@@ -190,9 +199,10 @@ public class IfStructure : ISControl
     /// </summary>
     private void SyntetizeElsifBranch()
     {
+        int condLine = _streamer.Current?.Line ?? 0; // line of 'elsif' keyword (#5)
         _streamer.Expect(KEYWORDS); // consume 'elsif'
 
-        var branch = new IfBranch();
+        var branch = new IfBranch { ConditionLine = condLine };
 
         // Parse condition (up to 'then')
         var rawDataBuilder = new StringBuilder();
@@ -362,6 +372,12 @@ public class IfStructure : ISControl
     /// <param name="branch">The branch to add the parsed assignment to.</param>
     private void SyntetizeAssingation(IfBranch branch)
     {
+        // Phase B+ Deep AST (follow-up 2026-05-19): capture the line of the
+        // assignment's LHS token before the streamer consumes it. Works for
+        // every `sig <= …` inside an if/elsif/else branch, which was the
+        // biggest pedagogical gap of the first AST pass.
+        int assignLine = _streamer.Current?.Line ?? 0;
+
         var rawDataBuilder = new StringBuilder();
         int iterations = 0;
         const int maxIterations = 1000;
@@ -384,7 +400,7 @@ public class IfStructure : ISControl
         switch (type)
         {
             case OperationType.ASSIGNATION:
-                Operation op = new(operation, _variables);
+                Operation op = new(operation, _variables, sourceLine: assignLine);
                 branch.Tasks.Add(op);
                 break;
         }

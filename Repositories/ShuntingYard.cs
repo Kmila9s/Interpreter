@@ -31,9 +31,12 @@ public class ShuntingYard {
     /// </summary>
     private void OrderPrecedenceList(){
         foreach (var item in _items){
-            // Operands (variables and deferred functions) go directly to output
-            // v0.17.0: Also handle DeferredFunction like Variable (it's an operand)
-            if(item is Variable || item is Models.DeferredFunction) Result.Add(item);
+            // Operands (variables, deferred functions, and deferred indexed
+            // reads) go directly to output. v0.17.0 added DeferredFunction
+            // (for rising_edge / falling_edge); bench Phase F bug #5 sub-cause D
+            // added DeferredIndex (for `signal(N)` RHS reads that must be
+            // re-evaluated each delta against live signal values).
+            if(item is Variable || item is Models.DeferredFunction || item is Models.DeferredIndex || item is Models.DynamicIndex) Result.Add(item);
             else if(item is Operator operation ){
                 // Left parenthesis: push onto operator stack
                 if(operation.OperatorName == "(")

@@ -110,9 +110,56 @@ public class DeltaCycleEngine : IDisposable
     public event Action<ulong>? OnTimeAdvance;
 
     /// <summary>
+    /// Phase B (2026-05-19): live-replay frame event. Fires once per delta
+    /// cycle with the tick, delta number, and the set of signals whose value
+    /// just settled. Distinct from <see cref="OnDeltaCycleComplete"/> in that
+    /// it carries the changed-signal payload directly — the UI side doesn't
+    /// have to re-query the scheduler. Subscribers should treat the
+    /// collection as immutable and snapshot what they need immediately.
+    /// </summary>
+    public event Action<FrameEmittedArgs>? OnFrameEmitted;
+
+    /// <summary>
+    /// #5 (2026-05-27): fires when a non-sequential branch is taken at
+    /// runtime — an <c>if</c>/<c>elsif</c> condition that evaluated true, or a
+    /// <c>case</c> <c>when</c> arm that matched — carrying the 1-based source
+    /// line of that condition/arm. Lets the live-replay layer pause on a
+    /// breakpoint set on a condition line, which the signal-transition path
+    /// (<see cref="OnFrameEmitted"/>) can't catch because no signal changes on
+    /// the condition itself. Zero line means the parser didn't capture it.
+    /// </summary>
+    public event Action<int>? OnConditionEvaluated;
+
+    /// <summary>
+    /// True while the engine is in cooperative-paused state. Distinct from
+    /// <see cref="IsRunning"/>'s legacy semantics — exposed so the UI can
+    /// reflect pause state without re-deriving it from the timer.
+    /// </summary>
+    public bool IsPaused => !_isRunning;
+
+    /// <summary>
+    /// True while the simulation loop is alive (engine constructed + not yet
+    /// stopped). Mainly useful for UI bindings that want to gray out the
+    /// transport when no run is active.
+    /// </summary>
+    public bool IsRunning => _isRunning && !_cts.IsCancellationRequested;
+
+    /// <summary>
     /// Gets the signal scheduler for external access.
     /// </summary>
     public SignalScheduler SignalScheduler => _signalScheduler;
+
+    /// <summary>
+    /// Tick resolution in nanoseconds. Forwarded to `SignalScheduler` so
+    /// `after N ns` assignments convert to the right future-tick offset.
+    /// Default 10 (matching `TimeClock.NS_PER_TICK`); update before
+    /// running for sub-10ns sims. Bench bug #8.
+    /// </summary>
+    public int TickResolutionNs
+    {
+        get => _signalScheduler.TickResolutionNs;
+        set => _signalScheduler.TickResolutionNs = value;
+    }
 
     /// <summary>
     /// Gets the process scheduler for external access.
@@ -290,13 +337,16 @@ public class DeltaCycleEngine : IDisposable
             }
         }
 
-        // 4. Apply all scheduled updates
-        var changedSignals = _signalScheduler.ApplyCurrentUpdates();
+        // 4. Apply all scheduled updates. Phase B+ Deep AST: use the
+        //    line-aware variant so each change carries the 1-based source
+        //    line of the operation that drove it (0 = unknown).
+        var changedWithLines = _signalScheduler.ApplyCurrentUpdatesWithLines();
+        var changedSignals = new HashSet<Variable>(changedWithLines.Keys);
 
-        // 5. Record signal changes in history
+        // 5. Record signal changes in history with source-line metadata.
         // Time moment = tick * 1000 + delta (allows for up to 1000 delta cycles per tick)
         int timeMoment = (int)(_currentTick * 1000) + _currentDelta;
-        _signalHistory.RecordChanges(changedSignals, timeMoment);
+        _signalHistory.RecordChangesWithLines(changedWithLines, timeMoment);
 
         // 6. Fire signal change events
         foreach (var signal in changedSignals)
@@ -307,14 +357,39 @@ public class DeltaCycleEngine : IDisposable
         // 7. Fire delta cycle complete event
         OnDeltaCycleComplete?.Invoke(_currentTick, _currentDelta);
 
+        // Phase B: emit a single per-frame event the UI can subscribe to for
+        // live replay. Fires after the signal-change burst so subscribers see
+        // the post-delta state. Snapshots the changed-signals collection so
+        // the caller can safely retain it across awaits. Phase B+ Deep AST:
+        // also carries the per-signal source-line map.
+        if (OnFrameEmitted != null)
+        {
+            var snapshot = new List<Variable>(changedSignals);
+            var linesCopy = new Dictionary<Variable, int>(changedWithLines);
+            OnFrameEmitted.Invoke(new FrameEmittedArgs(_currentTick, _currentDelta, snapshot, linesCopy));
+        }
+
         // 8. Notify process scheduler of changed signals
         if (changedSignals.Count > 0)
         {
             _processScheduler.NotifySignalChanges(changedSignals);
         }
 
-        // Return true if there's more work to do
-        return _processScheduler.HasPendingProcesses || _signalScheduler.HasPendingUpdates;
+        // Return true if there's more work to do.
+        //
+        // Including `changedSignals.Count > 0` is load-bearing: concurrent
+        // signal assignments (the items in `_concurrentTasks`) re-evaluate
+        // unconditionally each delta cycle, but the previous exit condition
+        // only checked pending processes/schedule. That meant `cout <= cnt`
+        // computed against the OLD cnt at delta 0 and never got a chance to
+        // re-fire with the new cnt within the same tick — Kmila ended up
+        // emitting the cout update one whole tick later than GHDL.
+        // Counter case 003 exposed this; MAX_DELTA_CYCLES still caps
+        // combinational-loop runaways.
+        // Bench Phase E bug #7 fix (2026-06-02).
+        return _processScheduler.HasPendingProcesses
+            || _signalScheduler.HasPendingUpdates
+            || changedSignals.Count > 0;
     }
 
     /// <summary>
@@ -365,6 +440,19 @@ public class DeltaCycleEngine : IDisposable
         {
             await ExecuteSimpleLoopWithSchedulingAsync(simpleLoop);
         }
+        else if (control is Interpreter.Repositories.SelectedAssignment selAssign)
+        {
+            // `with…select` writes to its target through the scheduler so
+            // the change lands in SignalHistory and respects delta cycles.
+            // Bench Phase E bug #4 fix.
+            await selAssign.ExecuteAsync(_signalScheduler);
+        }
+        else if (control is Interpreter.Repositories.ConditionalAssignment condAssign)
+        {
+            // `value when cond else …` routes through the scheduler too.
+            // Bench Phase E bug #10 fix.
+            await condAssign.ExecuteAsync(_signalScheduler);
+        }
         else
         {
             // Fallback: execute normally (may not have proper scheduling)
@@ -404,6 +492,9 @@ public class DeltaCycleEngine : IDisposable
                 var result = branch.Condition.Execute() as Variable;
                 if (result?.Value is bool condition && condition)
                 {
+                    // #5: branch taken — let breakpoint consumers pause on the
+                    // condition's source line.
+                    OnConditionEvaluated?.Invoke(branch.ConditionLine);
                     foreach (var task in branch.Tasks)
                     {
                         if (task is Operation op)
@@ -463,6 +554,9 @@ public class DeltaCycleEngine : IDisposable
 
         if (matchingBranch != null)
         {
+            // #5: arm selected — let breakpoint consumers pause on the
+            // when-arm's source line.
+            OnConditionEvaluated?.Invoke(matchingBranch.ConditionLine);
             foreach (var task in matchingBranch.Tasks)
             {
                 if (task is Operation op)
@@ -488,8 +582,12 @@ public class DeltaCycleEngine : IDisposable
         bool isDescending = !forLoop.IsAscending;
         int step = isDescending ? -1 : 1;
 
-        // Create loop variable
-        Variable loopVar = new(forLoop.LoopVariableName, start.ToString(), Parser.Models.Constants.DATATYPES.INTEGER);
+        // Bug #14: reuse the synth-time loop Variable instance (the same
+        // one DynamicIndex captured as IndexSource). A fresh copy here
+        // would leave body operations reading a stale "0" while we update
+        // a different Variable.
+        Variable loopVar = forLoop.LoopVar ??
+            new Variable(forLoop.LoopVariableName, start.ToString(), Parser.Models.Constants.DATATYPES.INTEGER);
 
         for (int i = start; isDescending ? i >= end : i <= end; i += step)
         {
@@ -697,6 +795,48 @@ public class DeltaCycleEngine : IDisposable
     }
 
     /// <summary>
+    /// Phase B (2026-05-19): cooperative pause. Blocks the engine before its
+    /// next process / scheduled-op execution until <see cref="Resume"/> is
+    /// called. Independent of the TimeMachine wiring (still honoured) so
+    /// non-timer consumers can drive pause directly — used by the Editor's
+    /// live-replay tab so the user can scrub mid-run.
+    /// </summary>
+    public void Pause() => _isRunning = false;
+
+    /// <summary>
+    /// Phase B (2026-05-19): cooperative resume — cancels the inner pause
+    /// gate so any <see cref="WaitForResumeAsync"/> in flight returns and
+    /// the engine continues from the next process step.
+    /// </summary>
+    public void Resume()
+    {
+        _isRunning = true;
+        _pauseCts.Cancel();
+        _pauseCts = new CancellationTokenSource();
+    }
+
+    /// <summary>
+    /// Phase B (2026-05-19): step-one-delta helper. Briefly resumes the
+    /// engine, lets exactly one frame fire (subscribed via
+    /// <see cref="OnFrameEmitted"/>), then re-pauses. Intended for use from
+    /// a paused state — callers should already have invoked <see cref="Pause"/>.
+    /// </summary>
+    public void StepOneDelta()
+    {
+        if (!_isRunning)
+        {
+            // The on-frame-emitted callback below re-pauses after one delta.
+            void OnceHandler(FrameEmittedArgs _)
+            {
+                OnFrameEmitted -= OnceHandler;
+                _isRunning = false;
+            }
+            OnFrameEmitted += OnceHandler;
+            Resume();
+        }
+    }
+
+    /// <summary>
     /// Resets the engine for a new simulation.
     /// </summary>
     public void Reset()
@@ -729,5 +869,37 @@ public class DeltaCycleEngine : IDisposable
 
         _cts.Dispose();
         _pauseCts.Dispose();
+    }
+}
+
+/// <summary>
+/// Phase B (2026-05-19): payload carried by <see cref="DeltaCycleEngine.OnFrameEmitted"/>.
+/// Snapshot of one delta cycle for live-replay consumers. The
+/// <see cref="ChangedSignals"/> list is a defensive copy — safe to retain
+/// across awaits even while the engine pushes more frames.
+/// </summary>
+public sealed class FrameEmittedArgs
+{
+    public ulong Tick { get; }
+    public int Delta { get; }
+    public IReadOnlyList<Variable> ChangedSignals { get; }
+
+    /// <summary>
+    /// Phase B+ Deep AST (2026-05-19): per-signal 1-based source line of the
+    /// operation that produced each change in this delta. Keys are the same
+    /// references as <see cref="ChangedSignals"/>; values are 0 when the
+    /// driving operation has no captured source line (synthetic ops, legacy
+    /// construction paths). Subscribers can use this to highlight only the
+    /// firing branch instead of every assignment statement.
+    /// </summary>
+    public IReadOnlyDictionary<Variable, int> SourceLines { get; }
+
+    public FrameEmittedArgs(ulong tick, int delta, IReadOnlyList<Variable> changed,
+        IReadOnlyDictionary<Variable, int>? sourceLines = null)
+    {
+        Tick = tick;
+        Delta = delta;
+        ChangedSignals = changed;
+        SourceLines = sourceLines ?? new Dictionary<Variable, int>();
     }
 }

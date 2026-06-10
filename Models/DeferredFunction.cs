@@ -98,6 +98,17 @@ public class DeferredFunction
         );
         resultVar.PortType = PortType.OUT;
 
+        // Populate Size from the result string for vector types. Without
+        // this, `Operator.SolveArithOperation`'s vector-arithmetic path
+        // computed `width = Math.Max(1, 0) = 1` and returned a scalar,
+        // collapsing `resize(unsigned(a), 9) + …` to a single bit.
+        // Bench Phase F bug #12 fix (2026-06-05).
+        if (ResultType == Constants.DATATYPES.STD_LOGIC_VECTOR &&
+            resultValue is string s && s.Length > 0)
+        {
+            resultVar.Size = s.Length;
+        }
+
         return resultVar;
     }
 

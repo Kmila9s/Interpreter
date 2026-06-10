@@ -16,6 +16,19 @@ public class SignalHistory
     private readonly Dictionary<Variable, List<Tuple<int, object>>> _history = new();
 
     /// <summary>
+    /// Phase B+ Deep AST (2026-05-19): parallel list of 1-based source
+    /// lines for each transition in <see cref="_history"/>. Indexed
+    /// identically: <c>_sourceLines[signal][i]</c> is the line of the
+    /// operation that produced <c>_history[signal][i]</c>. Zero means
+    /// unknown (synthetic / legacy paths). Kept separate from
+    /// <see cref="_history"/> so the existing consumers
+    /// (<see cref="GetSignalHistory"/>, <see cref="ReadSince"/>, …) keep
+    /// their tuple shape and only the new <see cref="GetSignalHistoryDetailed"/>
+    /// reaches in.
+    /// </summary>
+    private readonly Dictionary<Variable, List<int>> _sourceLines = new();
+
+    /// <summary>
     /// Lock for thread safety.
     /// </summary>
     private readonly object _lock = new();
@@ -56,10 +69,12 @@ public class SignalHistory
             if (!_history.ContainsKey(signal))
             {
                 _history[signal] = new List<Tuple<int, object>>();
+                _sourceLines[signal] = new List<int>();
 
                 if (recordInitial)
                 {
                     _history[signal].Add(Tuple.Create(initialTime, signal.Value));
+                    _sourceLines[signal].Add(0); // initial value has no source line
                 }
             }
         }
@@ -87,6 +102,16 @@ public class SignalHistory
     /// <param name="value">The new value.</param>
     public void RecordChange(Variable signal, int timeMoment, object value)
     {
+        RecordChange(signal, timeMoment, value, sourceLine: 0);
+    }
+
+    /// <summary>
+    /// Phase B+ Deep AST (2026-05-19): records a value change with the
+    /// 1-based source line of the operation that produced it. <c>sourceLine
+    /// = 0</c> means unknown; the back-compat overload above forwards 0.
+    /// </summary>
+    public void RecordChange(Variable signal, int timeMoment, object value, int sourceLine)
+    {
         if (!IsRecording) return;
 
         lock (_lock)
@@ -94,9 +119,11 @@ public class SignalHistory
             if (!_history.ContainsKey(signal))
             {
                 _history[signal] = new List<Tuple<int, object>>();
+                _sourceLines[signal] = new List<int>();
             }
 
             _history[signal].Add(Tuple.Create(timeMoment, value));
+            _sourceLines[signal].Add(sourceLine);
         }
     }
 
@@ -120,6 +147,43 @@ public class SignalHistory
         foreach (var signal in signals)
         {
             RecordCurrentValue(signal, timeMoment);
+        }
+    }
+
+    /// <summary>
+    /// Phase B+ Deep AST: per-signal recording with source-line tagging.
+    /// Each entry's value is taken from the live <see cref="Variable.Value"/>
+    /// (matching <see cref="RecordCurrentValue"/>); the line comes from the
+    /// dictionary value. Used by <see cref="DeltaCycleEngine"/> after each
+    /// delta when it knows which operation produced each change.
+    /// </summary>
+    public void RecordChangesWithLines(IReadOnlyDictionary<Variable, int> signalsWithLines, int timeMoment)
+    {
+        foreach (var kv in signalsWithLines)
+        {
+            RecordChange(kv.Key, timeMoment, kv.Key.Value, kv.Value);
+        }
+    }
+
+    /// <summary>
+    /// Phase B+ Deep AST: returns (time, value, sourceLine) triples for the
+    /// signal. Tuples share the same indexing as <see cref="GetSignalHistory"/>,
+    /// extended with the source-line column. Returns an empty list when the
+    /// signal isn't tracked.
+    /// </summary>
+    public List<(int TimeMoment, object Value, int SourceLine)> GetSignalHistoryDetailed(Variable signal)
+    {
+        lock (_lock)
+        {
+            if (!_history.TryGetValue(signal, out var hist)) return new();
+            _sourceLines.TryGetValue(signal, out var lines);
+            var result = new List<(int, object, int)>(hist.Count);
+            for (int i = 0; i < hist.Count; i++)
+            {
+                int line = (lines != null && i < lines.Count) ? lines[i] : 0;
+                result.Add((hist[i].Item1, hist[i].Item2, line));
+            }
+            return result;
         }
     }
 
@@ -302,6 +366,7 @@ public class SignalHistory
         lock (_lock)
         {
             _history.Clear();
+            _sourceLines.Clear();
         }
     }
 
@@ -315,6 +380,7 @@ public class SignalHistory
             foreach (var key in _history.Keys)
             {
                 _history[key].Clear();
+                if (_sourceLines.TryGetValue(key, out var lines)) lines.Clear();
             }
         }
     }
@@ -408,7 +474,12 @@ public class SignalHistory
             sb.AppendLine("   VHDL Interpreter v0.17.0");
             sb.AppendLine("$end");
             sb.AppendLine("$timescale");
-            sb.AppendLine($"   {timescaleNs}ns");
+            // Body times are emitted as `time * timescaleNs` where `time`
+            // is the engine's `tick * 1000 + delta` counter, so each
+            // `vcdTime` unit is one picosecond regardless of `timescaleNs`.
+            // The earlier `{timescaleNs}ns` header was 1000× off and made
+            // GHDL-vs-Kmila diffs nonsensical (bench Phase D).
+            sb.AppendLine("   1ps");
             sb.AppendLine("$end");
 
             // Variable definitions

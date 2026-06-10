@@ -283,6 +283,7 @@ class Program
         failures += Tests.IEEELoweringEndToEndTests.RunAllTests();
         failures += Tests.NestedIEEECallTests.RunAllTests();
         failures += Tests.PracticeExerciseTests.RunAllTests();
+        failures += Tests.PortStrictnessTests.RunAllTests();
         Environment.ExitCode = failures;
     }
 

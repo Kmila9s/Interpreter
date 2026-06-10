@@ -310,6 +310,9 @@ public class SimpleLoopStructure : ISControl
     /// </summary>
     private void SyntetizeAssignment()
     {
+        // Phase B+ Deep AST (follow-up): capture the LHS line.
+        int assignLine = _streamer.Current?.Line ?? 0;
+
         var rawDataBuilder = new StringBuilder();
         while (_streamer.Current?.Value != ";" && !IsEndOfLoop())
         {
@@ -328,7 +331,7 @@ public class SimpleLoopStructure : ISControl
         var type = _detector.GetOperationType(operation);
         if (type == OperationType.ASSIGNATION)
         {
-            Operation op = new(operation, _variables);
+            Operation op = new(operation, _variables, sourceLine: assignLine);
             Tasks.Add(op);
         }
     }

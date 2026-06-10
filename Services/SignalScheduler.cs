@@ -11,7 +11,8 @@ namespace Interpreter.Services;
 public record SignalUpdate(
     Variable Target,
     object NewValue,
-    TimeSpan? Delay = null
+    TimeSpan? Delay = null,
+    int SourceLine = 0
 );
 
 /// <summary>
@@ -37,16 +38,82 @@ public class SignalScheduler
     private readonly object _lock = new();
 
     /// <summary>
+    /// Cached current tick + tick resolution so `after N ns` assignments
+    /// (`ScheduledOperation` → `ScheduleAfterNs`) can compute a future
+    /// tick without having to plumb the engine state through every caller.
+    /// Updated by `AdvanceTime` and the engine's setup. Bench bug #8.
+    /// </summary>
+    private ulong _currentTick = 0;
+    private int _tickResolutionNs = 10;
+
+    public int TickResolutionNs
+    {
+        get { lock (_lock) return _tickResolutionNs; }
+        set { lock (_lock) _tickResolutionNs = Math.Max(1, value); }
+    }
+
+    /// <summary>
+    /// Pending per-bit writes for the current delta cycle, keyed by target
+    /// signal. Multiple per-bit assignments to the same vector merge here
+    /// (one entry per affected bit index) and are applied as a single
+    /// vector update at <see cref="ApplyCurrentUpdatesWithLines"/> time —
+    /// otherwise the queue's last-wins semantics would let one bit clobber
+    /// the seven others when an architecture does
+    /// <c>output(0) &lt;= …; output(1) &lt;= …; …</c>. Bench Phase E bug #5.
+    /// </summary>
+    private readonly Dictionary<Variable, Dictionary<int, (char bit, int sourceLine)>> _pendingBitWrites = new();
+
+    /// <summary>
     /// Schedules a signal update for the current delta cycle.
     /// The update will be applied when ApplyCurrentUpdates() is called.
     /// </summary>
     /// <param name="target">The target signal to update.</param>
     /// <param name="newValue">The new value to assign.</param>
-    public void Schedule(Variable target, object newValue)
+    public void Schedule(Variable target, object newValue, int sourceLine = 0)
     {
         lock (_lock)
         {
-            _currentDeltaUpdates.Enqueue(new SignalUpdate(target, newValue));
+            _currentDeltaUpdates.Enqueue(new SignalUpdate(target, newValue, null, sourceLine));
+        }
+    }
+
+    /// <summary>
+    /// Schedules a single-bit update against an element of a vector signal.
+    /// Multiple bit writes to the same target within the same delta cycle
+    /// merge per index rather than clobbering each other. Bench bug #5 fix.
+    /// </summary>
+    public void ScheduleBitWrite(Variable target, int bitIndex, char bitValue, int sourceLine = 0)
+    {
+        lock (_lock)
+        {
+            if (!_pendingBitWrites.TryGetValue(target, out var bits))
+            {
+                bits = new Dictionary<int, (char, int)>();
+                _pendingBitWrites[target] = bits;
+            }
+            bits[bitIndex] = (bitValue, sourceLine);
+        }
+    }
+
+    /// <summary>
+    /// Convenience overload: schedules an update at `currentTick +
+    /// ceil(delayNs / tickResNs)`. Tracks delay in nanoseconds rather than
+    /// `TimeSpan` so sub-100ns delays (1 ns, 10 ns) round correctly.
+    /// Bench bug #8 fix.
+    /// </summary>
+    public void ScheduleAfterNs(Variable target, object newValue, long delayNs, int sourceLine = 0)
+    {
+        lock (_lock)
+        {
+            int res = Math.Max(1, _tickResolutionNs);
+            ulong delayTicks = (ulong)Math.Max(1, (delayNs + res - 1) / res);
+            ulong futureTick = _currentTick + delayTicks;
+            if (!_futureUpdates.TryGetValue(futureTick, out var queue))
+            {
+                queue = new Queue<SignalUpdate>();
+                _futureUpdates[futureTick] = queue;
+            }
+            queue.Enqueue(new SignalUpdate(target, newValue, TimeSpan.FromTicks(delayNs * 10), sourceLine));
         }
     }
 
@@ -83,29 +150,65 @@ public class SignalScheduler
     /// <returns>Set of signals that actually changed value.</returns>
     public HashSet<Variable> ApplyCurrentUpdates()
     {
-        HashSet<Variable> changedSignals = new();
+        // Back-compat thin wrapper around ApplyCurrentUpdatesWithLines —
+        // discards the source-line map for callers that only care about
+        // which signals changed.
+        return new HashSet<Variable>(ApplyCurrentUpdatesWithLines().Keys);
+    }
 
+    /// <summary>
+    /// Phase B+ Deep AST (2026-05-19): drains the per-delta queue, returning
+    /// the signals that actually changed along with the 1-based source line
+    /// of the operation that drove each change (0 when unknown). When
+    /// multiple updates target the same signal in the same delta, the
+    /// LAST update wins for both value AND line — matches scheduler semantics.
+    /// </summary>
+    public Dictionary<Variable, int> ApplyCurrentUpdatesWithLines()
+    {
+        var changed = new Dictionary<Variable, int>();
         lock (_lock)
         {
             while (_currentDeltaUpdates.Count > 0)
             {
                 var update = _currentDeltaUpdates.Dequeue();
-
-                // Track old value for change detection
                 object? oldValue = update.Target.Value;
-
-                // Apply the update
                 update.Target.Value = update.NewValue;
-
-                // Check if value actually changed
                 if (!Equals(oldValue, update.Target.Value))
                 {
-                    changedSignals.Add(update.Target);
+                    changed[update.Target] = update.SourceLine;
                 }
             }
-        }
 
-        return changedSignals;
+            // Apply per-bit writes by splicing each pending bit into the
+            // target's current value, then committing a single merged
+            // vector. Bench bug #5 — keeps `output(0) <= …; output(1) <= …;`
+            // from clobbering each other.
+            foreach (var (target, bits) in _pendingBitWrites)
+            {
+                string current = target.Value as string ?? string.Empty;
+                int width = Math.Max(target.Size, current.Length);
+                if (width == 0) width = bits.Keys.Max() + 1;
+                if (current.Length < width) current = current.PadLeft(width, '0');
+                var chars = current.ToCharArray();
+                int lastLine = 0;
+                foreach (var (idx, val) in bits)
+                {
+                    int pos = width - 1 - idx;        // VHDL idx 0 = rightmost
+                    if (pos < 0 || pos >= chars.Length) continue;
+                    chars[pos] = val.bit;
+                    lastLine = val.sourceLine != 0 ? val.sourceLine : lastLine;
+                }
+                string merged = new string(chars);
+                object? oldValue = target.Value;
+                target.Value = merged;
+                if (!Equals(oldValue, target.Value))
+                {
+                    changed[target] = lastLine;
+                }
+            }
+            _pendingBitWrites.Clear();
+        }
+        return changed;
     }
 
     /// <summary>
@@ -117,6 +220,7 @@ public class SignalScheduler
     {
         lock (_lock)
         {
+            _currentTick = newTick;
             // v0.17.0: Avoid LINQ allocation - SortedDictionary is ordered, so we can break early
             // Also reuse a static list to avoid repeated allocations
             while (_futureUpdates.Count > 0)
@@ -144,7 +248,7 @@ public class SignalScheduler
         {
             lock (_lock)
             {
-                return _currentDeltaUpdates.Count > 0;
+                return _currentDeltaUpdates.Count > 0 || _pendingBitWrites.Count > 0;
             }
         }
     }

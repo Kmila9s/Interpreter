@@ -57,6 +57,17 @@ public class ScheduledOperation
                 var result = deferredFunc.Evaluate();
                 variables.Push(result);
             }
+            // Bench bug #5 sub-cause D: re-read indexed vector bits at
+            // expression-evaluation time so `signal(N)` reflects the live
+            // signal value, not the value at parse time.
+            else if (item is Models.DeferredIndex deferredIdx)
+            {
+                variables.Push(deferredIdx.Evaluate());
+            }
+            else if (item is Models.DynamicIndex dynIdx)
+            {
+                variables.Push(dynIdx.Evaluate());
+            }
             else if (item is Operator op)
             {
                 // Only treat as unary NOT if it's actually a logic operation with NOT precedence
@@ -100,8 +111,41 @@ public class ScheduledOperation
         // Get the computed value
         object computedValue = variables.Pop().Value;
 
-        // Schedule the update instead of applying immediately
-        _scheduler.Schedule(_operation.Result, computedValue);
+        // Indexed-target assignment (`output(0) <= …`): route through the
+        // scheduler's per-bit channel so 8 sibling per-bit writes merge
+        // instead of clobbering each other on apply. Bench bug #5 fix.
+        if (_operation.ResultBitIndex is int bitIdx)
+        {
+            string newBit = (computedValue?.ToString() ?? "0").TrimStart('\'').TrimEnd('\'').Trim();
+            char bitChar = newBit.Length > 0 ? newBit[^1] : '0';
+            _scheduler.ScheduleBitWrite(_operation.Result, bitIdx, bitChar, _operation.SourceLine);
+            return;
+        }
+
+        // `after N ns` inertial delay: route through the future-tick queue
+        // so the assignment lands at `currentTick + ceil(delay/tickResNs)`
+        // instead of the current delta. Bench bug #8 fix.
+        if (_operation.AfterDelayNs > 0)
+        {
+            _scheduler.ScheduleAfterNs(_operation.Result, computedValue, _operation.AfterDelayNs, _operation.SourceLine);
+            return;
+        }
+
+        // VHDL variable assignment (`:=`) — apply immediately so the next
+        // statement (especially the next iteration of an enclosing
+        // for-loop) reads the updated value. Scheduling these would leave
+        // `count := count + 1` reading stale `count` forever.
+        // Bug #14 follow-up.
+        if (_operation.IsVariableAssignment)
+        {
+            _operation.Result.Value = computedValue;
+            return;
+        }
+
+        // Schedule the update instead of applying immediately. The source
+        // line propagates so the delta-cycle engine can tag the change with
+        // the exact statement that produced it — Phase B+ Deep AST plumbing.
+        _scheduler.Schedule(_operation.Result, computedValue, _operation.SourceLine);
     }
 
     /// <summary>

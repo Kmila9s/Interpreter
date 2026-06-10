@@ -39,13 +39,15 @@ public class SignalAttributeHandler
     /// </summary>
     public void RegisterSignal(Variable signal)
     {
+        // Always (re)seed the per-signal state. The handler is a singleton,
+        // so without this a follow-up simulation in the same process would
+        // inherit stale state from the prior run (eg. _previousValues["clk"]
+        // = "1") and the next stimulus event would be silently swallowed.
+        // Bug #18 fix.
         string key = signal.Name;
-        if (!_previousValues.ContainsKey(key))
-        {
-            _previousValues[key] = signal.Value;
-            _activeFlags[key] = false;
-            _stableFlags[key] = true;
-        }
+        _previousValues[key] = signal.Value;
+        _activeFlags[key] = false;
+        _stableFlags[key] = true;
 
         // Subscribe to value changes
         signal.OnValueChange += OnSignalValueChange;

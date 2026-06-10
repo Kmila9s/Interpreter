@@ -134,14 +134,26 @@ public class Resources
     }
 
     /// <summary>
-    /// Finds clock signals in a process by detecting rising_edge/falling_edge calls.
+    /// Finds clock signals in a process by detecting rising_edge/falling_edge calls
+    /// anywhere in the process body, plus heuristic name matches on the sensitivity
+    /// list as a fallback for legacy designs that don't use edge functions.
     /// </summary>
     private HashSet<string> FindClockSignalsInProcess(Process process)
     {
         var clocks = new HashSet<string>();
 
-        // TODO: Scan process tasks for rising_edge(signal) or signal'event patterns
-        // For now, scan sensitivity list for common clock names
+        // Walk the body looking for `rising_edge(<sig>)` / `falling_edge(<sig>)`
+        // / `<sig>'event` patterns in any operation's raw expression text. This
+        // catches the canonical clocked-process shape even when the
+        // sensitivity list uses unconventional clock names (tick, ph0, bclk).
+        var visited = new HashSet<object>();
+        ScanTasksForClockEdges(process.Tasks, clocks, visited, depth: 0);
+
+        // Fallback heuristic: signals on the sensitivity list whose names
+        // *look* like clocks. Older textbook designs occasionally write
+        // `process(clk) begin q <= d; end process;` without an explicit edge
+        // function — keeping this match preserves the old behaviour without
+        // depending on it for modern code.
         if (process.SensitiveList != null)
         {
             foreach (var signal in process.SensitiveList)
@@ -156,6 +168,103 @@ public class Resources
         }
 
         return clocks;
+    }
+
+    /// <summary>
+    /// Recursively walks a task list looking for <c>rising_edge(sig)</c> /
+    /// <c>falling_edge(sig)</c> / <c>sig'event</c> patterns inside expression
+    /// text. The argument is added to <paramref name="clocks"/>. Defensive
+    /// against AST shape changes — reads <c>RawData</c> off any container by
+    /// duck-typing, then descends through known body collections.
+    /// </summary>
+    private void ScanTasksForClockEdges(List<object> tasks, HashSet<string> clocks, HashSet<object> visited, int depth)
+    {
+        if (depth > 100 || tasks == null) return;
+        foreach (var task in tasks)
+        {
+            if (task == null || visited.Contains(task)) continue;
+            visited.Add(task);
+
+            // Pull whatever expression text the node carries. Operation.RawData
+            // is the obvious source; IfStructure.Branches[].Condition.RawData
+            // surfaces conditions like `if rising_edge(clk) then`.
+            string? raw = TryGetRaw(task);
+            ExtractClockNamesFromExpression(raw, clocks);
+
+            // Nested structure walk. Each container with a Tasks collection
+            // (Process body, branch body, loop body) gets descended into.
+            var tasksProp = task.GetType().GetProperty("Tasks");
+            if (tasksProp?.GetValue(task) is List<object> inner)
+            {
+                ScanTasksForClockEdges(inner, clocks, visited, depth + 1);
+            }
+
+            // IfStructure / CaseStructure expose their condition+body via Branches.
+            if (task is IfStructure ifStruct && ifStruct.Branches != null)
+            {
+                foreach (var br in ifStruct.Branches)
+                {
+                    if (br == null) continue;
+                    var condRaw = TryGetRaw(br.GetType().GetProperty("Condition")?.GetValue(br));
+                    ExtractClockNamesFromExpression(condRaw, clocks);
+                    if (br.Tasks != null)
+                        ScanTasksForClockEdges(br.Tasks, clocks, visited, depth + 1);
+                }
+            }
+            else if (task is CaseStructure caseStruct && caseStruct.Branches != null)
+            {
+                foreach (var br in caseStruct.Branches)
+                {
+                    if (br?.Tasks != null)
+                        ScanTasksForClockEdges(br.Tasks, clocks, visited, depth + 1);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pulls signal names out of edge-detection idioms found inside an
+    /// expression string. Both VHDL forms are supported:
+    /// <c>rising_edge(sig)</c> / <c>falling_edge(sig)</c> and the older
+    /// <c>sig'event and sig = '1'</c> shape.
+    /// </summary>
+    private static void ExtractClockNamesFromExpression(string? raw, HashSet<string> clocks)
+    {
+        if (string.IsNullOrEmpty(raw)) return;
+        // Case-insensitive search, but we record the original casing of the
+        // signal name so downstream lookups against SensitiveList match.
+        var matches = System.Text.RegularExpressions.Regex.Matches(
+            raw,
+            @"\b(?:rising_edge|falling_edge)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        foreach (System.Text.RegularExpressions.Match m in matches)
+        {
+            if (m.Groups.Count > 1) clocks.Add(m.Groups[1].Value);
+        }
+        // sig'event pattern — extract the identifier preceding the apostrophe.
+        var eventMatches = System.Text.RegularExpressions.Regex.Matches(
+            raw,
+            @"\b([A-Za-z_][A-Za-z0-9_]*)\s*'\s*event\b",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        foreach (System.Text.RegularExpressions.Match m in eventMatches)
+        {
+            if (m.Groups.Count > 1) clocks.Add(m.Groups[1].Value);
+        }
+    }
+
+    /// <summary>
+    /// Reflectively reads a <c>RawData</c> string off any AST node. Returns
+    /// null when the property isn't present or carries a non-string value.
+    /// </summary>
+    private static string? TryGetRaw(object? node)
+    {
+        if (node == null) return null;
+        try
+        {
+            var p = node.GetType().GetProperty("RawData");
+            return p?.GetValue(node) as string;
+        }
+        catch { return null; }
     }
 
     /// <summary>
@@ -192,11 +301,18 @@ public class Resources
     }
 
     /// <summary>
-    /// Checks if a process is clocked (contains rising_edge or falling_edge).
+    /// Checks if a process is clocked. A process counts as clocked when either:
+    /// <list type="bullet">
+    ///   <item>its sensitivity list mentions a signal already recognised as a
+    ///         clock (the canonical <c>process(clk)</c> shape), or</item>
+    ///   <item>its body contains a <c>rising_edge</c> / <c>falling_edge</c> /
+    ///         <c>'event</c> expression on any signal (covers VHDL-2008
+    ///         <c>process is begin … wait until rising_edge(clk); …</c>
+    ///         shapes that omit the sensitivity list).</item>
+    /// </list>
     /// </summary>
     private bool IsClockedProcess(Process process)
     {
-        // Check sensitivity list for clock signals
         if (process.SensitiveList != null)
         {
             foreach (var sig in process.SensitiveList)
@@ -206,8 +322,12 @@ public class Resources
             }
         }
 
-        // TODO: Also scan process tasks for rising_edge/falling_edge calls
-        return false;
+        // Body scan — populates a fresh set so we can answer "does this
+        // process do edge detection?" without polluting the global
+        // ClockSignals set (CalculateClocks already did that on its own pass).
+        var probe = new HashSet<string>();
+        ScanTasksForClockEdges(process.Tasks, probe, new HashSet<object>(), depth: 0);
+        return probe.Count > 0;
     }
 
     /// <summary>
@@ -301,36 +421,137 @@ public class Resources
     }
 
     /// <summary>
-    /// Estimates DSP slice usage from multiplication and wide arithmetic operations.
-    /// Accuracy: ~80-90%
+    /// Estimates DSP slice usage by walking every <see cref="Operation"/> in
+    /// the architecture and counting multiplications + wide additions. The
+    /// cost model targets Xilinx DSP48 (most common reference shape):
+    /// <list type="bullet">
+    ///   <item><c>*</c> / <c>**</c> with operand width ≤ 18 → 1 DSP.</item>
+    ///   <item><c>*</c> with operand width > 18 → ceil(bits/18) DSPs (cascade).</item>
+    ///   <item><c>/</c> / <c>mod</c> → 1 DSP (modelled as a multiplier-equivalent).</item>
+    ///   <item><c>+</c> / <c>-</c> with result width > 48 → ceil(bits/48) DSPs.</item>
+    /// </list>
     /// </summary>
     private void CalculateDSPSlices()
     {
-        if (_entity.Architecture == null)
-            return;
-
+        if (_entity.Architecture == null) return;
         DSPSlices = 0;
+        var visited = new HashSet<object>();
+        foreach (var task in _entity.Architecture.Tasks)
+            DSPSlices += CountDspsInTask(task, visited);
+    }
 
-        // TODO: Scan all operations in architecture and processes
-        // Count: *, ** operations
-        // Count: +, - operations wider than 48 bits
-        // Detect MAC patterns: A * B + C
+    private int CountDspsInTask(object task, HashSet<object> visited)
+    {
+        if (task == null || visited.Contains(task)) return 0;
+        visited.Add(task);
+
+        int sum = 0;
+        if (task is Operation op)
+            sum += CountDspsInOperation(op);
+        else if (task is ConditionalAssignment cond)
+        {
+            int targetBits = Math.Max(1, cond.Target?.Size ?? 1);
+            var scope = _entity.Architecture!.GetAllSignals();
+            foreach (var br in cond.Branches)
+            {
+                if (!string.IsNullOrEmpty(br.ValueExpression))
+                    sum += CountDspsInExpression(br.ValueExpression, targetBits, scope);
+            }
+        }
+        else if (task is SelectedAssignment sel)
+        {
+            int targetBits = Math.Max(1, sel.Target?.Size ?? 1);
+            var scope = _entity.Architecture!.GetAllSignals();
+            foreach (var c in sel.Choices)
+            {
+                if (!string.IsNullOrEmpty(c.ValueExpression))
+                    sum += CountDspsInExpression(c.ValueExpression, targetBits, scope);
+            }
+        }
+
+        // Descend into nested bodies (process body, if/case/loop branches).
+        var tasksProp = task.GetType().GetProperty("Tasks");
+        if (tasksProp?.GetValue(task) is System.Collections.IEnumerable inner)
+            foreach (var t in inner) sum += CountDspsInTask(t, visited);
+        if (task is IfStructure ifStruct && ifStruct.Branches != null)
+            foreach (var br in ifStruct.Branches)
+                if (br?.Tasks != null)
+                    foreach (var t in br.Tasks) sum += CountDspsInTask(t, visited);
+        if (task is CaseStructure caseStruct && caseStruct.Branches != null)
+            foreach (var br in caseStruct.Branches)
+                if (br?.Tasks != null)
+                    foreach (var t in br.Tasks) sum += CountDspsInTask(t, visited);
+        return sum;
+    }
+
+    private int CountDspsInOperation(Operation op)
+    {
+        int resultBits = Math.Max(1, op.Result?.Size ?? 1);
+        int dsps = 0;
+        foreach (var item in op.Items)
+        {
+            if (item is not Operator opx) continue;
+            string name = opx.OperatorName ?? string.Empty;
+            switch (opx.OperatorType)
+            {
+                case Constants.OperatorType.ARITH_OPERATION:
+                    if (name == "*" || name == "**")
+                    {
+                        // Operand width is approximated as the result width
+                        // since both operands and result feed the same MAC
+                        // shape. Above 18 bits we cascade.
+                        dsps += Math.Max(1, (int)Math.Ceiling(resultBits / 18.0));
+                    }
+                    else if (name == "/" || name == "mod")
+                    {
+                        dsps += 1; // Synthesisers typically map / and mod onto DSPs.
+                    }
+                    else if ((name == "+" || name == "-") && resultBits > 48)
+                    {
+                        dsps += (int)Math.Ceiling(resultBits / 48.0);
+                    }
+                    break;
+            }
+        }
+        return dsps;
+    }
+
+    private int CountDspsInExpression(string expression, int targetBits, HashSet<Variable> scope)
+    {
+        try
+        {
+            var dummy = new Variable("__dsp__", "0", Constants.DATATYPES.STD_LOGIC_VECTOR, targetBits);
+            dummy.PortType = Constants.PortType.OUT;
+            var extScope = new HashSet<Variable>(scope) { dummy };
+            var op = new Operation($"__dsp__ <= {expression}", extScope);
+            return CountDspsInOperation(op);
+        }
+        catch { return 0; }
     }
 
     /// <summary>
-    /// Estimates BRAM usage from array declarations and memory patterns.
-    /// Accuracy: ~85%
+    /// Estimates BRAM blocks from declared array types in the architecture's
+    /// <see cref="TypeRegistry"/>. Total memory bits = sum over every array
+    /// type of <c>ArrayLength × ElementSize</c>; result is divided by 18 432
+    /// (the canonical Xilinx 18Kb BRAM block) and rounded up. Arrays smaller
+    /// than 1 024 bits typically infer to distributed RAM (LUT-RAM) on real
+    /// synthesisers, so we skip those — a register file shouldn't claim a
+    /// whole BRAM in the resource panel.
     /// </summary>
     private void CalculateBRAM()
     {
-        if (_entity.Architecture == null)
-            return;
-
+        if (_entity.Architecture == null) return;
         BRAMBlocks = 0;
-
-        // TODO: Scan architecture signals for array types
-        // Calculate total memory size
-        // Apply BRAM block sizing (e.g., 18Kb or 36Kb for Xilinx)
+        var arrayTypes = _entity.Architecture.CustomTypes?.GetArrayTypes();
+        if (arrayTypes == null) return;
+        const double BlockBits = 18_432.0;       // 18 Kb block
+        const int LutRamThresholdBits = 1024;    // Below this we infer distributed RAM.
+        foreach (var typ in arrayTypes)
+        {
+            int bits = typ.ArrayLength * Math.Max(1, typ.ElementSize);
+            if (bits < LutRamThresholdBits) continue;
+            BRAMBlocks += Math.Ceiling(bits / BlockBits);
+        }
     }
 
     /// <summary>
@@ -374,6 +595,15 @@ public class Resources
         if (task is Operation op)
             return CountLutsInOperation(op);
 
+        // Concurrent multi-branch assignments aren't Operations — each branch
+        // carries a separate VHDL expression that needs its own LUTs. Without
+        // this dispatch a `y <= a and b when sel='1' else c xor d` design
+        // counted as zero combinational logic.
+        if (task is ConditionalAssignment cond)
+            return CountLutsInConditionalAssignment(cond);
+        if (task is SelectedAssignment sel)
+            return CountLutsInSelectedAssignment(sel);
+
         // Discovered at parse time: Process exposes its body as
         // List&lt;object&gt; Tasks. Reflect via a duck-typed "Tasks" property so
         // we also pick up IfStructure / CaseStructure / ForLoop / WhileLoop
@@ -400,6 +630,93 @@ public class Resources
             }
         }
         return 0;
+    }
+
+    /// <summary>
+    /// Estimates LUTs for a <c>target &lt;= v1 when c1 else v2 …</c> shape.
+    /// Each value expression gets one Operation worth of LUTs (sized to the
+    /// target's width); each condition adds one comparator (max(1, bits/2)).
+    /// </summary>
+    private int CountLutsInConditionalAssignment(ConditionalAssignment cond)
+    {
+        if (_entity.Architecture == null) return 0;
+        int targetBits = Math.Max(1, cond.Target?.Size ?? 1);
+        int total = 0;
+        var scope = _entity.Architecture.GetAllSignals();
+        foreach (var br in cond.Branches)
+        {
+            if (!string.IsNullOrEmpty(br.ValueExpression))
+                total += CountLutsInExpression(br.ValueExpression, targetBits, scope);
+            if (!string.IsNullOrEmpty(br.ConditionExpression))
+            {
+                // A 1-bit comparator on the condition expression; refine to
+                // the condition expression's own width if we can recover it
+                // from the parsed Operation, but a single comparator per
+                // branch is the textbook estimate.
+                total += Math.Max(1, targetBits / 2);
+            }
+        }
+        return total;
+    }
+
+    /// <summary>
+    /// Estimates LUTs for <c>with sel select target &lt;= v1 when …, others &gt;= …</c>.
+    /// One muxed comparator (per branch) on the selector expression's width,
+    /// plus per-value LUTs at the target width. The mux itself is folded into
+    /// the comparator count.
+    /// </summary>
+    private int CountLutsInSelectedAssignment(SelectedAssignment sel)
+    {
+        if (_entity.Architecture == null) return 0;
+        int targetBits = Math.Max(1, sel.Target?.Size ?? 1);
+        int total = 0;
+        var scope = _entity.Architecture.GetAllSignals();
+
+        // Selector comparators: estimate from the selector signal's width.
+        int selectorBits = 1;
+        var selectorSig = scope.FirstOrDefault(v =>
+            !string.IsNullOrEmpty(v.Name) &&
+            !string.IsNullOrEmpty(sel.SelectorExpression) &&
+            v.Name.Equals(sel.SelectorExpression.Trim(), StringComparison.OrdinalIgnoreCase));
+        if (selectorSig != null) selectorBits = Math.Max(1, selectorSig.Size);
+
+        foreach (var choice in sel.Choices)
+        {
+            if (!string.IsNullOrEmpty(choice.ValueExpression))
+                total += CountLutsInExpression(choice.ValueExpression, targetBits, scope);
+            // One comparator per choice (others case folds into the default mux input).
+            if (!choice.IsOthers)
+                total += Math.Max(1, selectorBits / 2);
+        }
+        return total;
+    }
+
+    /// <summary>
+    /// Parses a VHDL expression text into an <see cref="Operation"/> against
+    /// the given scope and counts its LUTs at the requested result width.
+    /// Wraps the parser in try/catch — a malformed branch shouldn't poison
+    /// the whole entity's estimate (we'd rather underreport one expression
+    /// than crash the resource view).
+    /// </summary>
+    private int CountLutsInExpression(string expression, int targetBits, HashSet<Variable> scope)
+    {
+        try
+        {
+            // The Operation constructor expects an assignment-shaped string when
+            // a Result is needed; we synthesise one against a dummy target so
+            // we can reuse the existing operator walk.
+            var dummy = new Variable("__res__", "0", Constants.DATATYPES.STD_LOGIC_VECTOR, targetBits);
+            dummy.PortType = Constants.PortType.OUT;
+            var extScope = new HashSet<Variable>(scope) { dummy };
+            var op = new Operation($"__res__ <= {expression}", extScope);
+            // Result width tracking — CountLutsInOperation reads
+            // op.Result.Size which is the dummy's width.
+            return CountLutsInOperation(op);
+        }
+        catch
+        {
+            return 0;
+        }
     }
 
     /// <summary>

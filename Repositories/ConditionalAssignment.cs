@@ -94,32 +94,36 @@ public class ConditionalAssignment : ISControl
     /// <summary>
     /// Executes the conditional assignment asynchronously.
     /// </summary>
-    public Task ExecuteAsync()
+    public Task ExecuteAsync() => ExecuteAsync(scheduler: null);
+
+    /// <summary>
+    /// Scheduler-aware execution. Mirrors the bug #4 fix for
+    /// <see cref="SelectedAssignment"/>: routes the target update through
+    /// the supplied scheduler so signal-history sees the change and delta-
+    /// cycle semantics apply. Bench Phase E bug #10 fix.
+    /// </summary>
+    public Task ExecuteAsync(Services.SignalScheduler? scheduler)
     {
         if (Target == null || Branches.Count == 0)
             return Task.CompletedTask;
 
-        // Evaluate each branch's condition in order
         foreach (var branch in Branches)
         {
             if (branch.IsDefault)
             {
-                // Default branch - use this value
-                AssignValue(branch.ValueExpression);
+                AssignValue(branch.ValueExpression, scheduler);
                 return Task.CompletedTask;
             }
 
-            // Evaluate condition
             if (string.IsNullOrEmpty(branch.ConditionExpression))
                 continue;
 
             Operation condOp = new(branch.ConditionExpression, _variables);
             var result = condOp.Execute();
 
-            bool conditionTrue = EvaluateConditionResult(result);
-            if (conditionTrue)
+            if (EvaluateConditionResult(result))
             {
-                AssignValue(branch.ValueExpression);
+                AssignValue(branch.ValueExpression, scheduler);
                 return Task.CompletedTask;
             }
         }
@@ -131,22 +135,19 @@ public class ConditionalAssignment : ISControl
     /// Assigns a value to the target signal.
     /// </summary>
     /// <param name="valueExpression">The expression to evaluate and assign.</param>
-    private void AssignValue(string valueExpression)
+    private void AssignValue(string valueExpression, Services.SignalScheduler? scheduler = null)
     {
         if (Target == null)
             return;
 
         Operation valueOp = new(valueExpression, _variables);
         var result = valueOp.Execute();
+        object value = (result is Variable varResult) ? varResult.Value : result!;
 
-        if (result is Variable varResult)
-        {
-            Target.Value = varResult.Value;
-        }
+        if (scheduler != null)
+            scheduler.Schedule(Target, value);
         else
-        {
-            Target.Value = result;
-        }
+            Target.Value = value;
     }
 
     /// <summary>

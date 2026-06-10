@@ -212,7 +212,7 @@ Placeholder
 *   **`VariableSyntetizer.cs`**: Parses variable/signal/port/generic/constant declarations with custom type support
 
 **Simulation Engine:**
-*   **`DeltaCycleEngine.cs`**: Coordinates VHDL delta cycle simulation with process scheduling, signal updates, and time advancement
+*   **`DeltaCycleEngine.cs`**: Coordinates VHDL delta cycle simulation with process scheduling, signal updates, and time advancement. Live-replay hooks: `OnFrameEmitted(FrameEmittedArgs)` (per-delta changed signals + their source lines), `Pause()`/`Resume()`/`StepOneDelta()`, `History`, and — 2026-05-27 — `OnConditionEvaluated(int line)` which fires when an `if`/`elsif` branch is taken or a `case` arm matches, so breakpoints can pause on a condition line that has no signal assignment.
 *   **`SignalScheduler.cs`**: Manages signal update scheduling for current and future delta cycles (`after` clause support)
 *   **`ProcessScheduler.cs`**: Manages process execution scheduling based on sensitivity lists
 *   **`SignalHistory.cs`**: Records signal value changes over time for waveform export (VCD, CSV, Text)
@@ -583,6 +583,8 @@ end if;
 
 **Design:** Uses flat list of `IfBranch` objects (not recursive) for better maintainability.
 
+**2026-05-27 — condition breakpoints (`IfBranch.ConditionLine`):** each branch records the 1-based source line of its `if` / `elsif` keyword (captured from `_streamer.Current.Line` before the keyword is consumed). At runtime `DeltaCycleEngine` fires `OnConditionEvaluated(line)` when a branch is *taken* (condition true), so the live-replay layer can pause on a breakpoint set on a condition line — the signal-transition path can't catch these because the condition itself produces no signal change. See `DeltaCycleEngine.OnConditionEvaluated`.
+
 **v0.13.0 Enhancement - Nested Case Statements:**
 ```csharp
 case "case":
@@ -627,6 +629,7 @@ end case;
 - `when others =>` default/fallback branch
 - Nested control structures (if, case, loops) within branches
 - v0.13.0: Can be nested within if/elsif/else branches
+- 2026-05-27: each `CaseWhenBranch` records the 1-based source line of its `when` keyword (`ConditionLine`); the engine fires `OnConditionEvaluated(line)` when an arm matches so a breakpoint on a `when` arm pauses the live run (parallel to `IfBranch.ConditionLine`).
 
 ### 5.6. VariableSyntetizer - Declaration Parser
 
@@ -2132,6 +2135,18 @@ Plus 40 (Parser) + 31 (Debugger) + 23 (TimeMachine) for a grand total of 230 / 2
 ## Quick architecture pointer
 
 If you're wiring the Interpreter into a host, the integration guide is at [`../Documentacion/IEEE_PIPELINE_GUIDE.md`](../Documentacion/IEEE_PIPELINE_GUIDE.md) — walks through the full flow from a user `q <= to_integer(unsigned(addr))` line down to a `BUF + TO_INTEGER` cell graph, with code samples at each layer.
+
+---
+
+## Step-replay downstream consumer (2026-05-17, App polish pass)
+
+`SignalHistory` and the `WaveformData.FromSignalHistory` factory now feed a new App-side step-replay pipeline. After a simulation completes, `App/Kmila/Kmila.Shared/Services/ReplayBuilder.cs` walks the union of all signals' transition times into ≤200 frames and emits an `ExecutionTimelineDoc` consumed by the Concepts-track `ExecutionPlayer` component. The App's Editor renders this as a new "Replay" dock tab — tape transport + live signal table per frame, no source-line highlights yet (that's Phase B).
+
+Implications for this module:
+
+- `SignalHistory.RawHistory` and `WaveformData.FromSignalHistory(history, timescaleNs)` are now load-bearing for the App's pedagogical playback, not just the Practice grader / VCD export / Runs persistence. Any future changes that drop transitions, reorder them, or change the `WaveformTransition.Label` semantics will visibly degrade the replay.
+- Phase B (line-highlight metadata per executed statement) will require instrumenting `DeltaCycleEngine` to emit a frame log alongside `SignalHistory`. Same `ExecutionTimelineDoc` consumer; the contract is fixed in `App/Kmila/Kmila.Shared/Models/ExecutionTimeline.cs` (`TimelineStep` shape with `T`, `HighlightLines`, `Signals`, `Note`). No App-side changes needed when Phase B lands — only Interpreter-side instrumentation.
+- See `Documentacion/CHANGELOG_concepts_module_2026-05-17.md` (Task 5 section) for the full pipeline diagram and the design-decisions table.
 
 ---
 

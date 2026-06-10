@@ -257,6 +257,22 @@ public class VariableSyntetizer : ISControl
             // For ports with unknown type, try to skip gracefully
             if (dataType == Constants.DATATYPES.UNKNOWN && customTypeDef == null && (_isPort || _isGeneric))
             {
+                // Strictness: when the unknown port type is within Levenshtein
+                // distance 2 of a canonical VHDL type name, fail loudly with a
+                // "did you mean" hint. Catches STDLOGIC / STD_LGIC slips that
+                // would otherwise be silently absorbed by the skip loop below.
+                // Mirrors the check in Parser.Repositories.PortsParser — that
+                // path isn't reachable from the App's pipeline, this one is.
+                var typoTok = _streamer.Current;
+                var suggestion = Constants.FindTypoSuggestion(typoTok?.Value ?? string.Empty);
+                if (suggestion != null)
+                {
+                    throw new ParserException(
+                        $"Unknown port type '{typoTok?.Value}'. Did you mean '{suggestion}'?",
+                        (int)(typoTok?.Line ?? 0) + 1,
+                        (int)(typoTok?.Col ?? 0) + 1,
+                        typoTok?.Value);
+                }
                 // Skip to semicolon or closing paren of port list (not inner parens)
                 int parenDepth = 0;
                 while (_streamer.Current != null)
@@ -462,7 +478,6 @@ public class VariableSyntetizer : ISControl
                 {
                     initValue = customTypeDef.GetDefaultValue();
                 }
-
                 var newVar = new Variable()
                 {
                     Name = variable.Name,
@@ -1287,6 +1302,26 @@ public class VariableSyntetizer : ISControl
         {
             ParsedTypes.TryRegister(typeDef);
             _typeRegistry?.TryRegister(typeDef);
+
+            // Bug #16 fix: register every enum literal as a constant Variable
+            // so expressions like `state <= sB` and `when sB =>` resolve. The
+            // literal's Value is its own name; the case statement compares
+            // string-to-string so the literal flows straight through.
+            if (typeDef.Kind == TypeKind.Enumeration)
+            {
+                foreach (var literal in typeDef.EnumValues)
+                {
+                    if (string.IsNullOrEmpty(literal)) continue;
+                    if (Variables.Any(v => v.Name.Equals(literal, StringComparison.OrdinalIgnoreCase)))
+                        continue;
+                    Variables.Add(new Variable
+                    {
+                        Name = literal,
+                        Type = Constants.DATATYPES.INTEGER,
+                        Value = literal,
+                    });
+                }
+            }
         }
     }
 

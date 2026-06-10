@@ -27,6 +27,14 @@ public class CaseWhenBranch
     /// Gets or sets the list of tasks to execute when this branch is taken.
     /// </summary>
     public List<object> Tasks { get; set; } = new();
+
+    /// <summary>
+    /// 1-based source line of the <c>when</c> keyword for this arm (#5). Lets
+    /// the live engine emit a condition-evaluation signal tagged with the line
+    /// so a breakpoint on a <c>when</c> arm pauses when that arm is selected.
+    /// Zero means unknown.
+    /// </summary>
+    public int ConditionLine { get; set; }
 }
 
 /// <summary>
@@ -277,9 +285,10 @@ public class CaseStructure : ISControl
     /// </summary>
     private void SyntetizeWhenBranch()
     {
+        int condLine = _streamer.Current?.Line ?? 0; // line of 'when' keyword (#5)
         _streamer.Expect(KEYWORDS); // consume 'when'
 
-        var branch = new CaseWhenBranch();
+        var branch = new CaseWhenBranch { ConditionLine = condLine };
 
         // Parse choices (can be multiple separated by '|')
         // Safety: limit iterations to prevent infinite loop
@@ -454,6 +463,10 @@ public class CaseStructure : ISControl
     /// <param name="branch">The branch to add the parsed assignment to.</param>
     private void SyntetizeAssignment(CaseWhenBranch branch)
     {
+        // Phase B+ Deep AST (follow-up): capture the assignment's source
+        // line BEFORE the streamer consumes the LHS token.
+        int assignLine = _streamer.Current?.Line ?? 0;
+
         var rawDataBuilder = new StringBuilder();
         int assignIterations = 0;
         int maxAssignIterations = 1000;
@@ -479,7 +492,7 @@ public class CaseStructure : ISControl
         var type = _detector.GetOperationType(operation);
         if (type == OperationType.ASSIGNATION)
         {
-            Operation op = new(operation, _variables);
+            Operation op = new(operation, _variables, sourceLine: assignLine);
             branch.Tasks.Add(op);
         }
     }

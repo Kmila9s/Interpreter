@@ -59,6 +59,22 @@ public class ForLoopStructure : ISControl
 {
     /// <summary>The variables in scope during range evaluation and loop body execution.</summary>
     private readonly HashSet<Variable> _variables;
+
+    /// <summary>
+    /// The single Variable instance representing the loop iterator. Created
+    /// at <see cref="Syntetize"/> time and re-used by <see cref="ExecuteAsync"/>
+    /// so DeferredIndex/expression-stack references stay live across
+    /// iterations. Bench Phase F bug #14 fix (2026-06-06).
+    /// </summary>
+    private Variable? _loopVar;
+
+    /// <summary>
+    /// Read-only accessor so the engine's scheduled-execution path can
+    /// reuse the synth-time iterator instance — body operations (notably
+    /// <c>DynamicIndex</c> for `signal(i)` reads) captured a reference to
+    /// it and a parallel runtime copy would leave them stale.
+    /// </summary>
+    public Variable? LoopVar => _loopVar;
     /// <summary>The token stream used for parsing the for loop structure.</summary>
     private readonly TokenStream _streamer;
     /// <summary>Detector used to classify operations found inside the loop body.</summary>
@@ -110,8 +126,14 @@ public class ForLoopStructure : ISControl
     /// </summary>
     public async Task ExecuteAsync()
     {
-        // Create loop variable
-        Variable loopVar = new(LoopVariableName, RangeStart.ToString(), Constants.DATATYPES.INTEGER);
+        // Re-use the synth-time loop variable. Body operations captured a
+        // reference to it (via the Variables HashSet passed into their
+        // Operation constructors), and a fresh Variable at run time would
+        // leave those references pointing at a stale instance — `diff(i)`
+        // inside the body wouldn't see the iterator advance.
+        // Bench Phase F bug #14 fix.
+        Variable loopVar = _loopVar ?? new Variable(
+            LoopVariableName, RangeStart.ToString(), Constants.DATATYPES.INTEGER);
 
         // Create temporary variable set with loop variable
         HashSet<Variable> loopVariables = [.. _variables, loopVar];
@@ -223,6 +245,7 @@ public class ForLoopStructure : ISControl
             }
 
             Variable loopVar2 = new(LoopVariableName, RangeStart.ToString(), Constants.DATATYPES.INTEGER);
+            _loopVar = loopVar2;
             HashSet<Variable> loopVariables2 = [.. _variables, loopVar2];
             SyntetizeLoopBody(loopVariables2);
             return;
@@ -252,8 +275,11 @@ public class ForLoopStructure : ISControl
             _streamer.MoveNext(); // consume 'loop'
         }
 
-        // Create loop variable for inner scope
+        // Create loop variable for inner scope. Stash it on the structure
+        // so ExecuteAsync can re-use the same instance instead of forking
+        // a parallel copy that body Operations don't see. Bench bug #14.
         Variable loopVar = new(LoopVariableName, RangeStart.ToString(), Constants.DATATYPES.INTEGER);
+        _loopVar = loopVar;
         HashSet<Variable> loopVariables = [.. _variables, loopVar];
 
         // Parse loop body
@@ -439,6 +465,9 @@ public class ForLoopStructure : ISControl
     /// <param name="variables">The variables in scope for expression evaluation.</param>
     private void SyntetizeAssignment(HashSet<Variable> variables)
     {
+        // Phase B+ Deep AST (follow-up): capture the LHS line.
+        int assignLine = _streamer.Current?.Line ?? 0;
+
         var rawDataBuilder = new StringBuilder();
         int iterations = 0;
         const int maxIterations = 1000;
@@ -460,7 +489,7 @@ public class ForLoopStructure : ISControl
         var type = _detector.GetOperationType(operation);
         if (type == OperationType.ASSIGNATION)
         {
-            Operation op = new(operation, variables);
+            Operation op = new(operation, variables, sourceLine: assignLine);
             Tasks.Add(op);
         }
     }

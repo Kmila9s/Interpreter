@@ -232,8 +232,14 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                     case DATATYPES.STD_LOGIC_VECTOR:
                         result = SolveVectorLogicOperation(leftSideOperator, rightSideOperator);
                     break;
+                    case DATATYPES.BOOLEAN:
+                        // Bug #17: AND/OR/etc over BOOLEAN operands
+                        // (post-comparison) previously fell through to
+                        // `result = new object()`. Funnel through bool ops.
+                        result = SolveBooleanLogicOperation(leftSideOperator, rightSideOperator);
+                    break;
                 }
-                
+
             break;
             case OperatorType.ARITH_OPERATION:
                 result = SolveArithOperation(leftSideOperator, rightSideOperator);
@@ -554,6 +560,36 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     }
 
     /// <summary>
+    /// Bug #17 fix: logic ops (and/or/nand/nor/xor/xnor/not) over BOOLEAN
+    /// operands. Reuses the bit-level SolveLogicOperation by mapping
+    /// true → '1' and false → '0'. Returns a bool so downstream consumers
+    /// (IfStructure condition, Operation.Execute) see the right type.
+    /// </summary>
+    public object SolveBooleanLogicOperation(Variable var1, Variable var2)
+    {
+        bool b1 = ToBool(var1.Value);
+        bool b2 = ToBool(var2.Value);
+        return OperatorName.ToLower() switch
+        {
+            "and"  => b1 && b2,
+            "or"   => b1 || b2,
+            "nand" => !(b1 && b2),
+            "nor"  => !(b1 || b2),
+            "xor"  => b1 != b2,
+            "xnor" => b1 == b2,
+            _      => false
+        };
+    }
+
+    private static bool ToBool(object? value)
+    {
+        if (value is bool b) return b;
+        string s = value?.ToString() ?? "";
+        if (bool.TryParse(s, out bool parsed)) return parsed;
+        return s == "1" || s.Equals("true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
     /// Solves an arithmetic operation.
     /// </summary>
     /// <param name="variable">The variable.</param>
@@ -578,15 +614,29 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                 return 0;
             }
             string str = v.Value.ToString() ?? "0";
-            // Handle VHDL meta-values ('U', 'X', 'Z', etc.)
-            if (int.TryParse(str, out int intVal))
-                return intVal;
-            // Try binary string conversion for vectors
-            if (str.Length > 0 && str.All(c => c == '0' || c == '1'))
+            // Vector-typed signals carry their value as a binary string
+            // ("00000010" = 2). We MUST try binary BEFORE decimal because
+            // int.TryParse("00000010") happily returns 10 (decimal), which
+            // silently corrupted unsigned arithmetic the moment a counter
+            // crossed any value whose binary representation looks like a
+            // valid decimal — bench Phase D / bug #6 (2026-06-02).
+            // BUT: don't apply the heuristic to INTEGER/NATURAL types —
+            // their decimal value can incidentally consist of only 0/1
+            // digits ("10" = ten, not two; "11" = eleven, not three) and
+            // forcing a binary parse silently corrupted intra-loop
+            // `count := count + 1` accumulation in 034 hamming once the
+            // count crossed 9. Bug #14 follow-up.
+            bool vectorish = v.Type == DATATYPES.STD_LOGIC_VECTOR ||
+                (v.Type != DATATYPES.INTEGER && v.Type != DATATYPES.NATURAL &&
+                 str.Length > 1 && str.All(c => c == '0' || c == '1'));
+            if (vectorish)
             {
                 try { return Convert.ToInt32(str, 2); }
-                catch { return 0; }
+                catch { /* fall through to decimal */ }
             }
+            // Handle VHDL meta-values ('U', 'X', 'Z', etc.) and integer literals
+            if (int.TryParse(str, out int intVal))
+                return intVal;
             return 0;
         }
         double GetDouble(Variable v) {
@@ -751,6 +801,27 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         if (string.Equals(s, "True",  StringComparison.OrdinalIgnoreCase)) return false;
         if (string.Equals(s, "False", StringComparison.OrdinalIgnoreCase)) return true;
         if (s.Length == 0) return '1';   // uninitialised — treat as `not 0` = '1'
+
+        // Vector `not`: invert every bit and return the inverted string.
+        // The previous path only looked at s[0], so `not "111111"` returned
+        // '0' (a single scalar) instead of "000000". Detect vector either
+        // by the variable's declared type or by the string holding 2+ bits.
+        bool isVector = variable.Type == DATATYPES.STD_LOGIC_VECTOR ||
+                        (s.Length > 1 && s.All(c => c == '0' || c == '1' || c == 'u' || c == 'x' || c == 'z' || c == 'U' || c == 'X' || c == 'Z'));
+        if (isVector && OperatorName.Equals("not", StringComparison.OrdinalIgnoreCase))
+        {
+            var chars = new char[s.Length];
+            for (int i = 0; i < s.Length; i++)
+            {
+                chars[i] = s[i] switch
+                {
+                    '0' => '1',
+                    '1' => '0',
+                    _   => 'x',
+                };
+            }
+            return new string(chars);
+        }
 
         char item = s[0];
         return OperatorName.ToLower() switch

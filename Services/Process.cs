@@ -349,6 +349,13 @@ public class Process : ISControl, IControl
     /// </summary>
     private void SyntetizeAssignment(HashSet<Variable> variables)
     {
+        // Phase B+ Deep AST (follow-up): capture the LHS line. Process
+        // bodies were the biggest pedagogical gap before this — DFF /
+        // shift-register / fix-latch lessons all assign inside processes,
+        // and without this they'd fall back to the regex map and
+        // over-highlight every branch.
+        int assignLine = _streamer.Current?.Line ?? 0;
+
         var rawDataBuilder = new StringBuilder();
         while (_streamer.Current?.Value != ";" && _streamer.Current?.Value.ToLower() != "end")
         {
@@ -368,7 +375,7 @@ public class Process : ISControl, IControl
         switch (type)
         {
             case OperationType.ASSIGNATION:
-                Operation op = new(operation, variables);
+                Operation op = new(operation, variables, sourceLine: assignLine);
                 Tasks.Add(op);
                 break;
         }

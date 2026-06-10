@@ -92,6 +92,9 @@ public enum OperationType : int {
 /// </summary>
 public class OperationsRegex {
     /// <summary>Regex to detect a VHDL signal assignment (<=) or variable assignment (:=).</summary>
-    /// <remarks>v0.16.1: Added support for := variable assignments used in processes and procedures.</remarks>
-    public static string ASSIGNATION = @"[A-Za-z_]+[_a-zA-Z0-9]*\s?(\<\=|:\=)\s?.+";
+    /// <remarks>v0.16.1: Added support for := variable assignments used in processes and procedures.
+    /// 2026-06-03 (bench bug #5): Also accept an indexed/sliced target like `output(0) &lt;= …` —
+    /// the previous regex's single `\s?` couldn't span `name ( 0 ) ` so per-bit assignments
+    /// were classified as UNKNOWN and silently dropped during architecture synthesis.</remarks>
+    public static string ASSIGNATION = @"[A-Za-z_][_a-zA-Z0-9]*(\s*\(\s*[^()]*\s*\))?\s*(\<\=|:\=)\s?.+";
 }

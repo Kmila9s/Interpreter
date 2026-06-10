@@ -65,6 +65,15 @@ public class SelectedAssignment : ISControl
     public string TargetName { get; private set; } = string.Empty;
 
     /// <summary>
+    /// Integer bit index when the selected assignment targets a single
+    /// element of a vector signal (e.g. <c>y(0) &lt;= …</c>). Null when
+    /// the assignment targets the whole signal. Only literal-integer
+    /// indices are captured; runtime indices fall through to whole-signal.
+    /// Bench bug #5 / #9 fix (2026-06-03).
+    /// </summary>
+    public int? TargetBitIndex { get; private set; }
+
+    /// <summary>
     /// Gets the target variable.
     /// </summary>
     public Variable? Target { get; private set; }
@@ -103,7 +112,16 @@ public class SelectedAssignment : ISControl
     /// <summary>
     /// Executes the selected assignment asynchronously.
     /// </summary>
-    public Task ExecuteAsync()
+    public Task ExecuteAsync() => ExecuteAsync(scheduler: null);
+
+    /// <summary>
+    /// Scheduler-aware execution: when a <paramref name="scheduler"/> is
+    /// supplied, the target update is routed through it (proper VHDL
+    /// delta-cycle semantics + SignalHistory recording). Otherwise it
+    /// falls back to immediate assignment, matching the legacy behavior
+    /// kept for non-engine callers. Bench Phase E bug #4 fix.
+    /// </summary>
+    public Task ExecuteAsync(Services.SignalScheduler? scheduler)
     {
         if (Target == null || string.IsNullOrEmpty(SelectorExpression) || Choices.Count == 0)
             return Task.CompletedTask;
@@ -113,29 +131,25 @@ public class SelectedAssignment : ISControl
         var selectorResult = selectorOp.Execute();
         string selectorValue = ExtractValue(selectorResult);
 
-        // Find matching choice
+        SelectionChoice? matched = null;
+        SelectionChoice? defaultChoice = null;
+
         foreach (var choice in Choices)
         {
-            if (choice.IsOthers)
-            {
-                // Default branch - use this value
-                AssignValue(choice.ValueExpression);
-                return Task.CompletedTask;
-            }
-
-            // Check if selector matches any of the choices
+            if (choice.IsOthers) { defaultChoice = choice; continue; }
             foreach (var choiceVal in choice.Choices)
             {
-                string cleanChoice = CleanValue(choiceVal);
-                string cleanSelector = CleanValue(selectorValue);
-
-                if (cleanChoice.Equals(cleanSelector, StringComparison.OrdinalIgnoreCase))
+                if (CleanValue(choiceVal).Equals(CleanValue(selectorValue), StringComparison.OrdinalIgnoreCase))
                 {
-                    AssignValue(choice.ValueExpression);
-                    return Task.CompletedTask;
+                    matched = choice;
+                    break;
                 }
             }
+            if (matched != null) break;
         }
+
+        var chosen = matched ?? defaultChoice;
+        if (chosen != null) AssignValue(chosen.ValueExpression, scheduler);
 
         return Task.CompletedTask;
     }
@@ -163,24 +177,92 @@ public class SelectedAssignment : ISControl
     }
 
     /// <summary>
-    /// Assigns a value to the target signal.
+    /// Assigns a value to the target signal. When <paramref name="scheduler"/>
+    /// is non-null, routes through the SignalScheduler so the change goes
+    /// into SignalHistory and respects VHDL delta-cycle semantics. The
+    /// scheduler-less path is the legacy fallback used by tests and callers
+    /// that haven't been wired into the engine yet.
     /// </summary>
-    /// <param name="valueExpression">The expression to evaluate and assign.</param>
-    private void AssignValue(string valueExpression)
+    private void AssignValue(string valueExpression, Services.SignalScheduler? scheduler = null)
     {
         if (Target == null)
             return;
 
-        Operation valueOp = new(valueExpression, _variables);
-        var result = valueOp.Execute();
-
-        if (result is Variable varResult)
+        // Strip `after N <unit>` from the value expression and capture the
+        // delay in nanoseconds so we can route through ScheduleAfterNs.
+        // Without this the AFTER clause was silently dropped and the
+        // assignment fired in the current delta — bench bug #8.
+        long afterNs = 0;
+        string valExpr = valueExpression;
         {
-            Target.Value = varResult.Value;
+            var m = System.Text.RegularExpressions.Regex.Match(
+                valueExpression,
+                @"\bafter\s+(\d+)\s*(fs|ps|ns|us|ms|sec|s)?\b",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (m.Success && long.TryParse(m.Groups[1].Value, out long n))
+            {
+                string unit = m.Groups[2].Success ? m.Groups[2].Value.ToLowerInvariant() : "ns";
+                afterNs = unit switch
+                {
+                    "fs" => n / 1_000_000L,
+                    "ps" => n / 1_000L,
+                    "ns" => n,
+                    "us" => n * 1_000L,
+                    "ms" => n * 1_000_000L,
+                    "sec" or "s" => n * 1_000_000_000L,
+                    _ => n,
+                };
+                valExpr = valueExpression.Substring(0, m.Index).Trim();
+            }
+        }
+
+        Operation valueOp = new(valExpr, _variables);
+        var result = valueOp.Execute();
+        object value = (result is Variable varResult) ? varResult.Value : result!;
+
+        if (scheduler != null)
+        {
+            if (TargetBitIndex is int bitIdx)
+            {
+                // Per-bit selected assignment: splice via ScheduleBitWrite
+                // so sibling per-bit `with…select` blocks (one per output
+                // bit of a demux/decoder) merge instead of clobbering.
+                string s = value?.ToString() ?? "0";
+                char bit = s.TrimStart('\'').TrimEnd('\'').Trim() is { Length: > 0 } str ? str[^1] : '0';
+                if (afterNs > 0)
+                {
+                    // After-delay with bit-target: build a full-vector
+                    // future value by splicing the bit into the current
+                    // signal value and schedule the whole result.
+                    string current = Target.Value as string ?? string.Empty;
+                    int width = Math.Max(Target.Size, current.Length);
+                    if (width == 0) width = bitIdx + 1;
+                    if (current.Length < width) current = current.PadLeft(width, '0');
+                    int pos = width - 1 - bitIdx;
+                    if (pos >= 0 && pos < current.Length)
+                    {
+                        var chars = current.ToCharArray();
+                        chars[pos] = bit;
+                        scheduler.ScheduleAfterNs(Target, new string(chars), afterNs);
+                    }
+                }
+                else
+                {
+                    scheduler.ScheduleBitWrite(Target, bitIdx, bit);
+                }
+            }
+            else if (afterNs > 0)
+            {
+                scheduler.ScheduleAfterNs(Target, value, afterNs);
+            }
+            else
+            {
+                scheduler.Schedule(Target, value);
+            }
         }
         else
         {
-            Target.Value = result;
+            Target.Value = value;
         }
     }
 
@@ -220,10 +302,13 @@ public class SelectedAssignment : ISControl
             _streamer.MoveNext();
         }
 
-        // Skip array indexing if present
+        // Capture array indexing like `y(0)` so the assignment lands on
+        // the right bit. Previously this just skipped the index tokens,
+        // making per-bit selected assignments collapse to whole-signal
+        // writes that clobbered each other. Bench bug #5/#9 fix.
         if (_streamer.Current?.Value == "(")
         {
-            SkipIndexing();
+            ParseTargetIndex();
         }
 
         // Expect '<='
@@ -237,26 +322,33 @@ public class SelectedAssignment : ISControl
     }
 
     /// <summary>
-    /// Skips array indexing like (7 downto 0).
+    /// Parses array indexing like `(0)`. Captures a literal-integer index
+    /// into <see cref="TargetBitIndex"/>; falls back to no-index (whole-
+    /// signal write) when the inner expression isn't a plain integer.
     /// </summary>
-    private void SkipIndexing()
+    private void ParseTargetIndex()
     {
-        int depth = 0;
-        while (_streamer != null && _streamer.Current != null)
+        if (_streamer?.Current?.Value != "(") return;
+        _streamer.MoveNext();
+
+        // Collect tokens until the matching closing paren.
+        var inner = new StringBuilder();
+        int depth = 1;
+        while (_streamer.Current != null)
         {
-            if (_streamer.Current.Value == "(")
-                depth++;
-            else if (_streamer.Current.Value == ")")
+            if (_streamer.Current.Value == "(") { depth++; inner.Append('('); _streamer.MoveNext(); continue; }
+            if (_streamer.Current.Value == ")")
             {
                 depth--;
-                if (depth == 0)
-                {
-                    _streamer.MoveNext();
-                    break;
-                }
+                if (depth == 0) { _streamer.MoveNext(); break; }
+                inner.Append(')'); _streamer.MoveNext(); continue;
             }
+            inner.Append(_streamer.Current.Value);
             _streamer.MoveNext();
         }
+
+        if (int.TryParse(inner.ToString().Trim(), out int idx))
+            TargetBitIndex = idx;
     }
 
     /// <summary>

@@ -815,10 +815,93 @@ public class Architecture : ISControl, IControl
     /// </summary>
     public void SyntetizeAssingations()
     {
+        // Strict shape: a concurrent statement must look like
+        //   <signal>[ ( <index> ) ] ( <= | := ) <expr> ;
+        //   <procedure_name>[ ( <args> ) ] ;
+        // Anything else (e.g. two identifiers in a row at depth 0 like the
+        // `MHz bit2 <= q2` shape produced when garbage gets pasted after a
+        // `;`) means the line is malformed. Catching it here surfaces a
+        // precise Monaco marker via Editor.razor's ParserException catch
+        // instead of building a quietly-different Operation that the
+        // simulator silently mis-evaluates.
+
+        var first = _streamer.Current;
+        if (first == null)
+            throw new ParserException(
+                "Unexpected end of input where a concurrent statement was expected",
+                _streamer.Previous);
+        if (first.Type != IDENTIFIERS && first.Type != QUALIFIED_IDENTIFIERS)
+            throw new ParserException(
+                $"Unexpected token '{first.Value}' — expected a signal name to start a concurrent statement",
+                first);
+
         var rawDataBuilder = new StringBuilder();
+        rawDataBuilder.Append(first.Value).Append(' ');
+        _streamer.MoveNext();
+
+        // Optional indexed access: `bus(7 downto 0) <= ...`, `mem(i)(j) <= ...`.
+        // Consume balanced parentheses immediately following the LHS.
+        while (_streamer.Current?.Value == "(")
+        {
+            int depth = 0;
+            do
+            {
+                if (_streamer.Current == null)
+                    throw new ParserException(
+                        "Unterminated parenthesized expression after signal name",
+                        _streamer.Previous);
+                if (_streamer.Current.Value == "(") depth++;
+                else if (_streamer.Current.Value == ")") depth--;
+                rawDataBuilder.Append(_streamer.Current.Value).Append(' ');
+                _streamer.MoveNext();
+            } while (depth > 0);
+        }
+
+        // Now the next token MUST be `<=`, `:=`, or `;` (bare procedure call).
+        var sep = _streamer.Current;
+        if (sep == null)
+            throw new ParserException(
+                $"Statement starting with '{first.Value}' is missing its assignment operator or terminator",
+                _streamer.Previous);
+
+        bool isProcedureCall = sep.Type == OPERATORS && sep.Value == ";";
+        bool isAssignment    = sep.Type == OPERATORS && (sep.Value == "<=" || sep.Value == ":=");
+
+        if (!isProcedureCall && !isAssignment)
+            throw new ParserException(
+                $"Unexpected token '{sep.Value}' after '{first.Value}' — expected '<=', ':=', or ';'",
+                sep);
+
+        if (isProcedureCall)
+        {
+            // Bare procedure call: just record the LHS so downstream
+            // classifiers see the same operation string as before (no
+            // assignment operator, no RHS). The existing detector treats
+            // this as a no-op below.
+            _streamer.MoveNext(); // consume ;
+            string procOp = rawDataBuilder.ToString().Trim();
+            _ = _detector.GetOperationType(procOp);
+            return;
+        }
+
+        // Assignment — append the operator and slurp the RHS until `;`.
+        rawDataBuilder.Append(sep.Value).Append(' ');
+        _streamer.MoveNext();
+
         while (_streamer.Current?.Value != ";")
         {
-            rawDataBuilder.Append(_streamer.Current?.Value + " ");
+            if (_streamer.Current == null)
+                throw new ParserException(
+                    $"Unexpected end of input in concurrent assignment for '{first.Value}' — missing ';'?",
+                    _streamer.Previous);
+            // Reject stray UNKNOWN tokens (e.g. `$`, mojibake from a paste)
+            // inside the RHS — once they reach Operation.Evaluate they
+            // become a confusing runtime error far from the source line.
+            if (_streamer.Current.Type == UNKNOWN)
+                throw new ParserException(
+                    $"Unexpected token '{_streamer.Current.Value}' inside concurrent statement — not a valid VHDL identifier, keyword, operator, or literal",
+                    _streamer.Current);
+            rawDataBuilder.Append(_streamer.Current.Value).Append(' ');
             _streamer.MoveNext();
         }
         string operation = rawDataBuilder.ToString().Trim();
@@ -828,6 +911,13 @@ public class Architecture : ISControl, IControl
         {
             case OperationType.ASSIGNATION:
                 List<Variable> variables = [.. _ports, .. _signals, .. _generics];
+
+                // Phase B+ Deep AST: capture the operation's 1-based source
+                // line. Use the assignment-operator's line specifically — it
+                // sits on the actual `<=` statement no matter how the RHS
+                // wraps — falling back to the streamer cursor (post-`;`) only
+                // when we couldn't find the `<=` token in the rawDataBuilder.
+                var assignLine = _streamer.Current?.Line ?? 0;
 
                 // Check for conditional assignment (when...else pattern)
                 if (operation.Contains("when", StringComparison.OrdinalIgnoreCase))
@@ -841,7 +931,7 @@ public class Architecture : ISControl, IControl
                 }
 
                 // Regular assignment
-                Operation op = new(operation, variables.ToHashSet());
+                Operation op = new(operation, variables.ToHashSet(), sourceLine: assignLine);
                 Tasks.Add(op);
                 break;
         }

@@ -432,6 +432,10 @@ public class GenerateBlock : ISControl
     /// <param name="variables">The variables in scope for this iteration.</param>
     private void ParseConcurrentStatement(TokenStream stream, HashSet<Variable> variables)
     {
+        // Phase B+ Deep AST (follow-up): capture the LHS line before the
+        // streamer walks through the statement.
+        int assignLine = stream.Current?.Line ?? 0;
+
         var rawDataBuilder = new StringBuilder();
         while (stream.Current?.Value != ";")
         {
@@ -458,7 +462,7 @@ public class GenerateBlock : ISControl
                 }
             }
 
-            Operation op = new(operation, variables);
+            Operation op = new(operation, variables, sourceLine: assignLine);
             Tasks.Add(op);
         }
     }
