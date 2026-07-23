@@ -38,6 +38,16 @@ public class Architecture : ISControl, IControl
     public string EntityName { get; private set; } = string.Empty;
     private readonly HashSet<Variable> _ports = new(), _generics = new();
     private HashSet<Variable> _signals = new();
+    /// <summary>
+    /// F-G-08 pass 5 (2026-07-22): pre-materialized union of
+    /// <c>_ports ∪ _generics ∪ _signals</c>, populated at the start of
+    /// <see cref="SyntetizeBehaviour(CancellationToken)"/> and reused by
+    /// every <see cref="SyntetizeAssingations"/> call. Pre-pass-5 each
+    /// assignment rebuilt this list + called <c>.ToHashSet()</c> on it,
+    /// paying ~207 hashes per assignment × hundreds of assignments on the
+    /// elaborated capstone. Null when synth hasn't started yet.
+    /// </summary>
+    private HashSet<Variable>? _assignmentVariables;
 
     /// <summary>
     /// Gets the internal signals of the architecture (read-only access).
@@ -292,6 +302,12 @@ public class Architecture : ISControl, IControl
         // v0.13.0 Fix: Move comparators list outside the loop to prevent repeated allocation
         // Previously created a new List<Variable> on every iteration, causing memory pressure
         HashSet<Variable> comparators = [.. _ports, .. _generics, .. _signals];
+        // F-G-08 pass 5 (2026-07-22): stash the same set for reuse by
+        // SyntetizeAssingations. Every concurrent assignment used to rebuild
+        // this on-demand; on the elaborated capstone that was hundreds of
+        // 207-item HashSet builds. `comparators` and `_assignmentVariables`
+        // share the same backing HashSet — read-only downstream.
+        _assignmentVariables = comparators;
 
         // v0.16.1: Add iteration limit to prevent infinite loops
         const int MAX_ITERATIONS = 100000;
@@ -360,17 +376,40 @@ public class Architecture : ISControl, IControl
                                     SkipGenerateBody(label);
                                 }
                                 continue;
+                            case "entity":
+                                // Direct-entity instantiation with the VHDL-2008 form:
+                                //   label : entity <lib>.<name>[(<arch>)] [generic map (...)] port map (...);
+                                // Without this case, the `default:` swallowed the `entity`
+                                // token; the streamer then landed on `work.<name>` and the
+                                // subsequent SyntetizeAssingations call threw
+                                // "Unexpected token 'generic' after 'work.X'" — audit F-G-05
+                                // (session 15, 2026-07-12). ParseComponentInstantiation
+                                // already handles the `entity` prefix (see else-if arm below
+                                // that this switch used to bypass).
+                                try
+                                {
+                                    var entityInstance = ParseComponentInstantiation(label);
+                                    if (entityInstance != null)
+                                    {
+                                        EntityRegistry.Instance.RegisterComponentInstance(EntityName, entityInstance);
+                                    }
+                                }
+                                catch
+                                {
+                                    SkipToSemicolon();
+                                }
+                                continue;
                             default:
                                 _streamer.MoveNext();
                                 continue;
                         }
                     }
-                    else if (_streamer.Current?.Type == IDENTIFIERS ||
-                             _streamer.Current?.Value?.ToLower() == "entity")
+                    else if (_streamer.Current?.Type == IDENTIFIERS)
                     {
-                        // Component instantiation: label : ComponentName [generic map (...)] port map (...)
-                        // Or direct entity instantiation: label : entity library.EntityName [generic map (...)] port map (...)
-                        // v0.16.0: Parse and register component instances for hierarchical design support
+                        // Traditional component instantiation:
+                        //   label : ComponentName [generic map (...)] port map (...)
+                        // The direct-entity form (`label : entity <lib>.<name> ...`) is
+                        // handled by `case "entity":` in the KEYWORDS switch above.
                         try
                         {
                             var instance = ParseComponentInstantiation(label);
@@ -381,7 +420,6 @@ public class Architecture : ISControl, IControl
                         }
                         catch
                         {
-                            // Fall back to skipping the component instantiation
                             SkipToSemicolon();
                         }
                         continue;
@@ -910,7 +948,11 @@ public class Architecture : ISControl, IControl
         switch (type)
         {
             case OperationType.ASSIGNATION:
-                List<Variable> variables = [.. _ports, .. _signals, .. _generics];
+                // F-G-08 pass 5: reuse the HashSet stashed by SyntetizeBehaviour.
+                // Fallback to on-demand build for any legacy caller that
+                // invokes SyntetizeAssingations directly (defensive; the only
+                // production caller is SyntetizeBehaviour, which sets the field).
+                var variables = _assignmentVariables ?? [.. _ports, .. _signals, .. _generics];
 
                 // Phase B+ Deep AST: capture the operation's 1-based source
                 // line. Use the assignment-operator's line specifically — it
@@ -922,7 +964,7 @@ public class Architecture : ISControl, IControl
                 // Check for conditional assignment (when...else pattern)
                 if (operation.Contains("when", StringComparison.OrdinalIgnoreCase))
                 {
-                    var condAssign = ConditionalAssignment.TryParse(operation, variables.ToHashSet());
+                    var condAssign = ConditionalAssignment.TryParse(operation, variables);
                     if (condAssign != null)
                     {
                         Tasks.Add(condAssign);
@@ -931,7 +973,7 @@ public class Architecture : ISControl, IControl
                 }
 
                 // Regular assignment
-                Operation op = new(operation, variables.ToHashSet(), sourceLine: assignLine);
+                Operation op = new(operation, variables, sourceLine: assignLine);
                 Tasks.Add(op);
                 break;
         }

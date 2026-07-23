@@ -323,11 +323,29 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             case DATATYPES.INTEGER:
             case DATATYPES.NATURAL:
             {
-                // INTEGER/NATURAL: safe parsing with fallback to 0 for meta-values
+                // INTEGER/NATURAL: safe parsing with fallback to 0 for meta-values.
+                // Bench bug #21 (P2A HALT detect): enum-typed signals are
+                // stored as INTEGER but their `.Value` is the literal name
+                // string (e.g. "S_HALT"). The legacy code parsed both sides
+                // to 0 on failure, so every enum comparison returned true.
+                // When both sides fail to parse, fall back to ordinal string
+                // equality so `state = S_HALT` resolves correctly.
                 string s1 = var1.Value?.ToString() ?? "0";
                 string s2 = var2.Value?.ToString() ?? "0";
-                if (!int.TryParse(s1, out int i1)) i1 = 0;
-                if (!int.TryParse(s2, out int i2)) i2 = 0;
+                bool ok1 = int.TryParse(s1, out int i1);
+                bool ok2 = int.TryParse(s2, out int i2);
+                if (!ok1 && !ok2)
+                {
+                    string op = OperatorName.ToLower();
+                    if (op == "=")  return s1.Equals(s2, StringComparison.Ordinal);
+                    if (op == "!=" || op == "/=") return !s1.Equals(s2, StringComparison.Ordinal);
+                    // Order operators on two non-numeric enum values are
+                    // ambiguous (depends on declaration order, which we
+                    // don't track). Default to false.
+                    return false;
+                }
+                if (!ok1) i1 = 0;
+                if (!ok2) i2 = 0;
                 switch (OperatorName.ToLower())
                 {
                     case "=":
@@ -672,9 +690,22 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             }
             else
             {
-                int width = Math.Max(
-                    leftVec  ? Math.Max(1, leftVariable.Size)  : 1,
-                    rightVec ? Math.Max(1, rightVariable.Size) : 1);
+                int leftW  = leftVec  ? Math.Max(1, leftVariable.Size)  : 1;
+                int rightW = rightVec ? Math.Max(1, rightVariable.Size) : 1;
+                // numeric_std width semantics:
+                //   `+` / `-`  → max(left, right) (modular wrap is the
+                //                 expected behaviour for narrow accumulators)
+                //   `*`         → left + right    (full product needs the
+                //                 sum-of-widths or the high bits get
+                //                 silently masked — bench bug #22, surfaced
+                //                 by P1's `unsigned(A(4 downto 0)) * unsigned(B(4 downto 0))`
+                //                 once Phase E.3 started extracting the slice
+                //                 properly instead of widening to the whole
+                //                 vector).
+                string opName = OperatorName?.ToLower() ?? string.Empty;
+                int width = opName == "*"
+                    ? leftW + rightW
+                    : Math.Max(leftW, rightW);
                 int li  = GetInt(leftVariable);
                 int ri  = GetInt(rightVariable);
                 int raw = SolveIntOperation(li, ri);
@@ -745,9 +776,10 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             case "**":
                 return (int)Math.Pow(leftVariable, rightVariable);
             case "/":
-                return leftVariable / rightVariable;
+                // Divide-by-zero guard — see Operator.SolveIntOperation.
+                return rightVariable == 0 ? 0 : leftVariable / rightVariable;
             case "mod":
-                return leftVariable % rightVariable;
+                return rightVariable == 0 ? 0 : leftVariable % rightVariable;
             default:
                 return 0;
         }
@@ -770,9 +802,10 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             case "**":
                 return Math.Pow(leftVariable, rightVariable);
             case "/":
-                return leftVariable / rightVariable;
+                // Divide-by-zero guard — see Operator.SolveIntOperation.
+                return rightVariable == 0 ? 0 : leftVariable / rightVariable;
             case "mod":
-                return leftVariable % rightVariable;
+                return rightVariable == 0 ? 0 : leftVariable % rightVariable;
             default:
                 return 0;
         }

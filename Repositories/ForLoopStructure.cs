@@ -203,6 +203,7 @@ public class ForLoopStructure : ISControl
     /// </summary>
     public void Syntetize()
     {
+        Interpreter.Services.ParseTrace.Log($"ForLoop @{(_streamer.Current?.Line ?? 0) + 1}");
         _streamer.Expect(KEYWORDS); // consume 'for'
 
         // Get loop variable name
@@ -415,6 +416,35 @@ public class ForLoopStructure : ISControl
                         ReturnStatement returnStmt = new(loopVariables, _streamer);
                         returnStmt.Syntetize();
                         Tasks.Add(returnStmt);
+                        break;
+
+                    // F-G-08 pass 4 (2026-07-17): testbench-only statements.
+                    // Prevents wait/report/assert nested in a for-loop body
+                    // from mis-dispatching to for/case/if via their keyword
+                    // fall-through.
+                    case "wait":
+                        // F-G-13c (Session 23, 2026-07-18): capture the
+                        // wait as a real task so the engine's resumable
+                        // for-loop executor can yield the process here.
+                        // Prior to F-G-13c this was silently dropped, so
+                        // stimulus sweeps like `for i in … loop … wait
+                        // for T; end loop` fired every iteration at delta 0.
+                        var _wait = new WaitForStatement(_streamer, loopVariables);
+                        _wait.Syntetize();
+                        Tasks.Add(_wait);
+                        break;
+                    case "report":
+                        // F-G-11b (2026-07-18): execute reports nested inside
+                        // a for-loop body.
+                        var _rpt = new ReportStatement(loopVariables, _streamer);
+                        _rpt.Syntetize();
+                        Tasks.Add(_rpt);
+                        break;
+                    case "assert":
+                        // F-G-16 (2026-07-18): execute asserts nested inside a for-loop body.
+                        var _ass = new AssertStatement(loopVariables, _streamer);
+                        _ass.Syntetize();
+                        Tasks.Add(_ass);
                         break;
 
                     default:

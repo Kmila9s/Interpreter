@@ -526,6 +526,18 @@ public static class StandardFunctions
     /// </summary>
     private static string GetStringValue(object arg, HashSet<Variable> variables)
     {
+        // Bench bug #20: a DeferredIndex arg (slice / single-bit access on
+        // a Variable) carries live source + bounds. Evaluate every call
+        // so `unsigned(mbr_reg(7 downto 0))` sees the current slice value.
+        if (arg is Models.DeferredIndex di)
+            return di.Evaluate().Value?.ToString() ?? "";
+
+        // Sub-expression inside a function-call arg (2026-07-05 DIP-adder
+        // fix). Re-fold live so `std_logic_vector(unsigned(a)+unsigned(b))`
+        // tracks a/b changes tick-by-tick.
+        if (arg is Models.DeferredExpression de)
+            return de.Evaluate().Value?.ToString() ?? "";
+
         if (arg is Variable v)
             return v.Value?.ToString() ?? "";
 
@@ -546,6 +558,35 @@ public static class StandardFunctions
     /// </summary>
     private static int GetIntValue(object arg, HashSet<Variable> variables)
     {
+        // Bench bug #20: evaluate DeferredIndex slices live so callers like
+        // `to_integer(unsigned(addr(3 downto 0)))` see the right bits.
+        if (arg is Models.DeferredIndex di)
+        {
+            var ev = di.Evaluate();
+            string s2 = ev.Value?.ToString() ?? "";
+            if (s2.Length > 1 && s2.All(c => c == '0' || c == '1'))
+            {
+                try { return System.Convert.ToInt32(s2, 2); } catch { /* fall through */ }
+            }
+            if (int.TryParse(s2, out int dip)) return dip;
+            return 0;
+        }
+
+        // Sub-expression arg (see GetStringValue equivalent). Live-fold
+        // then interpret the folded string as int with the same binary-
+        // then-decimal precedence used for other vector reads.
+        if (arg is Models.DeferredExpression de)
+        {
+            var ev = de.Evaluate();
+            string sd = ev.Value?.ToString() ?? "";
+            if (sd.Length > 1 && sd.All(c => c == '0' || c == '1'))
+            {
+                try { return System.Convert.ToInt32(sd, 2); } catch { /* fall through */ }
+            }
+            if (int.TryParse(sd, out int dd)) return dd;
+            return 0;
+        }
+
         if (arg is Variable v)
         {
             if (v.Value is int i)

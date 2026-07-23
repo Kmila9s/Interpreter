@@ -33,6 +33,14 @@ public static class Synthesizer
         {
             foreach (var s in entity.Architecture.Signals) ctx.AddSignal(s);
 
+            // Component instantiations live in EntityRegistry (populated by
+            // Architecture.SyntetizeBehaviour), not in Architecture.Tasks.
+            // Emit one BLACKBOX_COMPONENT cell per instance so hierarchical
+            // designs (e.g. capstone-calc's calc_top) surface their
+            // sub-modules in the schematic instead of rendering as a
+            // handful of orphan primitives.
+            ComponentSynthesizer.SynthesizeAll(entity.Name, ctx);
+
             HashSet<Variable> scope = entity.Architecture.GetAllSignals();
             foreach (var task in entity.Architecture.Tasks)
             {

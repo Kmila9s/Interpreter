@@ -55,6 +55,26 @@ public class DeferredIndex
                 IsSlice ? Constants.DATATYPES.STD_LOGIC_VECTOR : Constants.DATATYPES.STD_LOGIC);
         }
 
+        // Bench bug #19: arrays of vectors (Source.ElementSize > 1) index
+        // by ELEMENT, not by bit. `rom_init(3)` returns element slot 3, an
+        // ElementSize-wide slice. Slices `(H downto L)` over such arrays
+        // aren't supported here — they're an unusual VHDL construct on an
+        // array — so we honour single-index reads only and fall through to
+        // the legacy bit path for explicit ranges.
+        if (!IsSlice && Source.ElementSize > 1)
+        {
+            int elementSize = Source.ElementSize;
+            int start = High * elementSize;
+            if (start < 0 || start + elementSize > vec.Length)
+            {
+                return new Variable($"{Source.Name}_idx_{High}",
+                    new string('U', elementSize),
+                    Constants.DATATYPES.STD_LOGIC_VECTOR);
+            }
+            string slot = vec.Substring(start, elementSize);
+            return new Variable($"{Source.Name}_idx_{High}", slot, Constants.DATATYPES.STD_LOGIC_VECTOR);
+        }
+
         if (IsSlice)
         {
             int width = High - Low + 1;

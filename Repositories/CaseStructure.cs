@@ -162,6 +162,7 @@ public class CaseStructure : ISControl
     /// </summary>
     public void Syntetize()
     {
+        Interpreter.Services.ParseTrace.Log($"CaseStructure @{(_streamer.Current?.Line ?? 0) + 1}");
         _streamer.Expect(KEYWORDS); // consume 'case'
 
         // v0.16.1: Handle optional parentheses around selector: case (selector) is
@@ -409,6 +410,24 @@ public class CaseStructure : ISControl
                         ReturnStatement returnStmt = new(_variables, _streamer);
                         returnStmt.Syntetize();
                         branch.Tasks.Add(returnStmt);
+                        break;
+
+                    // F-G-08 pass 4 (2026-07-17): testbench-only statements.
+                    case "wait":
+                        Interpreter.Services.ParseTrace.SkipWaitStatement(_streamer);
+                        break;
+                    case "report":
+                        // F-G-11b (2026-07-18): execute reports nested inside
+                        // a case when-branch.
+                        var _rpt = new ReportStatement(_variables, _streamer);
+                        _rpt.Syntetize();
+                        branch.Tasks.Add(_rpt);
+                        break;
+                    case "assert":
+                        // F-G-16 (2026-07-18): execute asserts nested inside a case when-branch.
+                        var _ass = new AssertStatement(_variables, _streamer);
+                        _ass.Syntetize();
+                        branch.Tasks.Add(_ass);
                         break;
 
                     default:

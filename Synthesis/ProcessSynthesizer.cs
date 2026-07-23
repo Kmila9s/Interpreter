@@ -452,6 +452,7 @@ internal static class ProcessSynthesizer
     {
         if (process.Tasks.Count == 1 && process.Tasks[0] is IfStructure ifs && ifs.Branches.Count >= 1)
         {
+            // Sync-reset shape: outer `if rising_edge(clk) then …`.
             var br = ifs.Branches[0];
             var (sig, rising) = DetectClockEdge(br.Condition);
             // Pattern-matching null check — see Synthesize() comment.
@@ -459,6 +460,34 @@ internal static class ProcessSynthesizer
             // correctly for two-sided null and would falsely report a
             // null sig as "non-null" here.
             if (sig is not null) return (sig, rising, br.Tasks);
+
+            // Async-reset shape: `if reset = '1' then … elsif rising_edge(clk) then …`.
+            // Recognise the reset-then-elsif-rising_edge pair, collapse the
+            // rising_edge elsif to a plain `else`, and hand the synthesised
+            // IfStructure to WalkTasks so the mux cascade + DFF wrap fire
+            // as if the process had been written with sync semantics.
+            // Simulation still runs through DeltaCycleEngine (behavioural),
+            // so this rewrite only affects the schematic view — no
+            // regression risk to SimulatorBench's async-reset cases.
+            if (ifs.Branches.Count >= 2)
+            {
+                var (sigElsif, risingElsif) = DetectClockEdge(ifs.Branches[1].Condition);
+                if (sigElsif is not null)
+                {
+                    var rewritten = new IfStructure(new HashSet<Variable>(), default!);
+                    // Keep every branch before the clocked one verbatim (typically
+                    // the async-reset branch, sometimes preceded by an async-set).
+                    for (int i = 0; i < 1; i++)
+                    {
+                        rewritten.Branches.Add(ifs.Branches[i]);
+                    }
+                    // Elsif rising_edge(clk) → collapse to a plain else so the
+                    // walker doesn't try to gate on the edge signal.
+                    var clockedElse = new IfBranch { IsElse = true, Tasks = ifs.Branches[1].Tasks };
+                    rewritten.Branches.Add(clockedElse);
+                    return (sigElsif, risingElsif, new List<object> { rewritten });
+                }
+            }
         }
         Variable? nullSig = null;
         IList<object>? nullTasks = null;

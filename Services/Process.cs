@@ -31,6 +31,42 @@ public class Process : ISControl, IControl
     private readonly OperationDetector _detector = new();
 
     /// <summary>
+    /// F-G-13 MVP (2026-07-18): program counter for the wait-scheduled
+    /// process runner. Points to the next <see cref="Tasks"/> index to
+    /// execute when the process resumes. 0 before the first run, advanced
+    /// past each <c>WaitForStatement</c> when it yields.
+    /// </summary>
+    public int Pc { get; set; } = 0;
+
+    /// <summary>
+    /// F-G-13 MVP: true when this process's body contains any
+    /// <see cref="Interpreter.Repositories.WaitForStatement"/>. Set during
+    /// <see cref="SyntetizeBehaviour"/>. The engine uses this to decide
+    /// whether the process is time-driven (F-G-13 path) or
+    /// sensitivity-driven (legacy path via
+    /// <see cref="ProcessScheduler"/>).
+    /// </summary>
+    public bool HasWait { get; private set; } = false;
+
+    /// <summary>
+    /// F-G-13 MVP: true when the process has hit a terminal wait (bare
+    /// <c>wait;</c> or unsupported <c>wait on</c>) — the engine should
+    /// NOT schedule any further resumes.
+    /// </summary>
+    public bool IsTerminated { get; set; } = false;
+
+    /// <summary>
+    /// F-G-13c (Session 23, 2026-07-18): stack of loop-iteration frames
+    /// captured when a <c>wait</c> fires inside a for/while/simple loop
+    /// body. On resume, the engine's segment runner pops these frames
+    /// (deepest first) via the resumable loop executors so iteration
+    /// continues from the statement after the wait.
+    /// Empty stack means "not currently paused inside a loop" — resume
+    /// falls through to the normal top-level <see cref="Pc"/> walk.
+    /// </summary>
+    public Stack<Interpreter.Models.LoopFrame> Frames { get; } = new();
+
+    /// <summary>
     /// Initializes a new instance of the <see cref="Process"/> class.
     /// </summary>
     /// <param name="SignalsPorts">The signals and ports of the process.</param>
@@ -182,6 +218,9 @@ public class Process : ISControl, IControl
             // Check for cancellation at each iteration
             cancellationToken.ThrowIfCancellationRequested();
 
+            if (ParseTrace.Enabled)
+                ParseTrace.Log($"Process.body iter={iterations} tok='{_streamer.Current?.Value}' @{(_streamer.Current?.Line ?? 0) + 1}");
+
             if (_streamer.Current?.Type == KEYWORDS)
             {
                 switch (_streamer.Current.Value.ToLower())
@@ -252,17 +291,35 @@ public class Process : ISControl, IControl
                         break;
 
                     case "wait":
-                        // Testbench-only construct (wait for X ns; wait until cond; wait;).
-                        // Not synthesizable — consume tokens up to the terminating ';' so the
-                        // parser doesn't drift into the next statement and treat 'for' as a
-                        // ForLoopStructure (which previously caused runaway memory consumption).
-                        SkipWaitStatement();
+                        // F-G-13 (2026-07-18): capture the wait as a
+                        // WaitForStatement task so the delta engine can
+                        // yield the process here and schedule its resume
+                        // at current_tick + delay. F-G-13b (Session 23):
+                        // pass `allVariables` so `wait until <cond>` can
+                        // compile the condition into an Operation and
+                        // extract the referenced-signals sensitivity set.
+                        var waitStmt = new Interpreter.Repositories.WaitForStatement(_streamer, allVariables);
+                        waitStmt.Syntetize();
+                        Tasks.Add(waitStmt);
+                        HasWait = true;
                         break;
 
                     case "report":
+                        // F-G-11 (2026-07-18): capture and execute at runtime
+                        // via ReportBus. Prior to F-G-11 this was skipped so
+                        // testbench self-checking sweeps produced no output.
+                        var reportStmt = new Interpreter.Repositories.ReportStatement(allVariables, _streamer);
+                        reportStmt.Syntetize();
+                        Tasks.Add(reportStmt);
+                        break;
+
                     case "assert":
-                        // Simulation-only diagnostic statements. Skip to ';'.
-                        SkipToSemicolonInclusive();
+                        // F-G-16 (2026-07-18): evaluate condition + emit the
+                        // report message when false. Prior to F-G-16 this
+                        // was skipped.
+                        var assertStmt = new Interpreter.Repositories.AssertStatement(allVariables, _streamer);
+                        assertStmt.Syntetize();
+                        Tasks.Add(assertStmt);
                         break;
 
                     default:
@@ -273,8 +330,26 @@ public class Process : ISControl, IControl
             }
             else
             {
-                // For simple assignments (signal <= value or variable := value)
-                SyntetizeAssignment(allVariables);
+                // F-G-12 (2026-07-18): dispatch procedure calls before
+                // falling through to signal/variable assignment. Detection:
+                // current token is an identifier whose name is registered
+                // in FunctionRegistry as a procedure (IsPure=false). Without
+                // this, `press_key(KEY_1);` / `begin_case("A1");` used to
+                // trip SyntetizeAssignment which then drifted through the
+                // arg list without effect.
+                if (Interpreter.Repositories.ProcedureCallStatement
+                    .IsProcedureCall(_streamer, allVariables))
+                {
+                    var call = new Interpreter.Repositories.ProcedureCallStatement(
+                        allVariables, _streamer);
+                    call.Syntetize();
+                    if (call.IsValid) Tasks.Add(call);
+                }
+                else
+                {
+                    // For simple assignments (signal <= value or variable := value)
+                    SyntetizeAssignment(allVariables);
+                }
             }
         }
 
@@ -302,27 +377,23 @@ public class Process : ISControl, IControl
     /// </remarks>
     private void SkipWaitStatement()
     {
-        _streamer.MoveNext(); // consume 'wait'
-        SkipToSemicolonInclusive();
+        // F-G-08 pass 4 (2026-07-17): delegate to the shared helper which
+        // correctly tracks in-string state so `end` inside a fragmented
+        // string literal (`report "TB: end of stimulus"` etc.) doesn't
+        // cause an early exit that leaves the process body mid-parse.
+        ParseTrace.SkipWaitStatement(_streamer);
     }
 
     /// <summary>
-    /// Skips tokens up to and including the next <c>;</c>. Stops early at
-    /// <c>end</c> as a safety net so a missing semicolon doesn't run off the
-    /// process body.
+    /// Skips tokens up to and including the next <c>;</c>. Delegates to the
+    /// shared <see cref="ParseTrace.SkipToSemicolonInclusive"/> helper so
+    /// Process and the nested-body dispatchers use identical semantics —
+    /// including the F-G-08 pass 4 fix that treats a fragmented string
+    /// literal's contents (words like <c>end</c>) as opaque.
     /// </summary>
     private void SkipToSemicolonInclusive()
     {
-        while (_streamer.Current != null
-            && _streamer.Current.Value != ";"
-            && _streamer.Current.Value.ToLower() != "end")
-        {
-            _streamer.MoveNext();
-        }
-        if (_streamer.Current?.Value == ";")
-        {
-            _streamer.MoveNext();
-        }
+        ParseTrace.SkipToSemicolonInclusive(_streamer);
     }
 
     /// <summary>

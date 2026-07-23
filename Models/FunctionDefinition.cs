@@ -72,6 +72,16 @@ public class FunctionDefinition
     public List<Variable> LocalVariables { get; set; } = new();
 
     /// <summary>
+    /// Bench bug #19 perf follow-up: cached per-function-definition scope
+    /// used by ExecuteFunctionBody. SynthesizeFunctionBody binds the body's
+    /// Operations to the Variable instances in this scope; subsequent calls
+    /// update those Variables' .Value in place rather than re-synthesising
+    /// against a fresh scope (which was 20× slower on P22/P3). Null until
+    /// the first call synthesises the body.
+    /// </summary>
+    public HashSet<Variable>? CachedScope { get; set; } = null;
+
+    /// <summary>
     /// Gets or sets the package this function belongs to.
     /// </summary>
     public string? PackageName { get; set; }

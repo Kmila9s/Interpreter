@@ -134,12 +134,19 @@ public class SelectedAssignment : ISControl
         SelectionChoice? matched = null;
         SelectionChoice? defaultChoice = null;
 
+        // 2026-07-05 (STATUS §1): compare via numeric-value normalisation
+        // when both sides parse as integers. Previously a vector selector
+        // ("0001") never matched a decimal alternative ("1") because the
+        // clean-value string compare hit "0001" != "1". Now the check
+        // first normalises both sides to integers via BinaryOrDecimalToInt
+        // and falls back to string equality only when either side isn't
+        // numeric. Also handles bit-string chars ('0', '1').
         foreach (var choice in Choices)
         {
             if (choice.IsOthers) { defaultChoice = choice; continue; }
             foreach (var choiceVal in choice.Choices)
             {
-                if (CleanValue(choiceVal).Equals(CleanValue(selectorValue), StringComparison.OrdinalIgnoreCase))
+                if (ChoicesMatch(choiceVal, selectorValue))
                 {
                     matched = choice;
                     break;
@@ -174,6 +181,51 @@ public class SelectedAssignment : ISControl
     private static string CleanValue(string value)
     {
         return value.Replace("\"", "").Replace("'", "").Trim();
+    }
+
+    /// <summary>
+    /// Numeric-first alternative match for with…select. Tries both sides as
+    /// integers (accepting bit-string, decimal, or hex); falls back to case-
+    /// insensitive string equality when either side isn't numeric. Closes
+    /// STATUS §1: `when 0|1|7` vs. an `std_logic_vector` selector.
+    /// </summary>
+    private static bool ChoicesMatch(string choiceVal, string selectorValue)
+    {
+        var a = CleanValue(choiceVal);
+        var b = CleanValue(selectorValue);
+        if (TryParseInt(a, out long ai) && TryParseInt(b, out long bi))
+            return ai == bi;
+        return a.Equals(b, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Parse decimal, binary bit-string (all 0/1), or hex (0x…, x"…") into
+    /// a long. Empty/mixed strings return false so the caller falls back to
+    /// string comparison. Guards STATUS §1 with…select mixed alternatives.
+    /// </summary>
+    private static bool TryParseInt(string s, out long value)
+    {
+        value = 0;
+        if (string.IsNullOrEmpty(s)) return false;
+        // Bit-string: all 0/1 → binary. Guard against being fooled by
+        // decimal integers that happen to be `0` or `1`.
+        bool allBits = s.All(c => c == '0' || c == '1');
+        if (allBits)
+        {
+            try { value = Convert.ToInt64(s, 2); return true; }
+            catch { /* fall through */ }
+        }
+        if (long.TryParse(s, System.Globalization.NumberStyles.Integer,
+                          System.Globalization.CultureInfo.InvariantCulture, out value))
+            return true;
+        // Simple hex: "0x…" or "x…".
+        var h = s;
+        if (h.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) h = h.Substring(2);
+        else if (h.StartsWith("x", StringComparison.OrdinalIgnoreCase)) h = h.Substring(1);
+        else if (h.StartsWith("X", StringComparison.OrdinalIgnoreCase)) h = h.Substring(1);
+        else return false;
+        return long.TryParse(h, System.Globalization.NumberStyles.HexNumber,
+                             System.Globalization.CultureInfo.InvariantCulture, out value);
     }
 
     /// <summary>

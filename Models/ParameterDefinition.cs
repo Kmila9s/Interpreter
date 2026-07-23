@@ -49,6 +49,18 @@ public class ParameterDefinition
     public ParameterMode Mode { get; set; } = ParameterMode.In;
 
     /// <summary>
+    /// F-G-14 (Session 23, 2026-07-18): true when the formal is declared
+    /// with the <c>signal</c> object class. Signals passed as procedure
+    /// arguments must be aliased to the caller's Variable object at call
+    /// time so <c>&lt;=</c> inside the procedure body schedules against
+    /// the caller's driver via the delta cycle rather than writing to a
+    /// local shadow. The <c>signal</c> / <c>variable</c> keyword before
+    /// the name list is captured in <see cref="Services.VariableSyntetizer"/>'s
+    /// parameter parser (previously silently dropped).
+    /// </summary>
+    public bool IsSignal { get; set; } = false;
+
+    /// <summary>
     /// Gets or sets the size for vector types.
     /// </summary>
     public int Size { get; set; } = 0;

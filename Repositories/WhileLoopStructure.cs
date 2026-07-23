@@ -174,6 +174,7 @@ public class WhileLoopStructure : ISControl
     /// </summary>
     public void Syntetize()
     {
+        Interpreter.Services.ParseTrace.Log($"WhileLoop @{(_streamer.Current?.Line ?? 0) + 1}");
         _streamer.Expect(KEYWORDS); // consume 'while'
 
         // Parse condition until 'loop'
@@ -266,6 +267,35 @@ public class WhileLoopStructure : ISControl
                         ReturnStatement returnStmt = new(_variables, _streamer);
                         returnStmt.Syntetize();
                         Tasks.Add(returnStmt);
+                        break;
+
+                    // F-G-08 pass 4 (2026-07-17): testbench-only statements.
+                    // Same shape as Process.SyntetizeBehaviour's handler —
+                    // without this a `wait for N ns;` nested in a while loop
+                    // (e.g. a clock-generator process) mis-dispatched its
+                    // trailing `for` as a for-loop header and hung the parser.
+                    case "wait":
+                        // F-G-13c (Session 23, 2026-07-18): capture the
+                        // wait as a real task so the engine's resumable
+                        // while-loop executor can yield here (the classic
+                        // clock-generator idiom is `while X loop clk<=…;
+                        // wait for T; end loop`).
+                        var _wait = new WaitForStatement(_streamer, _variables);
+                        _wait.Syntetize();
+                        Tasks.Add(_wait);
+                        break;
+                    case "report":
+                        // F-G-11b (2026-07-18): execute reports nested inside
+                        // a while-loop body too, not just at process top level.
+                        var _rpt = new ReportStatement(_variables, _streamer);
+                        _rpt.Syntetize();
+                        Tasks.Add(_rpt);
+                        break;
+                    case "assert":
+                        // F-G-16 (2026-07-18): execute asserts nested inside a while-loop body.
+                        var _ass = new AssertStatement(_variables, _streamer);
+                        _ass.Syntetize();
+                        Tasks.Add(_ass);
                         break;
 
                     default:

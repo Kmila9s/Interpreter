@@ -159,6 +159,12 @@ public class SignalHistory
     /// </summary>
     public void RecordChangesWithLines(IReadOnlyDictionary<Variable, int> signalsWithLines, int timeMoment)
     {
+        // F-G-08 pass 2 (2026-07-16): hoist the per-entry IsRecording check
+        // out of the loop. Pass 1's KMILA_SIM_NO_HISTORY=1 opt-out flipped
+        // IsRecording, but RecordChange's own guard still paid the dict
+        // enumeration + N method calls per delta. Free skip now.
+        if (!IsRecording) return;
+
         foreach (var kv in signalsWithLines)
         {
             RecordChange(kv.Key, timeMoment, kv.Key.Value, kv.Value);
@@ -482,8 +488,14 @@ public class SignalHistory
             sb.AppendLine("   1ps");
             sb.AppendLine("$end");
 
-            // Variable definitions
-            var signals = _history.Keys.OrderBy(k => k.Name).ToList();
+            // Variable definitions. Constants (`constant X : integer := ...;`)
+            // never change over sim-time so VCD viewers shouldn't carry them
+            // as $var entries — they'd render as flat straight lines and
+            // clutter the pane. Audit F-G-03 (2026-07-09).
+            var signals = _history.Keys
+                .Where(k => !k.IsConstant)
+                .OrderBy(k => k.Name)
+                .ToList();
             var signalIds = new Dictionary<Variable, string>();
 
             sb.AppendLine($"$scope module {moduleName} $end");

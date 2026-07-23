@@ -34,6 +34,9 @@ public static class SynthesisTests
             ("Combinational process with if → MUX, no DFF", TestCombinationalIfMux),
             ("Process with case statement → MUX cascade", TestProcessCase),
             ("Layout produces deterministic coordinates", TestLayoutDeterminism),
+            ("Probe: dip-adder resize/unsigned/+ chain",   TestDipAdderProbe),
+            ("Async-reset (if reset then; elsif rising_edge) → DFF", TestAsyncResetDff),
+            ("Component instantiation → BLACKBOX_COMPONENT cell",   TestComponentInstantiationBlackbox),
         };
 
         foreach (var (name, run) in tests)
@@ -377,6 +380,131 @@ public static class SynthesisTests
     /// the same netlist must produce identical coordinates. This makes
     /// snapshot testing meaningful in the future.
     /// </summary>
+    /// <summary>
+    /// Diagnostic probe — the exact dip-adder assignment
+    /// `sum &lt;= std_logic_vector(resize(unsigned(a), 5) + resize(unsigned(b), 5))`.
+    /// Prints the emitted CellKind sequence so we can see whether ADD, RESIZE, and
+    /// the two `unsigned` BUF-casts land. Passes iff at least one ADD cell is emitted
+    /// (the presence-check is what the schematic export failure boils down to).
+    /// </summary>
+    private static bool TestDipAdderProbe()
+    {
+        var (entity, scope) = BuildEntity("dip_adder", new[] {
+            ("a",   PortType.IN,  DATATYPES.STD_LOGIC_VECTOR, 4),
+            ("b",   PortType.IN,  DATATYPES.STD_LOGIC_VECTOR, 4),
+            ("sum", PortType.OUT, DATATYPES.STD_LOGIC_VECTOR, 5),
+        });
+        entity.Architecture.Tasks.Add(new Operation(
+            "sum <= std_logic_vector(resize(unsigned(a), 5) + resize(unsigned(b), 5))", scope));
+        var net = Synthesizer.Synthesize(entity);
+        var kinds = net.Cells.Select(c => c.Kind.ToString()).ToList();
+        Console.WriteLine($"  cells: [{string.Join(", ", kinds)}]");
+        int adds    = net.Cells.Count(c => c.Kind == CellKind.ADD);
+        int resizes = net.Cells.Count(c => c.Kind == CellKind.RESIZE);
+        int bufs    = net.Cells.Count(c => c.Kind == CellKind.BUF);
+        Console.WriteLine($"  ADD={adds}  RESIZE={resizes}  BUF={bufs}");
+        return adds >= 1;
+    }
+
+    /// <summary>
+    /// Async-reset pattern: <c>process(clk, reset) if reset = '1' then q &lt;= '0'
+    /// elsif rising_edge(clk) then q &lt;= d end if</c>. Must emit at least one DFF.
+    /// Regression for the shift-register schematic bug where async-reset processes
+    /// silently degraded to combinational (BUF/MUX only, no DFF).
+    /// </summary>
+    private static bool TestAsyncResetDff()
+    {
+        var (entity, scope) = BuildEntity("e_dff_async", new[] {
+            ("clk",   PortType.IN,  DATATYPES.STD_LOGIC, 1),
+            ("reset", PortType.IN,  DATATYPES.STD_LOGIC, 1),
+            ("d",     PortType.IN,  DATATYPES.STD_LOGIC, 1),
+            ("q",     PortType.OUT, DATATYPES.STD_LOGIC, 1),
+        });
+        var clk   = scope.First(v => v.Name == "clk");
+        var reset = scope.First(v => v.Name == "reset");
+        var proc  = new Process(scope, default!);
+        proc.SensitiveList.Add(clk);
+        proc.SensitiveList.Add(reset);
+        var ifs = new IfStructure(scope, default!);
+        var resetBr = new IfBranch
+        {
+            Condition = new Operation("_c <= reset = '1'",
+                new HashSet<Variable>(scope) { new Variable("_c", "false", DATATYPES.BOOLEAN) { PortType = PortType.OUT } }),
+        };
+        resetBr.Tasks.Add(new Operation("q <= '0'", scope));
+        var clkBr = new IfBranch
+        {
+            Condition = new Operation("_c <= rising_edge(clk)",
+                new HashSet<Variable>(scope) { new Variable("_c", "false", DATATYPES.BOOLEAN) { PortType = PortType.OUT } }),
+        };
+        clkBr.Tasks.Add(new Operation("q <= d", scope));
+        ifs.Branches.Add(resetBr);
+        ifs.Branches.Add(clkBr);
+        proc.Tasks.Add(ifs);
+        entity.Architecture.Tasks.Add(proc);
+
+        var net = Synthesizer.Synthesize(entity);
+        int dff = net.Cells.Count(c => c.Kind == CellKind.DFF);
+        int blackbox = net.Cells.Count(c => c.Kind == CellKind.BLACKBOX_PROCESS);
+        Console.WriteLine($"  cells: [{string.Join(", ", net.Cells.Select(c => c.Kind))}]");
+        return dff >= 1 && blackbox == 0;
+    }
+
+    /// <summary>
+    /// Hierarchical design: `top_entity` port-maps to `sub_entity`. After
+    /// registering the instance in <see cref="EntityRegistry"/>, the
+    /// synthesizer must emit a BLACKBOX_COMPONENT cell whose pins are
+    /// wired to `top_entity`'s ports/signals. Regression coverage for
+    /// finding #9 — capstone-calc's invisible hierarchy.
+    /// </summary>
+    private static bool TestComponentInstantiationBlackbox()
+    {
+        // Reset the singleton so this test doesn't inherit state from prior tests
+        // (or the test runner's earlier iterations of this same test).
+        EntityRegistry.Reset();
+
+        // Build the resolved sub-entity so the synthesizer can look up
+        // formal-pin directions and place inputs/outputs on the correct
+        // edges of the glyph.
+        var subInfo = new EntityInfo
+        {
+            Name = "sub_entity",
+            Ports = new HashSet<Variable>
+            {
+                new Variable("a") { Type = DATATYPES.STD_LOGIC, PortType = PortType.IN,  IsPort = true },
+                new Variable("y") { Type = DATATYPES.STD_LOGIC, PortType = PortType.OUT, IsPort = true },
+            },
+        };
+        EntityRegistry.Instance.RegisterEntity(subInfo);
+
+        var (entity, _) = BuildEntity("top_entity", new[] {
+            ("x", PortType.IN,  DATATYPES.STD_LOGIC, 1),
+            ("z", PortType.OUT, DATATYPES.STD_LOGIC, 1),
+        });
+        var inst = new ComponentInstance
+        {
+            InstanceName = "u_sub",
+            EntityName = "sub_entity",
+            LibraryName = "work",
+            PortMap = { ["a"] = "x", ["y"] = "z" },
+        };
+        EntityRegistry.Instance.RegisterComponentInstance("top_entity", inst);
+
+        var net = Synthesizer.Synthesize(entity);
+        int bb = net.Cells.Count(c => c.Kind == CellKind.BLACKBOX_COMPONENT);
+        var cell = net.Cells.FirstOrDefault(c => c.Kind == CellKind.BLACKBOX_COMPONENT);
+        Console.WriteLine($"  cells: [{string.Join(", ", net.Cells.Select(c => c.Kind))}]");
+        if (cell == null) return false;
+        Console.WriteLine($"  BLACKBOX_COMPONENT inputs=[{string.Join(", ", cell.Inputs.Select(p => p.Name))}] " +
+                          $"outputs=[{string.Join(", ", cell.Outputs.Select(p => p.Name))}]");
+        bool hasInputA  = cell.Inputs.Any(p => p.Name == "a");
+        bool hasOutputY = cell.Outputs.Any(p => p.Name == "y");
+        bool labelOk    = cell.Attrs != null && cell.Attrs.TryGetValue("Op", out var op) && op == "sub_entity";
+        // Cleanup — don't leak state into the next test.
+        EntityRegistry.Reset();
+        return bb == 1 && hasInputA && hasOutputY && labelOk;
+    }
+
     private static bool TestLayoutDeterminism()
     {
         var (entity, scope) = BuildEntity("e8", new[] {

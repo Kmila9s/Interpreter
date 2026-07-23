@@ -143,6 +143,17 @@ internal static class ConcurrentAssignSynthesizer
                     if (nestedR is { } nr) nets.Add(nr.OutputNet);
                     else nets.Add(ctx.Constant($"@nested_{nested.FunctionName}", 1));
                     break;
+                case DeferredExpression dexpr:
+                    // Sub-expression passed as a function argument, e.g. the
+                    // `resize(unsigned(a), 5) + resize(unsigned(b), 5)` inside
+                    // `std_logic_vector(...)`. The parser wraps such argument
+                    // expressions in DeferredExpression rather than folding
+                    // them into the outer postfix stream, so the synthesizer
+                    // must walk the buffered items and emit an equivalent
+                    // cell chain here. Left-associative fold mirrors
+                    // DeferredExpression.Evaluate() at runtime.
+                    nets.Add(ResolveDeferredExpression(dexpr, ctx));
+                    break;
                 case string s when df.Variables.FirstOrDefault(
                     x => x.Name.Equals(s, StringComparison.OrdinalIgnoreCase)) is { } found:
                     nets.Add(NetForVariable(found, ctx));
@@ -159,6 +170,81 @@ internal static class ConcurrentAssignSynthesizer
             }
         }
         return nets;
+    }
+
+    /// <summary>
+    /// Synthesise a <see cref="DeferredExpression"/> — the buffered
+    /// sub-expression the parser stashes when an outer function call
+    /// receives a mixed operator+operand tree as an argument. Items are
+    /// laid out infix: <c>[operand, op, operand, op, operand, …]</c>.
+    /// We emit one cell per operator, left-associatively, and return the
+    /// net that carries the final result.
+    /// </summary>
+    private static Net ResolveDeferredExpression(DeferredExpression dexpr, SynthesisContext ctx)
+    {
+        var items = dexpr.Items;
+        if (items.Count == 0) return ctx.Constant("@dexpr_empty", 1);
+        if (items.Count == 1) return ResolveDeferredItem(items[0], ctx);
+
+        // Shape must alternate operand-op-operand-op-…; malformed input
+        // falls back to the first operand (matches Evaluate's guard).
+        for (int i = 0; i < items.Count; i++)
+        {
+            bool shouldBeOp = (i % 2) == 1;
+            bool isOp = items[i] is Operator;
+            if (shouldBeOp != isOp) return ResolveDeferredItem(items[0], ctx);
+        }
+
+        Net acc = ResolveDeferredItem(items[0], ctx);
+        for (int i = 1; i + 1 < items.Count; i += 2)
+        {
+            var opr = (Operator)items[i];
+            var right = ResolveDeferredItem(items[i + 1], ctx);
+            var (kind, isUnary) = ClassifyOperator(opr);
+            if (isUnary) continue; // shouldn't appear infix — skip defensively
+
+            int outWidth = Math.Max(acc.Width, right.Width);
+            if (opr.OperatorType == OperatorType.COMPARATION) outWidth = 1;
+
+            var outNet = ctx.NewInternal(width: outWidth, sourceLine: null);
+            ctx.AddCell(
+                kind: kind,
+                inputs: new[] { new Pin("A", acc.Id), new Pin("B", right.Id) },
+                outputs: new[] { new Pin("Y", outNet.Id) },
+                sourceLine: null,
+                attrs: new Dictionary<string, string> { ["Op"] = opr.OperatorName });
+            acc = outNet;
+        }
+        return acc;
+    }
+
+    /// <summary>
+    /// Resolve one item inside a <see cref="DeferredExpression"/> to a net.
+    /// Mirrors the operand branches of the outer expression walker but
+    /// operates on a single-item basis so
+    /// <see cref="ResolveDeferredExpression"/> can drive it.
+    /// </summary>
+    private static Net ResolveDeferredItem(object item, SynthesisContext ctx)
+    {
+        switch (item)
+        {
+            case Variable v:
+                return NetForVariable(v, ctx);
+            case DeferredFunction df:
+                var args = ResolveDeferredArgs(df, ctx);
+                var r = IEEEPrimitives.TryLower(df.FunctionName,
+                    new IEEEPrimitiveArgs(args, ctx, SourceLine: null));
+                if (r is { } lower) return lower.OutputNet;
+                return ctx.Constant($"@dexpr_{df.FunctionName}", 1);
+            case DeferredExpression nested:
+                return ResolveDeferredExpression(nested, ctx);
+            case int n:
+                return ctx.Constant(n.ToString(), Math.Max(1, n));
+            case string s:
+                return ctx.Constant("Literal-" + s, s.Length > 0 ? s.Length : 1);
+            default:
+                return ctx.Constant($"@dexpr_item_{item?.GetType().Name ?? "null"}", 1);
+        }
     }
 
     private static void HandleOperator(Operator opr, Stack<Net> stack, SynthesisContext ctx, string? sourceLine)

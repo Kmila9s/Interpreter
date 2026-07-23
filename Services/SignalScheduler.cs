@@ -64,6 +64,16 @@ public class SignalScheduler
     private readonly Dictionary<Variable, Dictionary<int, (char bit, int sourceLine)>> _pendingBitWrites = new();
 
     /// <summary>
+    /// F-G-08 pass 2 (2026-07-16): reusable scratch buffer returned by
+    /// <see cref="ApplyCurrentUpdatesWithLines"/>. The caller consumes the
+    /// returned dictionary synchronously before the next apply call (see
+    /// <c>DeltaCycleEngine.RunDeltaCycleAsync</c>, which snapshots the
+    /// per-frame copy into its own container), so reuse is safe. Saves one
+    /// dict allocation per delta.
+    /// </summary>
+    private readonly Dictionary<Variable, int> _changedScratch = new();
+
+    /// <summary>
     /// Schedules a signal update for the current delta cycle.
     /// The update will be applied when ApplyCurrentUpdates() is called.
     /// </summary>
@@ -157,6 +167,35 @@ public class SignalScheduler
     }
 
     /// <summary>
+    /// Expand an `(others=>X)` aggregate-marker string to a literal bitstring
+    /// matching the target signal's declared width. Without this, the marker
+    /// emitted by <c>Operation.ParseOthersAggregate</c> and the init-value
+    /// path in <c>VariableSyntetizer</c> would land in the target's Value
+    /// verbatim — the VCD writer then emits the 11-char string (non-bit chars
+    /// map to 'x') instead of, say, eight clean zeros. The init-value path
+    /// has its own eager-expansion guard at construction; this is the
+    /// engine-side guard for sequential / concurrent <c>signal &lt;=
+    /// (others =&gt; '0')</c> assignments.
+    /// </summary>
+    private static object ExpandAggregateMarker(object newValue, Variable target)
+    {
+        if (newValue is string s
+            && target.Size > 0
+            && s.StartsWith("(others=>", StringComparison.Ordinal))
+        {
+            int arrow = s.IndexOf("=>", StringComparison.Ordinal);
+            int close = s.IndexOf(')', arrow);
+            if (arrow >= 0 && close > arrow + 2)
+            {
+                string inner = s.Substring(arrow + 2, close - arrow - 2).Trim();
+                char fill = inner.Length > 0 ? inner[0] : '0';
+                return new string(fill, target.Size);
+            }
+        }
+        return newValue;
+    }
+
+    /// <summary>
     /// Phase B+ Deep AST (2026-05-19): drains the per-delta queue, returning
     /// the signals that actually changed along with the 1-based source line
     /// of the operation that drove each change (0 when unknown). When
@@ -165,14 +204,15 @@ public class SignalScheduler
     /// </summary>
     public Dictionary<Variable, int> ApplyCurrentUpdatesWithLines()
     {
-        var changed = new Dictionary<Variable, int>();
+        var changed = _changedScratch;
+        changed.Clear();
         lock (_lock)
         {
             while (_currentDeltaUpdates.Count > 0)
             {
                 var update = _currentDeltaUpdates.Dequeue();
                 object? oldValue = update.Target.Value;
-                update.Target.Value = update.NewValue;
+                update.Target.Value = ExpandAggregateMarker(update.NewValue, update.Target);
                 if (!Equals(oldValue, update.Target.Value))
                 {
                     changed[update.Target] = update.SourceLine;

@@ -56,6 +56,17 @@ public class SimulationRunner : IDisposable
     public event Action<DeltaCycleEngine>? OnEngineReady;
 
     /// <summary>
+    /// F-G-11 (2026-07-18): fires each time a VHDL <c>report</c> statement
+    /// executes in a process body. Forwarded from <see cref="ReportBus"/>,
+    /// which <see cref="Interpreter.Repositories.ReportStatement.ExecuteAsync"/>
+    /// publishes to. Subscribe here (rather than to <see cref="ReportBus"/>
+    /// directly) so the subscription automatically clears when the run
+    /// completes — a static bus keeps subscribers alive across runs
+    /// otherwise, which pollutes downstream logs.
+    /// </summary>
+    public event Action<string>? OnReport;
+
+    /// <summary>
     /// Runs the simulation to completion based on the provided config.
     /// Follows the proven pattern from Interpreter/Program.cs:RunSimulation.
     /// </summary>
@@ -67,6 +78,23 @@ public class SimulationRunner : IDisposable
         _isRunning = true;
         _isPaused = false;
         _cts = new CancellationTokenSource();
+
+        // F-G-08 pass 3 diag (2026-07-16): opt-in wall-clock cancel. Set
+        // KMILA_SIM_WALL_TIMEOUT_MS=<ms> to auto-cancel the run after N ms
+        // — the diagnostic summary the engine emits will then reflect
+        // however many ticks/deltas managed to run in that window. Off by
+        // default (0 = disabled).
+        var wallEnv = Environment.GetEnvironmentVariable("KMILA_SIM_WALL_TIMEOUT_MS");
+        if (int.TryParse(wallEnv, out int wallMs) && wallMs > 0)
+        {
+            _cts.CancelAfter(TimeSpan.FromMilliseconds(wallMs));
+        }
+
+        // F-G-11 (2026-07-18): bridge ReportBus → this runner's OnReport for
+        // the lifetime of the run. Unsubscribe in finally so the static bus
+        // doesn't accumulate stale listeners across simulate calls.
+        void ReportForwarder(string msg) => OnReport?.Invoke(msg);
+        ReportBus.Instance.OnReport += ReportForwarder;
 
         try
         {
@@ -129,6 +157,12 @@ public class SimulationRunner : IDisposable
             // their first load.
             _engine = new DeltaCycleEngine();
             _engine.Initialize(allSignals, arch.Tasks);
+
+            // F-G-08 pass 3 diag (2026-07-16): propagate the runner's cancel
+            // into the engine so KMILA_SIM_WALL_TIMEOUT_MS actually breaks
+            // out of a long delta-cycle loop (RunTimeStepAsync's loop condition
+            // checks its own _cts, not the runner's).
+            _cts.Token.Register(() => _engine?.Stop());
 
             // Apply clock initial states (observed as a real transition)
             foreach (var clk in config.Clocks)
@@ -261,11 +295,19 @@ public class SimulationRunner : IDisposable
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            OnError?.Invoke(ex.Message);
+            // Include the stack trace's first usable frames so headless callers
+            // can pinpoint the failure rather than just see the generic
+            // "Object reference not set" string.
+            var st = ex.StackTrace ?? string.Empty;
+            var firstFrame = st.Split('\n').FirstOrDefault()?.Trim() ?? string.Empty;
+            OnError?.Invoke($"{ex.GetType().Name}: {ex.Message} | {firstFrame}");
             OnSimulationEnded?.Invoke(false);
         }
         finally
         {
+            // F-G-11: tear down the ReportBus bridge so the static event
+            // doesn't retain this closure across runs.
+            ReportBus.Instance.OnReport -= ReportForwarder;
             _isRunning = false;
             _isPaused = false;
         }

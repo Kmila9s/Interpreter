@@ -132,6 +132,7 @@ public class IfStructure : ISControl
     /// </summary>
     public void Syntetize()
     {
+        ParseTrace.Log($"IfStructure @{(_streamer.Current?.Line ?? 0) + 1}");
         // Parse the main 'if' branch
         SyntetizeIfBranch();
 
@@ -316,6 +317,26 @@ public class IfStructure : ISControl
                         ReturnStatement returnStmt = new(_variables, _streamer);
                         returnStmt.Syntetize();
                         branch.Tasks.Add(returnStmt);
+                        break;
+
+                    // F-G-08 pass 4 (2026-07-17): testbench-only statements.
+                    // Prevents nested `wait for … ns;` / `report …;` / `assert …;`
+                    // from mis-dispatching their trailing tokens as for/while headers.
+                    case "wait":
+                        Interpreter.Services.ParseTrace.SkipWaitStatement(_streamer);
+                        break;
+                    case "report":
+                        // F-G-11b (2026-07-18): execute reports nested inside
+                        // an if/elsif/else branch.
+                        var _rpt = new ReportStatement(_variables, _streamer);
+                        _rpt.Syntetize();
+                        branch.Tasks.Add(_rpt);
+                        break;
+                    case "assert":
+                        // F-G-16 (2026-07-18): execute asserts nested inside an if/elsif/else branch.
+                        var _ass = new AssertStatement(_variables, _streamer);
+                        _ass.Syntetize();
+                        branch.Tasks.Add(_ass);
                         break;
 
                     default:

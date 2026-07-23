@@ -27,7 +27,12 @@ public enum CellKind {
     RESIZE,
     /// <summary>Posedge or negedge detector on a clock-class wire.</summary>
     EDGE_DETECT,
-    BLACKBOX_PROCESS
+    BLACKBOX_PROCESS,
+    /// <summary>Opaque module for a component instantiation. Rendered as a
+    /// rectangle with one pin per port-map binding; the label carries the
+    /// referenced entity name so students see the hierarchy without the
+    /// synth pass having to inline every sub-module.</summary>
+    BLACKBOX_COMPONENT
 }
 
 /// <summary>

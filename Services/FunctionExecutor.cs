@@ -86,13 +86,23 @@ public class FunctionExecutor
 
         try
         {
-            // Create local scope with parameters
-            HashSet<Variable> localScope = CreateLocalScope(function, arguments, callerVariables);
-
-            // Synthesize body if not already done
-            if (!function.IsSynthesized)
+            // Bench bug #19 perf follow-up: reuse the synthesised body's
+            // CachedScope across calls — its parameter Variables already
+            // back the body's Operations. We just refresh their .Value
+            // from the current call's arguments. Without this, every call
+            // re-synthesised against a fresh scope, which was ~20× slower
+            // on signal-heavy designs (P22, P3) and made P4 unusable.
+            HashSet<Variable> localScope;
+            if (function.IsSynthesized && function.CachedScope != null)
             {
+                localScope = function.CachedScope;
+                RefreshScopeArgs(function, localScope, arguments, callerVariables);
+            }
+            else
+            {
+                localScope = CreateLocalScope(function, arguments, callerVariables);
                 SynthesizeFunctionBody(function, localScope);
+                function.CachedScope = localScope;
             }
 
             // Execute the function body
@@ -110,6 +120,44 @@ public class FunctionExecutor
     public async Task<object?> ExecuteFunctionAsync(string functionName, object[] arguments, HashSet<Variable> callerVariables)
     {
         return await Task.Run(() => ExecuteFunction(functionName, arguments, callerVariables));
+    }
+
+    /// <summary>
+    /// Bench bug #19 perf: refreshes the cached scope's parameter Variables
+    /// with the current call's arguments. The Variable instances stay the
+    /// same (so the body's already-synthesised Operations remain valid);
+    /// only their .Value is updated. Also rewires caller-scope references
+    /// (constants/signals visible from the call site) so concurrent
+    /// changes flow through.
+    /// </summary>
+    private void RefreshScopeArgs(FunctionDefinition function, HashSet<Variable> localScope,
+                                  object[] arguments, HashSet<Variable> callerVariables)
+    {
+        // Refresh parameter values in place.
+        for (int i = 0; i < function.Parameters.Count && i < arguments.Length; i++)
+        {
+            var param = function.Parameters[i];
+            object? value = arguments[i];
+            if (value is Variable varValue) value = varValue.Value;
+            var existing = localScope.FirstOrDefault(v =>
+                v.Name.Equals(param.Name, StringComparison.OrdinalIgnoreCase));
+            if (existing != null && value != null)
+            {
+                existing.Value = value;
+            }
+        }
+
+        // Reset local variables to their declared defaults so the body
+        // executes from a known state on every call.
+        foreach (var localVar in function.LocalVariables)
+        {
+            var existing = localScope.FirstOrDefault(v =>
+                v.Name.Equals(localVar.Name, StringComparison.OrdinalIgnoreCase));
+            if (existing != null && localVar.Value != null)
+            {
+                existing.Value = localVar.Value;
+            }
+        }
     }
 
     /// <summary>

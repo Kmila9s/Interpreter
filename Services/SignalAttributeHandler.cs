@@ -9,20 +9,22 @@ namespace Interpreter.Services;
 /// </summary>
 public class SignalAttributeHandler
 {
-    /// <summary>
-    /// Stores the previous values of signals for 'event and 'last_value detection.
-    /// </summary>
-    private readonly Dictionary<string, object> _previousValues = new(StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>
-    /// Stores the active flag for signals (whether they had an event this delta cycle).
-    /// </summary>
-    private readonly Dictionary<string, bool> _activeFlags = new(StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>
-    /// Stores the stable flag for signals (whether they have been stable).
-    /// </summary>
-    private readonly Dictionary<string, bool> _stableFlags = new(StringComparer.OrdinalIgnoreCase);
+    // F-G-08 (2026-07-15): keyed by Variable reference (identity hash). The
+    // previous string-keyed maps did case-folding hash on every read/write —
+    // triggered by every Variable.Value change through the OnValueChange
+    // event — and were a leading contributor to O(N)-per-tick cost on the
+    // 196-signal capstone design. Kept the name-lookup overloads for
+    // EvaluateAttribute (called at parse-driven expression eval) which
+    // arrives with a string signal name from source; that path pays the old
+    // cost but fires only from user-code paths, not the engine's hot loop.
+    /// <summary>Stores the previous values of signals for 'event and 'last_value detection.</summary>
+    private readonly Dictionary<Variable, object> _previousValues = new();
+    /// <summary>Name → Variable index kept in sync so EvaluateAttribute-by-name still resolves.</summary>
+    private readonly Dictionary<string, Variable> _byName = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Stores the active flag for signals (whether they had an event this delta cycle).</summary>
+    private readonly Dictionary<Variable, bool> _activeFlags = new();
+    /// <summary>Stores the stable flag for signals (whether they have been stable).</summary>
+    private readonly Dictionary<Variable, bool> _stableFlags = new();
 
     /// <summary>
     /// Singleton instance for global signal tracking.
@@ -44,10 +46,11 @@ public class SignalAttributeHandler
         // inherit stale state from the prior run (eg. _previousValues["clk"]
         // = "1") and the next stimulus event would be silently swallowed.
         // Bug #18 fix.
-        string key = signal.Name;
-        _previousValues[key] = signal.Value;
-        _activeFlags[key] = false;
-        _stableFlags[key] = true;
+        _previousValues[signal] = signal.Value;
+        _activeFlags[signal] = false;
+        _stableFlags[signal] = true;
+        if (!string.IsNullOrEmpty(signal.Name))
+            _byName[signal.Name] = signal;
 
         // Subscribe to value changes
         signal.OnValueChange += OnSignalValueChange;
@@ -58,12 +61,12 @@ public class SignalAttributeHandler
     /// </summary>
     private void OnSignalValueChange(Variable signal)
     {
-        string key = signal.Name;
-        if (_previousValues.TryGetValue(key, out var prevValue))
+        if (_previousValues.TryGetValue(signal, out var prevValue))
         {
             // Signal had an event if value changed
-            _activeFlags[key] = !Equals(prevValue, signal.Value);
-            _stableFlags[key] = Equals(prevValue, signal.Value);
+            bool changed = !Equals(prevValue, signal.Value);
+            _activeFlags[signal] = changed;
+            _stableFlags[signal] = !changed;
         }
     }
 
@@ -72,8 +75,8 @@ public class SignalAttributeHandler
     /// </summary>
     public void UpdatePreviousValue(Variable signal)
     {
-        _previousValues[signal.Name] = signal.Value;
-        _activeFlags[signal.Name] = false;
+        _previousValues[signal] = signal.Value;
+        _activeFlags[signal] = false;
     }
 
     /// <summary>
@@ -93,15 +96,18 @@ public class SignalAttributeHandler
     /// </summary>
     public bool GetEvent(Variable signal)
     {
-        return _activeFlags.TryGetValue(signal.Name, out var active) && active;
+        return _activeFlags.TryGetValue(signal, out var active) && active;
     }
 
     /// <summary>
     /// Gets whether a signal had an event (value change) during current delta cycle.
+    /// Name-based path: EvaluateAttribute uses this when a source-level
+    /// expression like `clk'event` is being resolved.
     /// </summary>
     public bool GetEvent(string signalName)
     {
-        return _activeFlags.TryGetValue(signalName, out var active) && active;
+        return _byName.TryGetValue(signalName, out var signal)
+            && _activeFlags.TryGetValue(signal, out var active) && active;
     }
 
     /// <summary>
@@ -110,7 +116,7 @@ public class SignalAttributeHandler
     /// </summary>
     public object GetLastValue(Variable signal)
     {
-        return _previousValues.TryGetValue(signal.Name, out var value) ? value : signal.Value;
+        return _previousValues.TryGetValue(signal, out var value) ? value : signal.Value;
     }
 
     /// <summary>
@@ -118,7 +124,8 @@ public class SignalAttributeHandler
     /// </summary>
     public object GetLastValue(string signalName)
     {
-        return _previousValues.TryGetValue(signalName, out var value) ? value : "U";
+        return _byName.TryGetValue(signalName, out var signal)
+            && _previousValues.TryGetValue(signal, out var value) ? value : "U";
     }
 
     /// <summary>
@@ -127,7 +134,7 @@ public class SignalAttributeHandler
     /// </summary>
     public bool GetStable(Variable signal)
     {
-        return _stableFlags.TryGetValue(signal.Name, out var stable) && stable;
+        return _stableFlags.TryGetValue(signal, out var stable) && stable;
     }
 
     /// <summary>
@@ -136,7 +143,7 @@ public class SignalAttributeHandler
     /// </summary>
     public bool GetActive(Variable signal)
     {
-        return _activeFlags.TryGetValue(signal.Name, out var active) && active;
+        return _activeFlags.TryGetValue(signal, out var active) && active;
     }
 
     /// <summary>
@@ -241,6 +248,7 @@ public class SignalAttributeHandler
         _previousValues.Clear();
         _activeFlags.Clear();
         _stableFlags.Clear();
+        _byName.Clear();
     }
 }
 

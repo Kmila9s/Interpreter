@@ -26,6 +26,24 @@ public class VariableSyntetizer : ISControl
     private TokenStream _streamer;
     private TypeRegistry? _typeRegistry;
 
+    // Bench bug #19 follow-up: per-element width + slot count of the array
+    // type currently being initialized. Set right before the := initializer
+    // is parsed and cleared right after, so the named-association aggregate
+    // parser can build a slot-correct bitstring without each call site
+    // having to plumb the array type through.
+    private int _currentArrayElementSize = 0;
+    private int _currentArrayLength = 0;
+
+    /// <summary>
+    /// F-G-08 pass 4 (2026-07-17): cancellation token in effect for the
+    /// current Synthesize call. Threading a CancellationToken through every
+    /// Skip*/Parse* signature would inflate this class by hundreds of lines
+    /// of boilerplate; a per-call field is minimally invasive. Set at the
+    /// top of <see cref="Syntetize(CancellationToken)"/>; read by each Skip*
+    /// method's <see cref="ParseTrace.Step"/> call.
+    /// </summary>
+    private CancellationToken _currentCt = CancellationToken.None;
+
     /// <summary>
     /// Initializes a new instance of the <see cref="VariableSyntetizer"/> class.
     /// </summary>
@@ -70,6 +88,11 @@ public class VariableSyntetizer : ISControl
     /// <param name="cancellationToken">Cancellation token.</param>
     public void Syntetize(CancellationToken cancellationToken)
     {
+        // F-G-08 pass 4 (2026-07-17): make the token available to every Skip*
+        // method via a field so we don't have to thread it through 10+
+        // signatures. Restored to CancellationToken.None on the way out.
+        _currentCt = cancellationToken;
+
         // v0.16.1: Track parenthesis depth for port/generic parsing
         // This ensures we only stop at the closing ')' of the Port/Generic section,
         // not at inner parentheses used in type declarations like std_logic_vector(7 downto 0)
@@ -103,6 +126,13 @@ public class VariableSyntetizer : ISControl
 
             // Check for cancellation at each iteration
             cancellationToken.ThrowIfCancellationRequested();
+
+            // F-G-08 pass 4 diag: one trace per declaration so we can see
+            // exactly which decl the outer loop is about to dispatch.
+            int _declStartLine = (_streamer.Current?.Line ?? 0) + 1;
+            string _declToken = _streamer.Current?.Value ?? "?";
+            if (ParseTrace.Enabled)
+                ParseTrace.Log($"decl-begin='{_declToken}' @{_declStartLine}");
 
             // Skip component declarations
             if (_streamer.Current?.Value?.ToLower() == "component")
@@ -238,8 +268,19 @@ public class VariableSyntetizer : ISControl
             TypeDefinition? customTypeDef = null;
             if (dataType == Constants.DATATYPES.UNKNOWN)
             {
-                // Try to resolve from type registry
-                customTypeDef = _typeRegistry?.Get(dataTypeStr) ?? ParsedTypes.Get(dataTypeStr);
+                // Try to resolve from type registry (local scope first, then
+                // this parser instance's parsed-types table). F-G-04 follow-up
+                // (2026-07-09): finally consult `PackageRegistry` for
+                // cross-file package-declared subtypes seeded by
+                // `PackageSubtypeScanner` at project scan time. When a hit
+                // lands here, `dataType` gets promoted to the base numeric
+                // type (STD_LOGIC_VECTOR) and `VectorSize` is derived from
+                // the subtype's high/low bounds — so `a : in q16_t` is
+                // treated indistinguishably from `a : in signed(31 downto 0)`
+                // downstream.
+                customTypeDef = _typeRegistry?.Get(dataTypeStr)
+                             ?? ParsedTypes.Get(dataTypeStr)
+                             ?? PackageSubtypeScanner.LookupGlobally(dataTypeStr);
                 if (customTypeDef != null)
                 {
 #if DEBUG
@@ -251,6 +292,31 @@ public class VariableSyntetizer : ISControl
             // If datatype is UNKNOWN and NOT in registry, skip this declaration
             if (dataType == Constants.DATATYPES.UNKNOWN && customTypeDef == null && !_isPort && !_isGeneric)
             {
+                // F-G-04 extension (Phase G Ring 4 audit 2026-07-09): the
+                // SourceElaborator inlines child architectures by promoting
+                // their ports to top-level signals (renamed as
+                // `<label>__<port>`) and their signals to top-level signals
+                // (same rename scheme). When those child items are typed
+                // with a package-declared subtype (`q16_t`, `opcode_t`, …),
+                // the same drop-on-skip pattern that dropped ports also
+                // drops the elaborated signals — every downstream reference
+                // then fails with "Undeclared variable". Register the
+                // signal name(s) as a placeholder Variable so name
+                // resolution succeeds; arithmetic semantics remain the same
+                // "best-effort STD_LOGIC_VECTOR width 32" as the port
+                // fallback, but the elaborated top compiles.
+                string fallbackSignalType = _streamer.Current?.Value ?? string.Empty;
+                foreach (var v in variables)
+                {
+                    Variables.Add(new Variable
+                    {
+                        Name = v.Name,
+                        Type = Constants.DATATYPES.STD_LOGIC_VECTOR,
+                        Size = 32,
+                        IsPort = false,
+                        CustomTypeName = fallbackSignalType,
+                    });
+                }
                 SkipToSemicolon();
                 continue;
             }
@@ -272,6 +338,32 @@ public class VariableSyntetizer : ISControl
                         (int)(typoTok?.Line ?? 0) + 1,
                         (int)(typoTok?.Col ?? 0) + 1,
                         typoTok?.Value);
+                }
+                // F-G-04 (Phase G audit 2026-07-09): package-declared subtypes
+                // (e.g. `subtype q16_t is signed(31 downto 0);` in `types_pkg`)
+                // don't currently make it into the headless pipeline's port
+                // parser — `use work.types_pkg.all;` doesn't yet load the
+                // parent package's subtype table into a scope this method
+                // consults. Without this branch, `port (a : in q16_t; …)`
+                // would silently drop `a` from `Variables`, and any process
+                // sensitivity list or expression referencing `a` would fail
+                // with "Undeclared variable 'a'". Register each port under a
+                // best-effort placeholder type (STD_LOGIC_VECTOR, size 32) so
+                // downstream name resolution succeeds. Arithmetic semantics
+                // for signed/unsigned subtypes may not be honored, but that's
+                // a strictly narrower gap than a dropped port.
+                string fallbackTypeName = _streamer.Current?.Value ?? string.Empty;
+                foreach (var v in variables)
+                {
+                    Variables.Add(new Variable
+                    {
+                        Name = v.Name,
+                        Type = Constants.DATATYPES.STD_LOGIC_VECTOR,
+                        Size = 32,
+                        IsPort = _isPort,
+                        PortType = portType,
+                        CustomTypeName = fallbackTypeName,
+                    });
                 }
                 // Skip to semicolon or closing paren of port list (not inner parens)
                 int parenDepth = 0;
@@ -357,10 +449,55 @@ public class VariableSyntetizer : ISControl
 
                     if (isComplexExpression)
                     {
-#if DEBUG
-                        Console.WriteLine($"[VariableSyntetizer] Complex vector expression detected, using default size");
-#endif
-                        // Skip complex expression and use default size
+                        // F-G-01 fix (session 8, 2026-07-09): try to fold the
+                        // range expression using PackageRegistry-loaded
+                        // constants before giving up. Common capstone
+                        // patterns like `std_logic_vector(LED_ROWS*LED_COLS - 1 downto 0)`
+                        // (LED_ROWS=LED_COLS=3 → high=8) now resolve to 9-bit
+                        // vectors instead of defaulting to 8. Handles:
+                        //   * bare integer / constant refs
+                        //   * two-operand +, -, *, /
+                        //   * three-operand `A op B op C` (typical `W-1`, `A*B-1`, …)
+                        // Multiplication / addition chains beyond three tokens
+                        // still fall back to the default. On any resolution
+                        // failure, existing default-8 behaviour is preserved.
+                        int? hiEval = null;
+                        string? dirTok = null;
+                        int? loEval = null;
+                        {
+                            var expr = new List<string>();
+                            int depth = 1;
+                            _streamer.SetRollBack();
+                            while (_streamer.Current != null && depth > 0)
+                            {
+                                var val = _streamer.Current.Value;
+                                if (val == "(") depth++;
+                                else if (val == ")") { depth--; if (depth == 0) break; }
+                                expr.Add(val);
+                                _streamer.MoveNext();
+                            }
+                            _streamer.RollBack();
+
+                            // Split around "downto" or "to".
+                            int splitIdx = -1;
+                            for (int i = 0; i < expr.Count; i++)
+                            {
+                                var t = expr[i].ToLowerInvariant();
+                                if (t == "downto" || t == "to")
+                                {
+                                    splitIdx = i;
+                                    dirTok = t;
+                                    break;
+                                }
+                            }
+                            if (splitIdx > 0 && dirTok != null)
+                            {
+                                hiEval = FoldSimpleExpr(expr.GetRange(0, splitIdx));
+                                loEval = FoldSimpleExpr(expr.GetRange(splitIdx + 1, expr.Count - splitIdx - 1));
+                            }
+                        }
+
+                        // Skip the complex expression tokens.
                         int parenDepth = 1;
                         while (_streamer.Current != null && parenDepth > 0)
                         {
@@ -373,7 +510,24 @@ public class VariableSyntetizer : ISControl
                         }
                         if (_streamer.Current?.Value == ")")
                             _streamer.MoveNext(); // consume final ')'
-                        VectorSize = 8; // Default size for complex expressions
+
+                        if (hiEval.HasValue && loEval.HasValue && dirTok != null)
+                        {
+                            int hi = hiEval.Value;
+                            int lo = loEval.Value;
+                            int width = dirTok == "downto" ? hi - lo + 1 : lo - hi + 1;
+                            VectorSize = width > 0 ? width : 8;
+#if DEBUG
+                            Console.WriteLine($"[VariableSyntetizer] F-G-01 folded range: {hi} {dirTok} {lo} → width {VectorSize}");
+#endif
+                        }
+                        else
+                        {
+#if DEBUG
+                            Console.WriteLine($"[VariableSyntetizer] Complex vector expression detected, using default size");
+#endif
+                            VectorSize = 8; // Default size for complex expressions
+                        }
                     }
                     else
                     {
@@ -399,12 +553,23 @@ public class VariableSyntetizer : ISControl
                 if (_streamer.Current?.Value?.ToLower() == "range")
                 {
                     _streamer.Expect(KEYWORDS); // consume "range"
-                    object varValue = GetVariableValue();
-                    int initial = Convert.ToInt32(varValue);
+                    // F-G-02 fix (session 8, 2026-07-09): scoped
+                    // PackageRegistry lookup for range bounds. Prior code
+                    // called GetVariableValue which registers a placeholder
+                    // (Value=0) for any identifier not in local scope, so
+                    // `range 0 to BUZ_LONG_TICKS` collapsed to `0 to 0` and
+                    // yielded width 1. Now, if the current token is an
+                    // identifier that resolves in PackageRegistry, use that
+                    // constant's value directly and advance the stream —
+                    // otherwise fall back to GetVariableValue's legacy
+                    // behaviour. Keeping the PackageRegistry lookup ONLY in
+                    // this branch (not in GetVariableValue itself) avoids
+                    // disturbing initializer / expression paths that read
+                    // signals whose *names* happen to shadow constants.
+                    int initial = ReadRangeBound();
                     _streamer.Expect(KEYWORDS); // consume "to"
-                    varValue = GetVariableValue();
-                    int end = Convert.ToInt32(varValue);
-                    VectorSize = Math.Abs(end - initial);
+                    int end = ReadRangeBound();
+                    VectorSize = RangeToBitWidth(initial, end);
                 }
             }
             // Handle time type - will be handled in initialization
@@ -459,7 +624,29 @@ public class VariableSyntetizer : ISControl
             if (!_isPort && _streamer.Current?.Value == ":=")
             {
                 _streamer.Expect(OPERATORS); // consume ":="
+
+                // Bench bug #19 follow-up: pass array element width into the
+                // aggregate parser so it can place each named-association
+                // value at the right slot offset. Reset after parsing so
+                // unrelated initializers fall back to the scalar code path.
+                int prevElemSize = _currentArrayElementSize;
+                int prevArrayLen = _currentArrayLength;
+                if (customTypeDef != null && customTypeDef.Kind == TypeKind.Array
+                    && customTypeDef.ElementSize > 1)
+                {
+                    _currentArrayElementSize = customTypeDef.ElementSize;
+                    _currentArrayLength = customTypeDef.ArrayLength;
+                }
+                else
+                {
+                    _currentArrayElementSize = 0;
+                    _currentArrayLength = 0;
+                }
+
                 value = ParseInitializationValue();
+
+                _currentArrayElementSize = prevElemSize;
+                _currentArrayLength = prevArrayLen;
             }
             // Handle "after" clause (skip it for now - temporal simulation not implemented)
             if (_streamer.Current?.Value?.ToLower() == "after")
@@ -478,15 +665,56 @@ public class VariableSyntetizer : ISControl
                 {
                     initValue = customTypeDef.GetDefaultValue();
                 }
+                // Eagerly expand `(others=>X)` aggregate to a literal bitstring
+                // when the declared vector size is known. The Size setter only
+                // expands the marker when `_value` is already non-null, but the
+                // ctor below sets Size first (with no value) and then Value, so
+                // the marker would otherwise leak into VCD output as the literal
+                // 11-char string `(others=>0)` until the first signal write.
+                // Covers std_logic_vector, unsigned, signed, bit_vector, and the
+                // other vector-shaped types — the marker form is by definition
+                // vector-only in VHDL, so VectorSize>0 + marker pattern suffices.
+                if (!_isPort
+                    && VectorSize > 0
+                    && initValue is string initMarker
+                    && initMarker.StartsWith("(others=>", StringComparison.Ordinal))
+                {
+                    int arrow = initMarker.IndexOf("=>", StringComparison.Ordinal);
+                    int close = initMarker.IndexOf(')', arrow);
+                    if (arrow >= 0 && close > arrow + 2)
+                    {
+                        string inner = initMarker.Substring(arrow + 2, close - arrow - 2).Trim();
+                        char fill = inner.Length > 0 ? inner[0] : '0';
+                        initValue = new string(fill, VectorSize);
+                    }
+                }
                 var newVar = new Variable()
                 {
                     Name = variable.Name,
                     Type = dataType,
                     IsPort = _isPort,
                     PortType = portType,
+                    // Mark arch-local constants so downstream (VCD exporter etc.)
+                    // can distinguish them from signals. Audit F-G-03 (2026-07-09).
+                    IsConstant = varType.Equals("constant", StringComparison.OrdinalIgnoreCase),
                     Size = VectorSize,  // Set Size BEFORE Value to avoid Size setter issues
                     Value = !_isPort ? initValue : null!,
                 };
+
+                // Bench bug #19: when the variable is typed by a user-defined
+                // array (e.g. `rom_t = array(0 to 7) of std_logic_vector(7 downto 0)`),
+                // carry the per-element width into the Variable so DynamicIndex /
+                // DeferredIndex can slice element-wise on `signal(N)` access.
+                // Without this, the indexer falls back to single-bit reads and
+                // returns garbage / 'x' for every lookup into a constant array.
+                if (customTypeDef != null && customTypeDef.Kind == TypeKind.Array
+                    && customTypeDef.ElementSize > 1)
+                {
+                    newVar.ElementSize = customTypeDef.ElementSize;
+                    newVar.ArrayLength = customTypeDef.ArrayLength;
+                    if (string.IsNullOrEmpty(newVar.CustomTypeName))
+                        newVar.CustomTypeName = customTypeDef.Name;
+                }
 
                 // Store custom type name reference for debugging/analysis
                 if (customTypeDef != null)
@@ -523,6 +751,8 @@ public class VariableSyntetizer : ISControl
                 break;
             }
             _streamer.Expect(OPERATORS); // ;
+            if (ParseTrace.Enabled)
+                ParseTrace.Log($"decl-end='{_declToken}' @{_declStartLine} next='{_streamer.Current?.Value}'");
         }
     }
 
@@ -969,6 +1199,13 @@ public class VariableSyntetizer : ISControl
 
     /// <summary>
     /// Parses an aggregate expression like (others => '0') or a parenthesized expression.
+    /// Bench bug #19: also recognises positional aggregates
+    /// (`("10101010", "10111011", ...)`) used to initialise constant arrays,
+    /// and returns them as a contiguous bitstring (element 0 first) so
+    /// indexed reads via [[DeferredIndex]] / [[DynamicIndex]] can slice cleanly.
+    /// Without this branch the parser fell into the generic stringify-tokens
+    /// fallback below, which produced an unparseable `(  "..."  ,  "..."  )`
+    /// blob and broke every `rom(addr)` lookup.
     /// </summary>
     private object ParseAggregateOrExpression()
     {
@@ -990,26 +1227,340 @@ public class VariableSyntetizer : ISControl
             // Return a special aggregate marker
             return $"(others=>{defaultValue})";
         }
-        else
-        {
-            // It's a regular parenthesized expression - skip until closing paren
-            int depth = 1;
-            string expr = "(";
-            while (depth > 0 && _streamer.Current != null)
-            {
-                if (_streamer.Current.Value == "(") depth++;
-                else if (_streamer.Current.Value == ")") depth--;
 
-                if (depth > 0)
-                {
-                    expr += _streamer.Current.Value + " ";
-                    _streamer.MoveNext();
-                }
-            }
-            expr += ")";
-            _streamer.MoveNext(); // consume final ')'
-            return expr.Trim();
+        // Bench bug #19 follow-up: named-association aggregate path —
+        // `( key => value, key => value, ..., others => fallback )`. Used by
+        // ROM tables that initialise per-address with a function-call value.
+        // Requires the caller to have set _currentArrayElementSize +
+        // _currentArrayLength (done in the := initializer block) so we know
+        // each slot's width and how many slots to allocate.
+        if (_currentArrayElementSize > 0
+            && _currentArrayLength > 0
+            && TryParseNamedAggregate(out string? namedBits))
+        {
+            return namedBits!;
         }
+
+        // Try the positional-aggregate path. Snapshot the stream, walk
+        // through the comma-separated element list; if every element is a
+        // recognisable bitstring literal, concatenate and return. Any
+        // unrecognised token / nested expression aborts the attempt and we
+        // fall back to the legacy stringify behaviour.
+        if (TryParsePositionalAggregate(out string? bitstring))
+        {
+            return bitstring!;
+        }
+
+        // It's a regular parenthesized expression - skip until closing paren
+        int depth = 1;
+        string expr = "(";
+        while (depth > 0 && _streamer.Current != null)
+        {
+            if (_streamer.Current.Value == "(") depth++;
+            else if (_streamer.Current.Value == ")") depth--;
+
+            if (depth > 0)
+            {
+                expr += _streamer.Current.Value + " ";
+                _streamer.MoveNext();
+            }
+        }
+        expr += ")";
+        _streamer.MoveNext(); // consume final ')'
+        return expr.Trim();
+    }
+
+    /// <summary>
+    /// Tries to read a positional aggregate of the form
+    /// <c>("10101010", "11001100", ..., x"AB")</c> from the current stream
+    /// position (which must already be past the opening '('). On success
+    /// the stream is advanced past the matching ')' and the per-element
+    /// bitstrings are concatenated in declaration order (element 0 first,
+    /// MSB-first within each element). Returns false and rolls back the
+    /// stream when any element fails to convert to a bitstring, so the
+    /// caller can fall back to the legacy expression path.
+    /// </summary>
+    private bool TryParsePositionalAggregate(out string? bitstring)
+    {
+        bitstring = null;
+        _streamer.SetRollBack();
+
+        var elements = new List<string>();
+        int depth = 1;
+        bool first = true;
+
+        while (_streamer.Current != null && depth > 0)
+        {
+            string tok = _streamer.Current.Value ?? string.Empty;
+
+            if (tok == "(") { depth++; _streamer.MoveNext(); continue; }
+            if (tok == ")")
+            {
+                depth--;
+                if (depth == 0) { _streamer.MoveNext(); break; }
+                _streamer.MoveNext();
+                continue;
+            }
+
+            if (tok == ",") { _streamer.MoveNext(); continue; }
+
+            // First non-trivial token decides whether this aggregate is
+            // positional. If the very first thing is an operator or
+            // identifier-followed-by `(`, we bail so a generic expression
+            // like `(A + 1)` still reaches the legacy fallback.
+            string? bits = null;
+            if (tok.Length >= 2 && tok[0] == '"' && tok[^1] == '"')
+            {
+                bits = tok.Substring(1, tok.Length - 2);
+            }
+            else if (tok.Length >= 3 && (tok[0] == 'x' || tok[0] == 'X') && tok[1] == '"' && tok[^1] == '"')
+            {
+                bits = ParseHexLiteral(tok);
+            }
+            else
+            {
+                if (first) { _streamer.RollBack(); return false; }
+                // Mid-aggregate non-literal — also bail; the legacy path
+                // can deal with it (we don't try to evaluate identifiers
+                // here to avoid order-of-declaration surprises).
+                _streamer.RollBack();
+                return false;
+            }
+
+            if (bits != null)
+            {
+                elements.Add(bits);
+                first = false;
+            }
+            _streamer.MoveNext();
+        }
+
+        if (elements.Count == 0) { _streamer.RollBack(); return false; }
+
+        bitstring = string.Concat(elements);
+        return true;
+    }
+
+    /// <summary>
+    /// Tries to read a named-association aggregate of the form
+    /// <c>(0 =&gt; pack(170), 1 =&gt; pack(187), ..., others =&gt; (others =&gt; '0'))</c>
+    /// at the current stream position (past the opening '('). On success the
+    /// stream is advanced past the matching ')' and a contiguous bitstring of
+    /// <c>_currentArrayElementSize × _currentArrayLength</c> bits is returned,
+    /// with each value placed at its slot offset and any unspecified slots
+    /// filled by the <c>others</c> fallback (defaults to all-'0' when
+    /// absent). Value expressions are evaluated through the shared
+    /// <see cref="Operation"/> pipeline so user-defined functions, based
+    /// literals, and concatenations all work.
+    /// Returns false (and rolls the stream back) when the aggregate doesn't
+    /// match this shape so the caller can fall through to the legacy path.
+    /// </summary>
+    private bool TryParseNamedAggregate(out string? bitstring)
+    {
+        bitstring = null;
+        _streamer.SetRollBack();
+
+        int elementSize = _currentArrayElementSize;
+        int slots       = _currentArrayLength;
+        if (elementSize <= 0 || slots <= 0) { _streamer.RollBack(); return false; }
+
+        // Quick pre-scan: the first chunk's syntax must include `=>` at
+        // depth 1 before we hit the closing ')'. Without this we'd grab
+        // unrelated parenthesised expressions like `(A + 1)` from the
+        // legacy fallback.
+        if (!QuickHasArrow()) { _streamer.RollBack(); return false; }
+
+        var slotValues = new string?[slots];
+        string? othersFill = null;
+        bool sawAny = false;
+        int depth = 1; // we're past the opening '('
+
+        // Each iteration consumes one `<key> => <value>` chunk plus the
+        // following `,` or final `)`.
+        while (_streamer.Current != null && depth > 0)
+        {
+            // Read the key.
+            string keyTok = _streamer.Current.Value ?? string.Empty;
+            bool isOthers = keyTok.Equals("others", StringComparison.OrdinalIgnoreCase);
+            int keyIndex = -1;
+            if (isOthers)
+            {
+                _streamer.MoveNext();
+            }
+            else
+            {
+                if (!int.TryParse(keyTok, out keyIndex))
+                {
+                    // Not a simple integer key — bail to the legacy path.
+                    _streamer.RollBack();
+                    return false;
+                }
+                _streamer.MoveNext();
+            }
+
+            if (_streamer.Current?.Value != "=>") { _streamer.RollBack(); return false; }
+            _streamer.MoveNext(); // consume '=>'
+
+            // Collect the value expression tokens up to the next top-level
+            // ',' or the closing ')'. Paren-aware so nested aggregates +
+            // function-call arguments don't terminate the value prematurely.
+            string valueExpr = "";
+            int valueDepth = 0;
+            while (_streamer.Current != null)
+            {
+                string tok = _streamer.Current.Value ?? string.Empty;
+                if (valueDepth == 0 && (tok == "," || tok == ")")) break;
+                if (tok == "(") valueDepth++;
+                else if (tok == ")") valueDepth--;
+                valueExpr += tok + " ";
+                _streamer.MoveNext();
+            }
+            valueExpr = valueExpr.Trim();
+
+            string slotBits = EvaluateAggregateValue(valueExpr, elementSize);
+
+            if (isOthers) othersFill = slotBits;
+            else if (keyIndex >= 0 && keyIndex < slots) slotValues[keyIndex] = slotBits;
+            sawAny = true;
+
+            // Consume the separator. ',' → next chunk; ')' → done.
+            if (_streamer.Current?.Value == ",")
+            {
+                _streamer.MoveNext();
+                continue;
+            }
+            if (_streamer.Current?.Value == ")")
+            {
+                _streamer.MoveNext();
+                depth = 0;
+                break;
+            }
+            // Unexpected token — bail.
+            _streamer.RollBack();
+            return false;
+        }
+
+        if (!sawAny) { _streamer.RollBack(); return false; }
+
+        // Materialise the bitstring slot-by-slot, MSB-first (slot 0 at the
+        // start of the string — matches DeferredIndex / DynamicIndex slot
+        // extraction).
+        string fill = othersFill ?? new string('0', elementSize);
+        var sb = new System.Text.StringBuilder(elementSize * slots);
+        for (int i = 0; i < slots; i++)
+        {
+            sb.Append(slotValues[i] ?? fill);
+        }
+        bitstring = sb.ToString();
+        return true;
+    }
+
+    /// <summary>
+    /// Cheap lookahead for the named-aggregate detector: returns true when
+    /// the next significant `=&gt;` token appears before the matching outer
+    /// `)`. Doesn't consume the stream.
+    /// </summary>
+    private bool QuickHasArrow()
+    {
+        _streamer.SetRollBack();
+        int depth = 1;
+        bool found = false;
+        while (_streamer.Current != null && depth > 0)
+        {
+            string tok = _streamer.Current.Value ?? string.Empty;
+            if (tok == "(") depth++;
+            else if (tok == ")") { depth--; if (depth == 0) break; }
+            else if (tok == "=>" && depth == 1) { found = true; break; }
+            _streamer.MoveNext();
+        }
+        _streamer.RollBack();
+        return found;
+    }
+
+    /// <summary>
+    /// Evaluates an aggregate value expression (string / hex literal,
+    /// integer literal, identifier, function call, concatenation) to an
+    /// element-wide bitstring. Routes through <see cref="Operation"/> so
+    /// user-defined functions resolve via the existing FunctionExecutor
+    /// path. Falls back to a deterministic all-'U' element when evaluation
+    /// fails so the rest of the aggregate still materialises.
+    /// </summary>
+    private string EvaluateAggregateValue(string expr, int elementSize)
+    {
+        if (string.IsNullOrWhiteSpace(expr))
+            return new string('U', elementSize);
+
+        // Trim a trailing `)` that the value-collector may leave behind
+        // when the value itself is a parenthesised expression — Operation
+        // can handle balanced parens, not stray closers.
+        // (Defensive: the collector above is balance-aware, so this is a
+        // belt-and-braces guard.)
+        expr = expr.Trim();
+
+        // Nested `(others => '0')` shape: handle directly so we don't
+        // have to construct an Operation for a literal-fill aggregate.
+        if (expr.StartsWith("(") && expr.IndexOf("others", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            char fill = expr.Contains("'1'") ? '1' : (expr.Contains("'0'") ? '0' : 'U');
+            return new string(fill, elementSize);
+        }
+
+        // String literal `"..."` — strip quotes and pad/truncate.
+        if (expr.Length >= 2 && expr[0] == '"' && expr[^1] == '"')
+            return NormaliseBits(expr.Substring(1, expr.Length - 2), elementSize);
+
+        // Hex literal `x"NN"` — convert via the existing helper.
+        if (expr.Length >= 3 && (expr[0] == 'x' || expr[0] == 'X') && expr[1] == '"' && expr[^1] == '"')
+            return NormaliseBits(ParseHexLiteral(expr), elementSize);
+
+        // General expression — hand off to Operation. Use a combined scope
+        // (ports + constants/signals declared so far) so identifier lookups
+        // can resolve to either side.
+        try
+        {
+            var scope = new HashSet<Variable>(_comparator);
+            foreach (var v in Variables) scope.Add(v);
+            var op = new Operation(expr, scope);
+            var result = op.Execute();
+            string bits = result switch
+            {
+                Variable v => v.Value?.ToString() ?? string.Empty,
+                null       => string.Empty,
+                _          => result.ToString() ?? string.Empty,
+            };
+            return NormaliseBits(bits, elementSize);
+        }
+        catch
+        {
+            return new string('U', elementSize);
+        }
+    }
+
+    /// <summary>
+    /// Normalises a raw bit / value string into an element-wide bitstring:
+    /// strips surrounding quotes, pads with '0' on the left when shorter,
+    /// or truncates on the left when longer. Integer-shaped results (e.g.
+    /// <c>"170"</c> from a numeric function call) are converted to base-2.
+    /// </summary>
+    private static string NormaliseBits(string raw, int width)
+    {
+        if (string.IsNullOrEmpty(raw)) return new string('U', width);
+        string s = raw.Replace("\"", string.Empty).Replace("'", string.Empty).Trim();
+
+        bool isBinary = s.Length > 0 && s.All(c => c == '0' || c == '1' || c == 'U' || c == 'X' || c == 'Z');
+        if (!isBinary)
+        {
+            if (int.TryParse(s, out int n))
+            {
+                if (n < 0) n &= (int)((1L << width) - 1);
+                s = Convert.ToString(n, 2);
+            }
+            else return new string('U', width);
+        }
+
+        if (s.Length == width) return s;
+        if (s.Length > width)  return s.Substring(s.Length - width);
+        return s.PadLeft(width, '0');
     }
 
     /// <summary>
@@ -1198,12 +1749,15 @@ public class VariableSyntetizer : ISControl
     /// </summary>
     private void SkipComponentDeclaration()
     {
+        int _iter = 0;
+        ParseTrace.Log($"begin@{(_streamer.Current?.Line ?? 0) + 1}");
         // Skip 'component' keyword
         _streamer.MoveNext();
 
         // Skip until we find 'end component' or 'end <component_name>'
         while (_streamer.Current != null)
         {
+            ParseTrace.Step(ref _iter, _streamer, _currentCt);
             string val = _streamer.Current.Value.ToLower();
 
             // Safety check: if we hit 'begin', we've gone too far
@@ -1642,10 +2196,13 @@ public class VariableSyntetizer : ISControl
     /// </summary>
     private void SkipSubtypeDeclaration()
     {
+        int _iter = 0;
+        ParseTrace.Log($"begin@{(_streamer.Current?.Line ?? 0) + 1}");
         _streamer.MoveNext(); // 'subtype'
         string subtypeName = _streamer.Current?.Value ?? string.Empty;
         while (_streamer.Current != null && _streamer.Current.Value != ";")
         {
+            ParseTrace.Step(ref _iter, _streamer, _currentCt);
             _streamer.MoveNext();
         }
         if (_streamer.Current?.Value == ";")
@@ -1679,6 +2236,8 @@ public class VariableSyntetizer : ISControl
     /// </remarks>
     private void SkipAliasDeclaration()
     {
+        int _iter = 0;
+        ParseTrace.Log($"begin@{(_streamer.Current?.Line ?? 0) + 1}");
         _streamer.MoveNext(); // consume 'alias'
 
         string aliasName = _streamer.Current?.Value ?? string.Empty;
@@ -1730,6 +2289,7 @@ public class VariableSyntetizer : ISControl
         // attribute forms we don't yet model).
         while (_streamer.Current != null && _streamer.Current.Value != ";")
         {
+            ParseTrace.Step(ref _iter, _streamer, _currentCt);
             if (_streamer.Current.Value == "(") { ConsumeAndMeasureRange(); continue; }
             _streamer.MoveNext();
         }
@@ -1812,6 +2372,10 @@ public class VariableSyntetizer : ISControl
     /// </remarks>
     private void SkipFunctionDeclaration()
     {
+        // F-G-08 pass 4: shared iteration guard for the four while loops below.
+        int _fnIter = 0;
+        int _startLine = (_streamer.Current?.Line ?? 0) + 1;
+        ParseTrace.Log($"begin@{_startLine}");
         // Skip 'function' keyword
         _streamer.MoveNext();
 
@@ -1819,80 +2383,297 @@ public class VariableSyntetizer : ISControl
         // for matching the closing `end <name>;` token below).
         string functionNameRaw = _streamer.Current?.Value ?? "";
         string functionName    = functionNameRaw.ToLower();
+        _streamer.MoveNext(); // consume function name
 
-        // Register a black-box stub keyed by the original-case name. The
-        // registry is case-insensitive (per VHDL identifier rules) so call
-        // sites resolve regardless of how they spell it.
-        if (!string.IsNullOrEmpty(functionNameRaw))
+        // Bench bug #19 follow-up: parse parameter list + return type + body
+        // text so the function is callable, not a black-box stub. Anything
+        // we can't decode falls back to the legacy stub behaviour silently.
+        var parameters = new List<ParameterDefinition>();
+        var returnType = Constants.DATATYPES.UNKNOWN;
+        int returnTypeSize = 0;
+        string? customReturnTypeName = null;
+        string bodyRaw = string.Empty;
+
+        if (_streamer.Current?.Value == "(")
         {
-            FunctionRegistry.Instance.Register(new FunctionDefinition
-            {
-                Name = functionNameRaw,
-                IsPure = true
-            });
-            SkipDiagnosticLog.Instance.AddWarning(
-                "VHD-FUNC-BLACKBOX",
-                functionNameRaw,
-                $"Function '{functionNameRaw}' body was not synthesised. " +
-                "Calls resolve as a black-box; logic inside the function is " +
-                "absent from the netlist until function-body synthesis lands.");
+            _streamer.MoveNext(); // consume '('
+            TryParseParameterList(parameters);
         }
-#if DEBUG
-        Console.WriteLine($"[SkipFunction] Skipping function: {functionName}");
-#endif
 
-        // Simply look for 'end function' or 'end <function_name>'
-        while (_streamer.Current != null)
+        if (_streamer.Current?.Value?.ToLower() == "return")
         {
-            string val = _streamer.Current.Value.ToLower();
-
-            if (val == "end")
+            _streamer.MoveNext(); // consume 'return'
+            string retTypeTok = _streamer.Current?.Value ?? "std_logic";
+            returnType = Variable.GetDatatype(retTypeTok);
+            if (returnType == Constants.DATATYPES.UNKNOWN)
+                customReturnTypeName = retTypeTok;
+            _streamer.MoveNext();
+            // Optional vector range on return type, e.g. `return std_logic_vector(7 downto 0)`.
+            if (_streamer.Current?.Value == "(")
             {
-                _streamer.MoveNext(); // skip 'end'
-                if (_streamer.Current == null) break;
-
-                string nextVal = _streamer.Current.Value.ToLower();
-#if DEBUG
-                Console.WriteLine($"[SkipFunction] Found 'end' followed by: {nextVal}");
-#endif
-
-                // Check if this is the function end
-                if (nextVal == "function" || nextVal == functionName)
+                _streamer.MoveNext();
+                if (int.TryParse(_streamer.Current?.Value, out int hi))
                 {
-#if DEBUG
-                    Console.WriteLine($"[SkipFunction] Matched function end! Current: '{_streamer.Current?.Value}'");
-#endif
-                    _streamer.MoveNext(); // skip 'function' or function name
-#if DEBUG
-                    Console.WriteLine($"[SkipFunction] After skipping func name: '{_streamer.Current?.Value}'");
-#endif
-                    // Skip optional second function name after 'end function'
-                    if (_streamer.Current?.Type == IDENTIFIERS)
+                    _streamer.MoveNext(); // hi
+                    _streamer.MoveNext(); // downto/to
+                    if (int.TryParse(_streamer.Current?.Value, out int lo))
                     {
-#if DEBUG
-                        Console.WriteLine($"[SkipFunction] Skipping identifier: '{_streamer.Current?.Value}'");
-#endif
+                        returnTypeSize = Math.Abs(hi - lo) + 1;
                         _streamer.MoveNext();
                     }
-#if DEBUG
-                    Console.WriteLine($"[SkipFunction] Before checking semicolon: '{_streamer.Current?.Value}'");
-#endif
-                    if (_streamer.Current?.Value == ";")
-                    {
-#if DEBUG
-                        Console.WriteLine($"[SkipFunction] Skipping semicolon");
-#endif
-                        _streamer.MoveNext(); // skip ';'
-                    }
-#if DEBUG
-                    Console.WriteLine($"[SkipFunction] Final current token: '{_streamer.Current?.Value}' at line {_streamer.Current?.Line}");
-#endif
-                    return;
                 }
-                // Other 'end' statements - just continue (don't move next again, we already moved)
+                while (_streamer.Current != null && _streamer.Current.Value != ")")
+                {
+                    ParseTrace.Step(ref _fnIter, _streamer, _currentCt);
+                    _streamer.MoveNext();
+                }
+                if (_streamer.Current?.Value == ")") _streamer.MoveNext();
+            }
+        }
+
+        // Look ahead for `is`, then capture body tokens from the
+        // architecture-level `begin` to the matching `end`. Inner if/case/
+        // loop blocks have their own `begin`/`end` pairs so we count depth.
+        if (_streamer.Current?.Value?.ToLower() == "is")
+        {
+            _streamer.MoveNext();
+        }
+
+        // Skip local declarations (variables, constants) until top-level `begin`.
+        while (_streamer.Current != null && _streamer.Current.Value?.ToLower() != "begin")
+        {
+            ParseTrace.Step(ref _fnIter, _streamer, _currentCt);
+            _streamer.MoveNext();
+        }
+        if (_streamer.Current?.Value?.ToLower() == "begin")
+        {
+            _streamer.MoveNext(); // consume 'begin'
+        }
+
+        // Capture body tokens until the matching `end` of the function.
+        // Track nesting on the canonical VHDL constructs that open a body:
+        //   if / case / process / function / procedure / generate / block
+        //   + for / while (the trailing `loop` keyword is part of the same
+        //     construct and must NOT count as a second opener)
+        //   + standalone `loop` (used as `loop ... end loop` — rare).
+        // Closers come as `end <keyword>` (or `end <name>`); we peek the
+        // token after each `end` and consume both as a single close so the
+        // depth counter stays balanced. The legacy code treated `end if`
+        // as decrement+increment, which silently terminated the body at
+        // the first inner `end` for any function whose body contained an
+        // `if` / `case` / `loop` / etc. Bench bug #24 (P4 key_index).
+        var bodyTokens = new List<string>();
+        int innerDepth = 0;
+        while (_streamer.Current != null)
+        {
+            ParseTrace.Step(ref _fnIter, _streamer, _currentCt);
+            string val = _streamer.Current.Value ?? string.Empty;
+            string low = val.ToLower();
+
+            if (low == "for" || low == "while")
+            {
+                // Loop opener: increment once and consume tokens up to
+                // (and including) the matching `loop` keyword so it
+                // doesn't double-count below.
+                innerDepth++;
+                bodyTokens.Add(val);
+                _streamer.MoveNext();
+                while (_streamer.Current != null
+                    && _streamer.Current.Value?.ToLower() != "loop")
+                {
+                    ParseTrace.Step(ref _fnIter, _streamer, _currentCt);
+                    bodyTokens.Add(_streamer.Current.Value ?? string.Empty);
+                    _streamer.MoveNext();
+                }
+                if (_streamer.Current != null)
+                {
+                    bodyTokens.Add(_streamer.Current.Value ?? string.Empty); // the `loop`
+                    _streamer.MoveNext();
+                }
                 continue;
             }
+
+            if (low == "if" || low == "case" || low == "process"
+             || low == "function" || low == "procedure"
+             || low == "generate" || low == "block"
+             || low == "loop")
+            {
+                innerDepth++;
+                bodyTokens.Add(val);
+                _streamer.MoveNext();
+                continue;
+            }
+
+            if (low == "end")
+            {
+                if (innerDepth == 0)
+                {
+                    // The function's own `end` — let the caller consume
+                    // the closer keyword + optional name + `;`.
+                    break;
+                }
+                innerDepth--;
+                bodyTokens.Add(val);
+                _streamer.MoveNext();
+                // Consume the following closer keyword / identifier so
+                // the next iteration doesn't see `if`/`loop`/etc. and
+                // mis-count it as a fresh opener.
+                if (_streamer.Current != null)
+                {
+                    bodyTokens.Add(_streamer.Current.Value ?? string.Empty);
+                    _streamer.MoveNext();
+                }
+                continue;
+            }
+
+            bodyTokens.Add(val);
             _streamer.MoveNext();
+        }
+        bodyRaw = string.Join(" ", bodyTokens);
+
+        if (!string.IsNullOrEmpty(functionNameRaw))
+        {
+            // Register a real FunctionDefinition (signature + body) so call
+            // sites resolve through FunctionExecutor instead of the black-box
+            // stub. PackageRegistry is the registry FunctionExecutor reads;
+            // FunctionRegistry still gets the entry so the parser-side
+            // user-function detection (IsUserFunction etc.) keeps working.
+            var def = new FunctionDefinition
+            {
+                Name = functionNameRaw,
+                Parameters = parameters,
+                ReturnType = returnType,
+                ReturnTypeSize = returnTypeSize,
+                CustomReturnTypeName = customReturnTypeName,
+                BodyRaw = bodyRaw,
+                IsPure = true,
+            };
+            FunctionRegistry.Instance.Register(def);
+            PackageRegistry.Instance.RegisterFunction(def, "global");
+        }
+
+        // Now consume the closing `end function;` / `end <name>;` tokens.
+        if (_streamer.Current?.Value?.ToLower() == "end")
+        {
+            _streamer.MoveNext();
+        }
+        if (_streamer.Current?.Value?.ToLower() == "function" ||
+            (_streamer.Current?.Value?.ToLower() == functionName))
+        {
+            _streamer.MoveNext();
+        }
+        // Optional second name (`end function pack`).
+        if (_streamer.Current?.Type == IDENTIFIERS)
+        {
+            _streamer.MoveNext();
+        }
+        if (_streamer.Current?.Value == ";")
+        {
+            _streamer.MoveNext();
+        }
+    }
+
+    /// <summary>
+    /// Parses a function parameter list starting after the opening '('.
+    /// Recognises <c>name : type</c> and <c>name : type(H downto L)</c>;
+    /// stops at the matching ')'. Best-effort: anything unrecognised is
+    /// skipped so a partial parameter list doesn't poison the whole
+    /// function declaration.
+    /// </summary>
+    private void TryParseParameterList(List<ParameterDefinition> parameters)
+    {
+        int _iter = 0;
+        int depth = 1;
+        while (_streamer.Current != null && depth > 0)
+        {
+            ParseTrace.Step(ref _iter, _streamer, _currentCt);
+            // Param name(s) until ':'. F-G-14 (Session 23, 2026-07-18):
+            // also capture the optional `signal`/`variable`/`constant`
+            // object class that precedes the name list — previously
+            // dropped by the KEYWORDS filter, but signal-class formals
+            // need to be aliased to the caller's Variable object so
+            // `<=` inside the body schedules against the caller's driver.
+            var names = new List<string>();
+            bool isSignal = false;
+            while (_streamer.Current != null && _streamer.Current.Value != ":")
+            {
+                ParseTrace.Step(ref _iter, _streamer, _currentCt);
+                if (_streamer.Current.Value == ")") { depth--; if (depth == 0) { _streamer.MoveNext(); return; } }
+                var lower = _streamer.Current.Value?.ToLowerInvariant();
+                if (lower == "signal") isSignal = true;
+                if (_streamer.Current.Type == IDENTIFIERS) names.Add(_streamer.Current.Value);
+                _streamer.MoveNext();
+            }
+            if (_streamer.Current?.Value != ":") return;
+            _streamer.MoveNext(); // consume ':'
+
+            // Optional mode (`in`/`out`/`inout`).
+            ParameterMode mode = ParameterMode.In;
+            string modeTok = _streamer.Current?.Value?.ToLower() ?? string.Empty;
+            if (modeTok == "in" || modeTok == "out" || modeTok == "inout")
+            {
+                mode = modeTok switch
+                {
+                    "out"   => ParameterMode.Out,
+                    "inout" => ParameterMode.InOut,
+                    _       => ParameterMode.In,
+                };
+                _streamer.MoveNext();
+            }
+
+            string typeTok = _streamer.Current?.Value ?? "std_logic";
+            var dataType = Variable.GetDatatype(typeTok);
+            string? customTypeName = dataType == Constants.DATATYPES.UNKNOWN ? typeTok : null;
+            _streamer.MoveNext();
+
+            int size = 0, hi = 0, lo = 0;
+            if (_streamer.Current?.Value == "(")
+            {
+                _streamer.MoveNext();
+                if (int.TryParse(_streamer.Current?.Value, out int h))
+                {
+                    hi = h; _streamer.MoveNext();
+                    _streamer.MoveNext(); // downto/to
+                    if (int.TryParse(_streamer.Current?.Value, out int l))
+                    {
+                        lo = l;
+                        size = Math.Abs(hi - lo) + 1;
+                        _streamer.MoveNext();
+                    }
+                }
+                while (_streamer.Current != null && _streamer.Current.Value != ")")
+                    _streamer.MoveNext();
+                if (_streamer.Current?.Value == ")") _streamer.MoveNext();
+            }
+
+            foreach (var n in names)
+            {
+                parameters.Add(new ParameterDefinition
+                {
+                    Name = n,
+                    Type = dataType,
+                    CustomTypeName = customTypeName,
+                    Mode = mode,
+                    Size = size,
+                    HighBound = hi,
+                    LowBound = lo,
+                    IsSignal = isSignal,
+                });
+            }
+
+            // Separator: ';' (next param) or ')' (end).
+            if (_streamer.Current?.Value == ";")
+            {
+                _streamer.MoveNext();
+                continue;
+            }
+            if (_streamer.Current?.Value == ")")
+            {
+                _streamer.MoveNext();
+                return;
+            }
+            // Unexpected token — bail.
+            return;
         }
     }
 
@@ -1908,47 +2689,121 @@ public class VariableSyntetizer : ISControl
         // Get the procedure name (case-preserved + lowered for matching).
         string procedureNameRaw = _streamer.Current?.Value ?? "";
         string procedureName    = procedureNameRaw.ToLower();
+        _streamer.MoveNext(); // consume procedure name
+
+        // F-G-12 (2026-07-18): capture parameters + body tokens so
+        // call sites can inline the procedure at runtime. Prior to F-G-12
+        // this method registered only the name (black-box stub), so
+        // `press_key(KEY_1);` in a testbench dropped silently.
+        var parameters = new List<ParameterDefinition>();
+        if (_streamer.Current?.Value == "(")
+        {
+            _streamer.MoveNext(); // consume '('
+            TryParseParameterList(parameters);
+        }
+
+        // Optional 'is'.
+        if (_streamer.Current?.Value?.ToLower() == "is")
+        {
+            _streamer.MoveNext();
+        }
+
+        // Skip local declarations (variables, constants) between 'is' and the
+        // body-opening 'begin'.
+        int _declIter = 0;
+        while (_streamer.Current != null && _streamer.Current.Value?.ToLower() != "begin")
+        {
+            ParseTrace.Step(ref _declIter, _streamer, _currentCt);
+            _streamer.MoveNext();
+        }
+        if (_streamer.Current?.Value?.ToLower() == "begin")
+        {
+            _streamer.MoveNext();
+        }
+
+        // Capture body tokens while walking until `end procedure` or
+        // `end <procedure_name>`. F-G-12 (2026-07-18): the previous
+        // begin/end-depth walk got confused by fragmented string literals
+        // (`" end "` tokenized into a lone `end` token would false-fire)
+        // and by `wait for N ns;` (misread as a for-loop header). The
+        // two-token `end <procedure|name>` match here is naturally
+        // string-safe: an `end` inside a report string is followed by
+        // more string fragments, not `procedure`/`<name>`.
+        var bodyTokens = new List<string>();
+        int _bodyIter = 0;
+        bool consumedEnd = false;
+        ParseTrace.Log($"proc-body-capture@{(_streamer.Current?.Line ?? 0) + 1}");
+        while (_streamer.Current != null)
+        {
+            ParseTrace.Step(ref _bodyIter, _streamer, _currentCt);
+            string val = _streamer.Current.Value ?? string.Empty;
+            string low = val.ToLower();
+
+            if (low == "end")
+            {
+                // Peek one token ahead. If it's `procedure` or the
+                // procedure name, THIS is the real end — bail out. Any
+                // other `end` (from `end if` / `end loop` / `end case` /
+                // even a stray `end` inside a string fragment) gets
+                // captured as normal body content.
+                var here = _streamer.Current;
+                _streamer.MoveNext();
+                string? next = _streamer.Current?.Value?.ToLower();
+                if (next == "procedure" || next == procedureName)
+                {
+                    // Consume `end`, `procedure`/<name>, optional
+                    // second name identifier, `;`. Same shape as
+                    // the pre-F-G-12 logic — no post-loop wrap needed.
+                    _streamer.MoveNext(); // procedure / <name>
+                    if (_streamer.Current?.Type == IDENTIFIERS)
+                        _streamer.MoveNext(); // optional second name
+                    if (_streamer.Current?.Value == ";")
+                        _streamer.MoveNext();
+                    consumedEnd = true;
+                    break;
+                }
+                // Not the real end — record both tokens and continue.
+                bodyTokens.Add(here?.Value ?? "end");
+                continue;
+            }
+
+            bodyTokens.Add(val);
+            _streamer.MoveNext();
+        }
+        string bodyRaw = string.Join(" ", bodyTokens);
 
         if (!string.IsNullOrEmpty(procedureNameRaw))
         {
             FunctionRegistry.Instance.Register(new FunctionDefinition
             {
                 Name = procedureNameRaw,
-                IsPure = false   // procedures may have side effects
+                Parameters = parameters,
+                BodyRaw = bodyRaw,
+                IsPure = false,   // procedures may have side effects
             });
+            // Diagnostic stays as-is — MVP inlining only fires report
+            // statements from the procedure body; signal assignments,
+            // wait, function-arg evaluation etc. still go unmodelled.
             SkipDiagnosticLog.Instance.AddWarning(
-                "VHD-PROC-BLACKBOX",
+                "VHD-PROC-PARTIAL",
                 procedureNameRaw,
-                $"Procedure '{procedureNameRaw}' body was not synthesised. " +
-                "Calls resolve as a black-box; the procedure's effects on " +
-                "out/inout signals are not modelled.");
+                $"Procedure '{procedureNameRaw}' body is captured but only " +
+                "`report` statements execute at call sites (F-G-12 MVP). " +
+                "Signal assignments, wait, and nested calls are not modelled.");
         }
 
-        // Simply look for 'end procedure' or 'end <procedure_name>'
-        while (_streamer.Current != null)
+        // If the loop exited without matching a real `end procedure`
+        // (malformed input / EOF), fall back to the pre-F-G-12 tolerant
+        // consume-any-end-and-run-off behaviour so the outer parser can
+        // still make progress instead of dying at the very next token.
+        if (!consumedEnd)
         {
-            string val = _streamer.Current.Value.ToLower();
-
-            if (val == "end")
-            {
-                _streamer.MoveNext(); // skip 'end'
-                if (_streamer.Current == null) break;
-
-                string nextVal = _streamer.Current.Value.ToLower();
-
-                // Check if this is the procedure end
-                if (nextVal == "procedure" || nextVal == procedureName)
-                {
-                    _streamer.MoveNext(); // skip 'procedure' or procedure name
-                    // Skip optional second procedure name after 'end procedure'
-                    if (_streamer.Current?.Type == IDENTIFIERS)
-                        _streamer.MoveNext();
-                    if (_streamer.Current?.Value == ";")
-                        _streamer.MoveNext(); // skip ';'
-                    return;
-                }
-            }
-            _streamer.MoveNext();
+            if (_streamer.Current?.Value?.ToLower() == "end") _streamer.MoveNext();
+            if (_streamer.Current?.Value?.ToLower() == "procedure" ||
+                _streamer.Current?.Value?.ToLower() == procedureName)
+                _streamer.MoveNext();
+            if (_streamer.Current?.Type == IDENTIFIERS) _streamer.MoveNext();
+            if (_streamer.Current?.Value == ";") _streamer.MoveNext();
         }
     }
 
@@ -1960,11 +2815,13 @@ public class VariableSyntetizer : ISControl
     /// </summary>
     private void SkipAttributeDeclaration()
     {
+        int _iter = 0;
         // Try to grab the attribute name for the diagnostic subject.
         _streamer.MoveNext(); // 'attribute'
         string attrName = _streamer.Current?.Value ?? string.Empty;
         while (_streamer.Current != null && _streamer.Current.Value != ";")
         {
+            ParseTrace.Step(ref _iter, _streamer, _currentCt);
             _streamer.MoveNext();
         }
         if (_streamer.Current?.Value == ";")
@@ -1984,8 +2841,10 @@ public class VariableSyntetizer : ISControl
     /// </summary>
     private void SkipDisconnectSpec()
     {
+        int _iter = 0;
         while (_streamer.Current != null && _streamer.Current.Value != ";")
         {
+            ParseTrace.Step(ref _iter, _streamer, _currentCt);
             _streamer.MoveNext();
         }
         if (_streamer.Current?.Value == ";")
@@ -2004,13 +2863,154 @@ public class VariableSyntetizer : ISControl
     /// </summary>
     private void SkipToSemicolon()
     {
+        int _iter = 0;
         while (_streamer.Current != null && _streamer.Current.Value != ";")
         {
+            ParseTrace.Step(ref _iter, _streamer, _currentCt);
             _streamer.MoveNext();
         }
         if (_streamer.Current?.Value == ";")
         {
             _streamer.MoveNext(); // skip ';'
         }
+    }
+
+    /// <summary>
+    /// F-G-01 helper (session 8, 2026-07-09): fold a small VHDL range-bound
+    /// expression to an integer. Handles integer literals, single-token
+    /// constant references (resolved via PackageRegistry), and left-to-right
+    /// two-operand or three-operand chains over +, -, *, /. Returns null
+    /// when the expression contains anything more complex — the caller then
+    /// falls back to the pre-existing default-8 behaviour.
+    /// </summary>
+    private static int? FoldSimpleExpr(List<string> tokens)
+    {
+        // Filter out whitespace-only tokens defensively.
+        var t = tokens.Where(x => !string.IsNullOrWhiteSpace(x)).ToList();
+        if (t.Count == 0) return null;
+
+        // Single operand.
+        if (t.Count == 1) return ResolveToken(t[0]);
+
+        // Two-operand: OP a  (unary -/+)  — rare in range specs but cheap.
+        if (t.Count == 2 && (t[0] == "-" || t[0] == "+"))
+        {
+            var v = ResolveToken(t[1]);
+            if (v == null) return null;
+            return t[0] == "-" ? -v.Value : v.Value;
+        }
+
+        // Left-to-right fold: value op value op value ... (no precedence).
+        int i = 0;
+        var a = ResolveToken(t[i++]);
+        if (a == null) return null;
+        int acc = a.Value;
+        while (i + 1 < t.Count)
+        {
+            string op = t[i++];
+            var b = ResolveToken(t[i++]);
+            if (b == null) return null;
+            acc = op switch
+            {
+                "+" => acc + b.Value,
+                "-" => acc - b.Value,
+                "*" => acc * b.Value,
+                "/" => b.Value != 0 ? acc / b.Value : 0,
+                _   => int.MinValue,
+            };
+            if (acc == int.MinValue) return null;
+        }
+        return i == t.Count ? acc : null;
+    }
+
+    /// <summary>
+    /// Resolves a single token to an integer: literal → parse; identifier →
+    /// look up in <see cref="PackageRegistry"/>. Returns null on miss.
+    /// </summary>
+    private static int? ResolveToken(string token)
+    {
+        string s = token.Replace("_", string.Empty);
+        if (int.TryParse(s, out int lit)) return lit;
+
+        var c = PackageRegistry.Instance.GetConstant(token);
+        if (c?.Value is int ci) return ci;
+        if (c?.Value is string cs && int.TryParse(cs, out int cp)) return cp;
+        return null;
+    }
+
+    /// <summary>
+    /// F-G-02 helper (session 8, 2026-07-09): coerce a <see cref="GetVariableValue"/>
+    /// return to <c>int</c>, falling back to <see cref="PackageRegistry"/>
+    /// when the value is an identifier string like <c>BUZ_LONG_TICKS</c> that
+    /// the local lookup didn't resolve. Returns 0 on any resolution failure —
+    /// matches the pre-existing <c>Convert.ToInt32</c> behaviour so downstream
+    /// range-magnitude arithmetic keeps its old semantics on miss.
+    /// </summary>
+    private static int ToInt32OrPackageConstant(object varValue)
+    {
+        if (varValue is int i) return i;
+        if (varValue is string s)
+        {
+            string bare = s.Trim().Replace("_", string.Empty);
+            if (int.TryParse(bare, out int lit)) return lit;
+            var pkg = PackageRegistry.Instance.GetConstant(s.Trim());
+            if (pkg?.Value is int pi) return pi;
+            if (pkg?.Value is string ps && int.TryParse(ps, out int pp)) return pp;
+        }
+        try { return Convert.ToInt32(varValue); }
+        catch { return 0; }
+    }
+
+    /// <summary>
+    /// F-G-02 helper: read one bound of an <c>integer range … to …</c>
+    /// clause. If the current token is an identifier that resolves in
+    /// <see cref="PackageRegistry"/>, take that constant's value and
+    /// advance past the token — otherwise defer to <see cref="GetVariableValue"/>
+    /// (legacy path). Kept as a scoped helper so package-constant lookup
+    /// only fires for range bounds, not for every identifier throughout
+    /// the parser.
+    /// </summary>
+    private int ReadRangeBound()
+    {
+        // Peek: identifier that PackageRegistry knows about?
+        if (_streamer.Current?.Type == IDENTIFIERS)
+        {
+            string name = _streamer.Current.Value ?? string.Empty;
+            var pkg = PackageRegistry.Instance.GetConstant(name);
+            if (pkg?.Value != null)
+            {
+                if (pkg.Value is int pi)
+                {
+                    _streamer.MoveNext();
+                    return pi;
+                }
+                if (pkg.Value is string ps && int.TryParse(ps, out int pp))
+                {
+                    _streamer.MoveNext();
+                    return pp;
+                }
+            }
+        }
+        return ToInt32OrPackageConstant(GetVariableValue());
+    }
+
+    /// <summary>
+    /// F-G-02 helper: minimum bit width needed to encode every integer in
+    /// [low, high] (unordered — accepts <c>0 to N</c> or <c>N downto 0</c>).
+    /// Uses <c>ceil(log2(max_magnitude + 1))</c> with a sign bit added when
+    /// the range spans negatives. Returns 1 for degenerate/empty ranges.
+    /// </summary>
+    private static int RangeToBitWidth(int a, int b)
+    {
+        int lo = Math.Min(a, b);
+        int hi = Math.Max(a, b);
+        // Magnitude that needs to fit: farthest-from-zero endpoint.
+        int magnitude = Math.Max(Math.Abs(lo), Math.Abs(hi));
+        if (magnitude == 0) return 1;
+        int bits = 0;
+        int m = magnitude;
+        while (m > 0) { bits++; m >>= 1; }
+        if (lo < 0) bits += 1; // sign bit
+        return bits;
     }
 }

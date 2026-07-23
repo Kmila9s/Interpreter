@@ -1962,6 +1962,450 @@ classDiagram
 
 ## Changelog
 
+### Ring 5 sweep observability — report / procedure / to_string (2026-07-18)
+
+Follow-on session that made VHDL testbench reports actually execute and
+their case-marker sweep readable via `/api/v1/simulate` response `log[]`.
+Every fix is additive: default paths unchanged, 121/121 SimulatorBench
+byte-identical.
+
+*   **F-G-11 — VHDL `report` statements execute + surface via API log.**
+    New `Interpreter/Services/ReportBus.cs` (singleton event sink);
+    `Interpreter/Repositories/ReportStatement.cs` implements `ISControl`
+    with parse-time expression capture (tracking `insideString` so a `;`
+    inside a string literal doesn't prematurely terminate) and
+    runtime rendering via `ReportBus.Emit`. `Process.SyntetizeBehaviour`'s
+    `case "report"` now creates a `ReportStatement` task instead of
+    skipping to `;`. `SimulationRunner.RunAsync` bridges
+    `ReportBus.OnReport` to an instance-scoped `OnReport` event for the
+    run's lifetime, tearing down in `finally` so the static bus doesn't
+    accumulate stale listeners.
+    `HeadlessSimulator.RunAsync` subscribes and appends `[report] <msg>`
+    to the response log. Before F-G-11 every VHDL `report` was silently
+    dropped by `SkipToSemicolonInclusive`.
+
+*   **F-G-11b — nested `report` execution.** The five sub-structure body
+    dispatchers (`WhileLoop` / `ForLoop` / `SimpleLoop` / `If` / `Case`)
+    also create `ReportStatement` tasks now instead of skipping. `assert`
+    still skips in all six (F-G-16 candidate).
+
+*   **F-G-12 — procedure-call inlining MVP.**
+    `Interpreter/Services/VariableSyntetizer.cs`: rewrote
+    `SkipProcedureDeclaration` to capture the parameter list (via the
+    existing `TryParseParameterList`) and the body tokens between `begin`
+    and a two-token `end procedure` / `end <name>` match. The two-token
+    match is naturally string-safe — bare `end` inside a `report "…"`
+    fragment is followed by more string fragments, not
+    `procedure`/`<name>`. Registers a full `FunctionDefinition`
+    (Parameters + BodyRaw, `IsPure=false`) in `FunctionRegistry`.
+    `Interpreter/Repositories/ProcedureCallStatement.cs` (pre-existing
+    scaffold, now wired): `Syntetize` captures positional argument
+    tokens (respecting string state so `,` and `)` inside a literal
+    don't fire arg-boundary logic). `ExecuteAsync` walks `BodyRaw`,
+    substitutes parameter names with argument tokens for every
+    `report … ;`, and emits via `ReportBus`. Signal assignments, `wait`,
+    nested calls, and function evaluation inside reports are NOT
+    modelled — full inlining is F-G-14 + F-G-13 territory.
+    `Process.SyntetizeBehaviour`'s `else` branch dispatches via
+    `ProcedureCallStatement.IsProcedureCall` before falling through
+    to `SyntetizeAssignment`.
+    Also fixed `SourceElaborator.StripLineComments` (was blind to
+    string literals — `report "-------- " & name & …` had its content
+    truncated at the first `--` inside the message).
+
+*   **F-G-12a — three tightly-coupled tokenizer / walk bugs.**
+    Surfaced by finally running procedure bodies for real.
+    1. `Parser/Repositories/Tokenizer.cs` `TokenizeSpaces` was
+       string-blind: `if (line.Contains("--")) line = line.Split("--")[0];`
+       truncated `report "-------- "` at the first `--` inside the
+       string. New `FindTrailingLineCommentStart` helper walks the
+       line tracking a `"`-toggled `insideString` flag and returns
+       the byte index of a `--` outside any literal.
+    2. Same tokenizer's `TokenizeSpecialCharacters` had a per-token
+       `if (line.StartsWith("--")) return new();` safety net that
+       fired during the recursive per-char split of `"--------"`,
+       dropping the intermediate 7-dash substring. Removed now that
+       line-level stripping is quote-aware.
+    3. `ProcedureCallStatement.ExecuteAsync`'s inner-walk break was
+       `i++; break;` while the outer `for` also `i++`ed, skipping one
+       token past every `;`. Every OTHER `report` in a multi-report
+       body was missed. Fixed by leaving `i` AT the `;`.
+
+*   **F-G-15 — `to_string(sig)` / `to_string(sig(hi downto|to lo))`
+    evaluation in report expressions.** New shared static
+    `Interpreter/Services/ParseTrace.RenderReportTokens(tokens, variables)`
+    consolidates the render logic previously duplicated across
+    `ReportStatement.ExecuteAsync` and `ProcedureCallStatement`. Inline
+    `TryEvalToString` pattern matcher recognises the 4-token
+    (`to_string ( name )`) and 9-token
+    (`to_string ( name ( hi downto lo ) )`) forms; resolves the signal
+    via variable scope; extracts the slice as
+    `raw.Substring(size-1-high, high-low+1)` (Kmila stores
+    `std_logic_vector` values as strings with index 0 = leftmost/MSB
+    char). Falls back to source-text emission on any unknown signal /
+    out-of-bounds slice / unrecognised direction. Ring 5's `end_case`
+    LCD reports now render actual bit values instead of the source
+    expression text.
+
+### Reference: `report` statement execution end-to-end
+
+```
+Source .vhd:                        report "TB: reset released";
+      │
+      ▼
+Parser.ParseFile                 (line-based state machine)
+      │
+      ▼
+Architecture.Syntetize           (per-arch)
+      │
+      ▼
+VariableSyntetizer.Syntetize     (declarative region)
+      │
+      ▼
+Architecture.SyntetizeBehaviour  (body)
+      │
+      ├─ case "process" ──► Process.Syntetize
+      │                          │
+      │                          ▼
+      │                     Process.SyntetizeBehaviour
+      │                          │
+      │                          ├─ case "report" ──► new ReportStatement + Syntetize + Tasks.Add
+      │                          ├─ case "procedure_call" ──► new ProcedureCallStatement + Syntetize + Tasks.Add
+      │                          └─ …
+      │
+      ▼
+DeltaCycleEngine.RunTimeStep     (loops until stable)
+      │
+      ▼
+ExecuteProcessWithSchedulingAsync
+      │
+      ▼
+foreach task in process.Tasks:
+   task.ExecuteAsync()  ──► ReportStatement / ProcedureCallStatement
+                                 │
+                                 ▼
+                            ParseTrace.RenderReportTokens()
+                                 │
+                                 ▼
+                            ReportBus.Instance.Emit(msg)
+                                 │
+                                 ▼
+                            SimulationRunner.OnReport (event, per-run bridge)
+                                 │
+                                 ▼
+                            HeadlessSimulator: log.Add($"[report] {msg}")
+                                 │
+                                 ▼
+                            /api/v1/simulate response `log[]`
+```
+
+Known limitations tracked as followups:
+- **F-G-13** — `wait for N ns` scheduling. Kmila doesn't model process suspend/resume across simulation time. All statements in a process body currently fire at delta 0 in code order.
+- **F-G-14** — signal assignments inside procedure bodies. Ring 5's
+  `press_key(KEY_1)` procedure body has `cols_in <= …` writes; F-G-12
+  MVP ignores them, so the DUT never sees inputs.
+
+Also shipped 2026-07-18 — F-G-16 (assert execution) + report render polish:
+
+*   **F-G-16 — VHDL `assert` execution.** New
+    `Interpreter/Repositories/AssertStatement.cs` mirrors
+    `ReportStatement`'s shape. `Syntetize` captures three optional
+    segments: condition tokens (until `report` / `severity` / `;`
+    respecting `insideString`), report expression tokens (until
+    `severity` / `;`), and severity level (default `error`).
+    `ExecuteAsync` evaluates the condition via `Operation` (same idiom
+    as `ExitStatement`'s `when` clause); when the condition is FALSE —
+    or when evaluation throws — emits `[assert-<sev>] <msg>` via
+    `ReportBus`. Default message when the source omits `report`:
+    `"Assertion violation"`. Failure-biased on eval-throw so students
+    diagnosing broken designs get noise rather than silence. Wired into
+    all six dispatchers (`Process` + `While` / `For` / `SimpleLoop` /
+    `If` / `Case` bodies).
+*   **Consecutive-same-char run collapse in report render.** The
+    fragmented-string path in `ParseTrace.RenderReportTokens` tracks
+    the previous emitted char; when the current token is a single char
+    equal to the previous, join WITHOUT a space. `========` (source)
+    was rendering as `= = = = = = = =` because the tokenizer splits
+    string content on special chars — now renders as `========`. Same
+    for `--------`. Multi-char tokens (`lcd`, `line0`) keep the space
+    separator so word boundaries survive. Heterogeneous single-char
+    runs also keep the space.
+
+### Ring 5 unblock — parser + elaborator (2026-07-17 → 2026-07-18)
+
+Session 22 shipped four related fixes plus the diagnostic scaffolding that
+found them. All four are additive: default paths unchanged, byte-identical
+SimulatorBench VCDs across 121 cases.
+
+*   **F-G-08 (parser hang) — sub-structure body dispatchers now handle `wait`
+    / `report` / `assert`.** `WhileLoopStructure`, `ForLoopStructure`,
+    `IfStructure`, `CaseStructure`, `SimpleLoopStructure` — none of their
+    body switch statements had cases for testbench-only keywords, so
+    `wait for N ns;` inside a nested `while ... loop` fell through
+    `default: _streamer.MoveNext()`; the parser then dispatched the
+    trailing `for` as a for-loop header, `ForLoopStructure.ParseRangeValue`
+    swallowed tokens until the next `loop`, and `new Operation(...)` on
+    the giant malformed range string hung indefinitely. Fix adds
+    `case "wait"` / `case "report"` / `case "assert"` to all five
+    dispatchers, delegating to new shared static helpers
+    `Interpreter.Services.ParseTrace.SkipWaitStatement` and
+    `.SkipToSemicolonInclusive`. `Process.SkipWaitStatement` /
+    `Process.SkipToSemicolonInclusive` now delegate to the same helpers.
+    Latent bonus fix in the shared helper: the tokenizer splits
+    `"TB: end of stimulus"` on whitespace, so the old `end` early-exit
+    safety net fired on the word `end` inside the fragmented literal —
+    the shared helper toggles an `insideString` flag via unmatched-quote
+    counting so it stays opaque to the walk.
+
+*   **F-G-09 (elaborator string-literal blindness) —
+    `SourceElaborator.SplitArchitecture` masks string-literal contents
+    before its keyword regex.** Same shape as F-G-08's fragmented-string
+    bug, one level up. The regex `\b(architecture|process|...|end|...)\b`
+    used to false-match on `end` inside `report "TB: end of stimulus";`,
+    decrementing `innerDepth` from 1 (inside `stim_proc`) to 0 and
+    prematurely terminating `bodyText` at the *real* `end process;`. The
+    emitter then wrote `end architecture;` right after `wait;` with no
+    closing `end process;` for the last process. Fix: new
+    `MaskStringLiterals` helper returns a length-preserving copy of the
+    source with `"..."` contents replaced by `.` (quotes preserved);
+    `SplitArchitecture` uses the masked copy for regex + `IndexOf(';')`
+    and the original for substring returns, so `report` strings survive
+    untouched in the elaborated output.
+
+*   **F-G-10 (elaborator artefact shadowing) — scanners skip
+    `_elaborated_*.vhd`.** `SourceElaborator.ScanProject` and
+    `HeadlessSimulator`'s scan loop both enumerate every `.vhd*` file in
+    the sandbox. A leftover `_elaborated_<entry>.vhd` from a previous run
+    of the same project would get scanned too, and its post-elaboration
+    record (with all component instances inlined into signals) would
+    overwrite the source's record in the entity dict. Downstream,
+    `HasComponentInstance(top.ArchitectureBody)` returned false,
+    `ElaborateOrNull` returned null, HeadlessSimulator fell back to the
+    original source, and the parser saw only the outer testbench shell
+    (11 signals for the Ring 5 capstone, missing all 174 DUT internals).
+    Fix: both scanners now skip file names starting with `_elaborated_`.
+    Reproducer was invisible to SimulatorBench because bench doesn't set
+    `retain: true` on its sandbox projects, so each case starts empty.
+
+*   **Cancellation surface through parse + synth descent.**
+    `Debugger.Repositories.Parser.ParseFile(CancellationToken)` overload
+    added; `SimulationRunner.RunAsync` registers
+    `_cts.Token.Register(() => _engine?.Stop())` after `Initialize` so
+    the runner-side cancel actually breaks the engine's delta loop.
+    `HeadlessSimulator.RunAsync` builds a request-scoped CTS at
+    `Phase("start")` (before parse) instead of inside SimulationRunner
+    (after parse), so `KMILA_SIM_WALL_TIMEOUT_MS=<n>` now covers the
+    whole pipeline — parse included — not just the sim loop.
+
+*   **Parse-time safety nets on every unbounded `Skip*` loop.** Added
+    `ParseTrace.MAX_SKIP_ITER = 100_000` cap + throw-with-context via
+    the new `Parser.Models.ParserSkipOverflowException` on:
+    `VariableSyntetizer.Skip{Function,Component,Subtype,Alias,Procedure,Attribute,Disconnect,ToSemicolon}Declaration`
+    plus `TryParseParameterList`; historically these had no cap and
+    could hang the parser indefinitely on pathological input. A cap
+    trip now surfaces via the response as
+    `[engine] ParserSkipOverflowException in <site> at line <N>,
+     tokens=[...]` — under 100 ms instead of "curl times out after
+    10 min."
+
+*   **Env-var-gated parse-time diagnostics.**
+    - `KMILA_PARSER_STEP_TRACE=1` — stderr `[kmila-parse t=...ms line=...] {caller}: {tag}` at
+      Skip* entries + per-declaration in the outer `VariableSyntetizer`
+      loop + entry-of every sub-structure `Syntetize`.
+    - `KMILA_SIM_PHASE_TRACE=1` — stderr `[kmila-phase t=...ms] {tag}`
+      at each pipeline boundary
+      (start / registries-cleared / scan / subscan / elaborate / parse / stimulus / runner).
+    - `KMILA_SIM_PROGRESS_EVERY_N_DELTAS=<n>` — stderr
+      `[kmila-diag t=...ms] tick=... delta=... cumDeltas=...` every N deltas.
+    - `KMILA_SIM_TRUNCATE_DELTA_CAP=1` — turn the delta-cap throw into
+      a break-and-continue so a run past the first cap is observable
+      end-to-end.
+    - `KMILA_SIM_NO_HISTORY=1` (pass 1 legacy) — skip VCD history
+      recording; response VCD is empty but `report`-based sweeps still
+      work.
+    Always-on: the response `log[]` gets a `[diag]` line at the end
+    with tick / delta / cap / initial-elab counters.
+
+### Practica-hardening sweep (2026-06-22 → 2026-06-23)
+
+Driven by the user's 5 ESCOM Arquitectura de Computadoras practicas
+(P1–P4). Each bug below was locked in as a SimulatorBench case (120–132)
+before being fixed; full per-case narrative lives in
+`Documentacion/HANDOFF_practicas_2026-06-23.md`. **The rule throughout:
+Kmila adapts to handle the codes, never the other way around.** No
+practica source was modified for sim-only compatibility.
+
+*   **Constant-array element access (Bench bug #19) — `Parser/Models/Variable.cs`
+    + `Interpreter/Models/{Deferred,Dynamic}Index.cs` +
+    `Interpreter/Services/VariableSyntetizer.cs` +
+    `Interpreter/Services/Operation.cs`.** Positional aggregates
+    (`("10101010", "10111011", …)`) now parse into a clean concatenated
+    bitstring of `ElementSize × ArrayLength` bits; `Variable` carries
+    the new `ElementSize` / `ArrayLength` fields; `DeferredIndex` /
+    `DynamicIndex` slice element-wise when the source has
+    `ElementSize > 1`. New expression-mode `DynamicIndex` re-evaluates
+    `rom_init(to_integer(unsigned(addr)))`-shaped indices each delta.
+    `ParseIndexedAccessDeferred` is paren-aware. **Trap:** Variable
+    overloads `operator==` to compare names — use `is null` /
+    `is not null` for reference checks.
+
+*   **Named-association aggregates + user-defined function bodies
+    (Bench bug #19 follow-up) — `VariableSyntetizer.cs`,
+    `Operation.cs`, `FunctionExecutor.cs`, `FunctionDefinition.cs`.**
+    `TryParseNamedAggregate` handles `(0 => pack(170), …, others => …)`
+    placing each value at `key × ElementSize` offset.
+    `SkipFunctionDeclaration` now parses signature + body and registers
+    a real `FunctionDefinition` in `PackageRegistry`.
+    `ParseUserDefinedFunctionCall` invokes `FunctionExecutor` when the
+    function has a body. New `CachedScope` on `FunctionDefinition` —
+    subsequent calls reuse the same parameter `Variable` instances and
+    only refresh `.Value` (20× perf win on heavy ROM init).
+
+*   **Case-statement identifier + slice selector
+    (Bench bugs #20, #21) — `DeltaCycleEngine.cs`.**
+    `ExecuteCaseStructureWithSchedulingAsync` now extracts the slice
+    when `HasSelectorSlice` is true; `ResolveChoiceForCase` resolves
+    each `when` choice — hex literals, quoted bit strings,
+    single-quoted bits, and **identifier lookups against `_allSignals`**
+    so `when OP_LOAD =>` matches the binary value of OP_LOAD.
+
+*   **P2A LOAD pipeline + HALT detect (Phase E).**
+    `Operation.ParseFunctionCall::TryConsumeSliceArg` emits a
+    `DeferredIndex` when an arg looks like `<var>(N)` /
+    `<var>(H downto L)`; `StandardFunctions.GetStringValue/GetIntValue`
+    learned to evaluate it; `Operator.SolveComparation` INTEGER branch
+    falls back to ordinal string equality when both sides aren't
+    numeric (enum literals live as their name strings); `*` operator
+    widened to `leftW + rightW` per numeric_std unsigned-multiply.
+    **P2A end-to-end: `acc_reg = 56`, `halted = 1` — matches GHDL
+    bit-for-bit and the MachXO2 FPGA.**
+
+*   **Function-body capture for any `if/case/loop`-nested body
+    (Bench bug #24) — `VariableSyntetizer.SkipFunctionDeclaration`.**
+    The legacy depth counter treated `end if` as decrement + re-increment
+    on the next keyword, truncating bodies at the first inner `end`.
+    Now consumes `end <closer>` as a single match; loop-opener prefix
+    `for X in Y loop` / `while X loop` skips past the trailing `loop`
+    keyword. P4's `key_index` function was the trigger.
+
+*   **Array attributes (`'length`, `'high`, `'low`, `'left`, `'right`)
+    — `Operation.TryParseSignalAttribute`.** P4 needed
+    `to_unsigned(N, slot_cnt'length)` which would otherwise corrupt the
+    function-call arg list. Boolean edge attributes (`event`,
+    `last_value`, `stable`, `active`) untouched.
+
+*   **`SourceElaborator` generic-default substitution — `SourceElaborator.cs`.**
+    New `ExtractGenericDefaults` reads `:=` defaults from a child
+    entity's generic clause; ordering: defaults first, then explicit
+    `generic map(...)` overrides. Port-type texts are substituted too
+    (so `STD_LOGIC_VECTOR(WIDTH-1 downto 0)` aliases reach the parent
+    as `STD_LOGIC_VECTOR(16-1 downto 0)`).
+
+*   **Engine perf: concurrent-task sensitivity gating
+    (Phase H.3) — `DeltaCycleEngine.cs`.** New per-Operation cache
+    `_operationInputs` records the static input-signal set
+    (`Variable`, `DeferredIndex.Source`, `DynamicIndex.Source` +
+    `IndexSource`; null = "always run" for `DeferredFunction` /
+    expression-mode `DynamicIndex`). `_lastDeltaChangedSignals`
+    snapshots committed changes per delta; the concurrent-task loop
+    skips Operations whose inputs don't overlap. Reset / unioned at
+    each time-step boundary so external-stimulus changes still
+    propagate. **P22 12× faster on signal-heavy designs.**
+
+### Continuation 2026-06-24 — handoff §6 follow-up
+
+Closed §6 items 1, 3, 5, 6 from `HANDOFF_practicas_2026-06-23.md`.
+Items 2 (P22 ROM rewrite) and 4 (P3/P22 ROM content) were
+re-confirmed deferred — both are practica-edit work and stay paused
+until the user re-authorizes. **Zero practica VHDL was modified.**
+
+*   **`(others => 'X')` initial-value eager expansion (§6 item 1)
+    — `VariableSyntetizer.cs`, signal-construction site.** The Size
+    setter's `(others=>X)` branch in `Parser/Models/Variable.cs:135`
+    only fires when `_value` is already non-null. The object-initializer
+    pattern at the signal-construction site sets `Size` first (no
+    value yet) and `Value` second, so the marker landed in `Value`
+    verbatim — VCD writers then emitted the literal 11-char string
+    `(others=>0)` (non-bit chars map to `'x'`) for every signal
+    initialised this way, until the first user write. Now: detect
+    the marker on the initializer value, expand to a `VectorSize`-wide
+    bitstring before construction, gated on `VectorSize > 0` (so
+    `unsigned` / `signed` / `bit_vector` / `std_logic_vector` are all
+    covered).
+
+*   **`(others => 'X')` RHS aggregate write-time expansion (§6 item 3,
+    P3 root cause) — `Operation.cs::ParseOthersAggregate` +
+    `SignalScheduler.cs::ExpandAggregateMarker`.** When `(others => '0')`
+    appears on the RHS of a clocked reset branch
+    (`pc_reg <= (others => '0')` etc.), the engine created an
+    `Aggregate_others_X` Variable via the 4-arg constructor. Passing
+    `Size = 0` to that constructor triggered `Variable.Size`'s own
+    marker-expansion path which produced a zero-length string — the
+    Aggregate Variable's `Value` collapsed to `""`. The scheduler
+    then wrote `""` into the target signal, and the VCD writer
+    rendered it back as the original 11-char marker. Fix has two
+    parts: (a) `ParseOthersAggregate` now uses the object-initializer
+    construction so the Size setter is never called, preserving the
+    marker string in `Value`; (b) new helper
+    `SignalScheduler.ExpandAggregateMarker(newValue, target)` runs at
+    every queue-drained write in `ApplyCurrentUpdatesWithLines` —
+    if the payload is an `(others=>X)` marker and `target.Size > 0`,
+    it expands to a `target.Size`-wide bitstring using the fill char
+    from the marker. **P3 result: all internal CPU registers now
+    initialise to clean zeros at t = 0; PC walks normally; `mbr_reg`
+    + `rom_data_w` get real values.** The remaining ACC stall on P3
+    is a practica content bug (`eq_sel` ROM-address mux OR-masks
+    data fetches — same pattern as P22 Phase G.1) and is out of
+    scope per the rule.
+
+*   **`*` width tripwire (§6 item 5) — no code change, locked via
+    bench case 135.** Auditing showed no existing bench case directly
+    exercised the Phase E `leftW + rightW` widening; P1 was the only
+    consumer, and only indirectly. Added a focused tripwire so any
+    drift back to narrow-multiply (`max(leftW, rightW)`) fails the
+    sweep immediately: `unsigned(4..0) * unsigned(4..0)` →
+    `unsigned(9..0)` → `std_logic_vector(8..0)`; `12 * 11 = 132 =
+    "010000100"` loses the MSB under narrow-multiply.
+
+*   **Function-body symbol-resolution rebind (§6 item 6) — no code
+    change, locked via bench case 136.** Built a tripwire where the
+    same `sub` entity is inlined twice with different architecture-scope
+    signal values (`k_sig` driven from input port `kin = 3` and
+    `kin = 7`), and a function `add_off` declared in `sub`'s
+    architecture reads `k_sig` directly. The handoff hypothesis was
+    that `CachedScope`'s reuse of parameter Variable instances would
+    bind the function body's Operations to the first instance's
+    `k_sig` and yield stale reads for the second instance. **The
+    case passes today** (`o1 = 5 + 3 = 8`, `o2 = 10 + 7 = 17`) — the
+    elaborator's per-instance signal renaming creates distinct
+    `FunctionDefinition` entries in `PackageRegistry`, so each
+    instance's function body parses against its own scope and there
+    is no cache collision. Workaround proven correct; tripwire stays
+    in the bench as a permanent regression net.
+
+**End-of-continuation state:**
+
+- **SimulatorBench: 119 / 119 PASS** (115 baseline + 4 new locks
+  133–136). ~26 cumulative simulator/bench bugs fixed.
+- **P1: 5 / 5 PASS.**
+- **P2A: ACC = 56, halted = 1** — bit-for-bit GHDL match, FPGA-verified
+  state preserved.
+- **P3 / P22 / P4:** parse + simulate cleanly. P3 internal-register
+  marker leak fixed; remaining ACC stalls are practica-content
+  issues, not Kmila bugs.
+
+Files modified in this continuation (uncommitted, user manages git):
+
+```
+Interpreter/Services/VariableSyntetizer.cs            §6 item 1 eager-expansion at construction
+Interpreter/Services/Operation.cs                     §6 item 3 no-Size construction of Aggregate_others_X
+Interpreter/Services/SignalScheduler.cs               §6 item 3 ExpandAggregateMarker write-time helper
+SimulatorBench/Cases/133-others-init-readback/        §6 item 1 lock
+SimulatorBench/Cases/134-others-rhs-clocked-reset/    §6 item 3 lock
+SimulatorBench/Cases/135-mul-width-tripwire/          §6 item 5 lock
+SimulatorBench/Cases/136-fn-multi-caller-scope/       §6 item 6 lock (no Kmila change)
+```
+
 ### Version 1.14.0 (2026-04-19)
 
 *   **`Services/Operator.cs` — xnor fixed.** The evaluator fell through to

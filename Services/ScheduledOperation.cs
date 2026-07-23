@@ -57,6 +57,15 @@ public class ScheduledOperation
                 var result = deferredFunc.Evaluate();
                 variables.Push(result);
             }
+            // 2026-07-20: user-defined function whose body is registered.
+            // Same shape as Operation.Execute — the schedular's loop is a
+            // twin dispatch, both need the DeferredUserFunction branch or
+            // else clocked-process user-fn calls freeze at first-fire.
+            else if (item is Models.DeferredUserFunction deferredUser)
+            {
+                var result = deferredUser.Evaluate();
+                variables.Push(result);
+            }
             // Bench bug #5 sub-cause D: re-read indexed vector bits at
             // expression-evaluation time so `signal(N)` reflects the live
             // signal value, not the value at parse time.
@@ -89,7 +98,13 @@ public class ScheduledOperation
                     {
                         vari.IsPort = false;
                         vari.Type = DATATYPES.BOOLEAN;
-                        vari.Value = bool.Parse((string)vari.Value);
+                        // Safe coercion (mirrors Operation.cs::Execute).
+                        vari.Value = vari.Value switch
+                        {
+                            bool b   => b,
+                            string s => bool.TryParse(s, out var pb) && pb,
+                            _        => false
+                        };
                     }
                     else if (string.Equals(op.OperatorName, "&", StringComparison.Ordinal))
                     {
@@ -105,7 +120,13 @@ public class ScheduledOperation
 
         if (variables.Count != 1)
         {
-            throw new InvalidOperationException($"Malformed expression: stack not reduced to a single result");
+            // Include the operation's raw RHS expression in the error so
+            // headless users can identify which assignment misparsed. Falls
+            // back to "<unknown>" when the underlying Operation didn't
+            // capture the source text.
+            var raw = _operation?.RawData ?? "<unknown>";
+            throw new InvalidOperationException(
+                $"Malformed expression: stack not reduced to a single result ({variables.Count} items left). RHS=`{raw}` Target=`{_operation?.Result?.Name}`");
         }
 
         // Get the computed value

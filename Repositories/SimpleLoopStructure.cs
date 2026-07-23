@@ -186,6 +186,7 @@ public class SimpleLoopStructure : ISControl
     /// </summary>
     public void Syntetize()
     {
+        Interpreter.Services.ParseTrace.Log($"SimpleLoop @{(_streamer.Current?.Line ?? 0) + 1}");
         _streamer.Expect(KEYWORDS); // consume 'loop'
 
         // Parse loop body
@@ -261,6 +262,29 @@ public class SimpleLoopStructure : ISControl
                         ReturnStatement returnStmt = new(_variables, _streamer);
                         returnStmt.Syntetize();
                         Tasks.Add(returnStmt);
+                        break;
+
+                    // F-G-08 pass 4 (2026-07-17): testbench-only statements.
+                    case "wait":
+                        // F-G-13c (Session 23, 2026-07-18): capture the
+                        // wait as a real task so the engine's resumable
+                        // simple-loop executor can yield here.
+                        var _wait = new WaitForStatement(_streamer, _variables);
+                        _wait.Syntetize();
+                        Tasks.Add(_wait);
+                        break;
+                    case "report":
+                        // F-G-11b (2026-07-18): execute reports nested inside
+                        // a simple-loop body.
+                        var _rpt = new ReportStatement(_variables, _streamer);
+                        _rpt.Syntetize();
+                        Tasks.Add(_rpt);
+                        break;
+                    case "assert":
+                        // F-G-16 (2026-07-18): execute asserts nested inside a simple-loop body.
+                        var _ass = new AssertStatement(_variables, _streamer);
+                        _ass.Syntetize();
+                        Tasks.Add(_ass);
                         break;
 
                     default:

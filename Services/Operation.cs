@@ -20,8 +20,30 @@ public enum SignalAttributeType
 }
 
 /// <summary>
-/// Represents an operation.
+/// Represents an operation — the runtime evaluator for a single VHDL expression
+/// or assignment. Tokenizes → synthesises via <see cref="Syntetize"/> into an
+/// <see cref="Items"/> array of operands + operators, then <see cref="Execute"/>
+/// walks Items with a Shunting-Yard-style stack.
 /// </summary>
+/// <remarks>
+/// Items dispatch (post 2026-07-20):
+/// <list type="bullet">
+/// <item><see cref="Variable"/> — plain signal / port / constant / literal.</item>
+/// <item><see cref="Models.DeferredFunction"/> — IEEE stdlib primitive
+/// (rising_edge, to_unsigned, resize, …) evaluated at execute time.</item>
+/// <item><see cref="Models.DeferredUserFunction"/> — user-declared VHDL
+/// function whose body is registered. Args re-parse against the live scope
+/// on every <see cref="Execute"/>. Introduced 2026-07-20 to close the
+/// user-fn reactivity gap (rgb_rainbow-style LFSR-through-function froze
+/// at first-eval pre-fix).</item>
+/// <item><see cref="Models.DeferredIndex"/> — indexed signal read
+/// (bench Phase F #5).</item>
+/// <item><see cref="Models.DynamicIndex"/> — runtime-variable index.</item>
+/// <item><see cref="Operator"/> — arith / logic / relational operator.</item>
+/// </list>
+/// <see cref="ScheduledOperation.Execute"/> has a twin dispatch loop that
+/// must stay in sync when new item kinds land.
+/// </remarks>
 public class Operation : IOperation {
     /// <summary>
     /// Gets the result of the operation.
@@ -107,6 +129,7 @@ public class Operation : IOperation {
     /// <param name="sourceLine">Optional 1-based source line; 0 = unknown.</param>
     public Operation(string RawData, HashSet<Variable> Variables, int sourceLine = 0)
     {
+        var _profileStopwatch = ParseProfile.Enabled ? System.Diagnostics.Stopwatch.StartNew() : null;
         SourceLine = sourceLine;
         this.Variables = Variables;
         _rawData = RawData;
@@ -198,6 +221,11 @@ public class Operation : IOperation {
 #endif
         ShuntingYard shuntingYard = new(syntetized);
         Items = shuntingYard.Result.ToArray();
+        if (_profileStopwatch != null)
+        {
+            _profileStopwatch.Stop();
+            ParseProfile.RecordOperationCtor(_profileStopwatch.ElapsedTicks);
+        }
     }
 
     /// <summary>
@@ -217,6 +245,16 @@ public class Operation : IOperation {
             // This allows rising_edge/falling_edge to be evaluated with current signal state
             else if(item is Models.DeferredFunction deferredFunc){
                 var result = deferredFunc.Evaluate();
+                variables.Push(result);
+            }
+            // 2026-07-20: user-defined function whose body is registered.
+            // Evaluate re-parses each arg expression against the live scope
+            // and re-runs FunctionExecutor.ExecuteFunction. Without this
+            // branch, `q <= step_r(state);` inside a clocked process would
+            // freeze after the first fire (the pre-P22-fn eager-execute
+            // path baked the result into a Variable that never refreshed).
+            else if(item is Models.DeferredUserFunction deferredUser){
+                var result = deferredUser.Evaluate();
                 variables.Push(result);
             }
             // Bench bug #5 sub-cause D: indexed vector reads re-read live.
@@ -248,7 +286,19 @@ public class Operation : IOperation {
                     {
                         vari.IsPort = false;
                         vari.Type = Constants.DATATYPES.BOOLEAN;
-                        vari.Value = bool.Parse((string)vari.Value);
+                        // The comparator op already returns a primitive type
+                        // here: sometimes a string ("True"/"False" — from the
+                        // legacy ToString-based comparator) and sometimes a
+                        // raw `bool` (newer dispatch paths). Coerce safely
+                        // either way; the InvalidCast at this line was
+                        // crashing P2A's `if reset = '1'` evaluation when
+                        // the comparator returned a bool directly.
+                        vari.Value = vari.Value switch
+                        {
+                            bool b   => b,
+                            string s => bool.TryParse(s, out var pb) && pb,
+                            _        => false
+                        };
                     }
                     else if (string.Equals(op.OperatorName, "&", StringComparison.Ordinal))
                     {
@@ -457,11 +507,13 @@ public class Operation : IOperation {
                     }
                     else if (!Variables.Contains(currentItem) && StandardFunctions.CouldBeFunction(currentItem))
                     {
-                        // User-defined function - skip to closing paren and return stub value
+                        // User-defined function. 2026-07-20 — wrapper (DeferredUserFunction
+                        // when body is registered, or legacy stub Variable otherwise) is
+                        // returned as `object`; Execute() branches on the type at fire time.
                         var funcResult = ParseUserDefinedFunctionCall(currentItem);
                         if (funcResult.success)
                         {
-                            items.Add(funcResult.variable);
+                            items.Add(funcResult.item);
                             continue;
                         }
                     }
@@ -496,17 +548,27 @@ public class Operation : IOperation {
                 {
                     _pendingDynamicIndexSource = null;
                     _pendingDynamicIndexVar = null;
+                    _pendingDynamicIndexExpression = null;
                     var idx = ParseIndexedAccessDeferred(variable);
                     if (idx.success)
                     {
                         items.Add(idx.deferred!);
                         continue;
                     }
-                    if (_pendingDynamicIndexSource != null && _pendingDynamicIndexVar != null)
+                    if (_pendingDynamicIndexSource is not null && _pendingDynamicIndexVar is not null)
                     {
                         items.Add(new Models.DynamicIndex(_pendingDynamicIndexSource, _pendingDynamicIndexVar));
                         _pendingDynamicIndexSource = null;
                         _pendingDynamicIndexVar = null;
+                        continue;
+                    }
+                    if (_pendingDynamicIndexSource is not null && _pendingDynamicIndexExpression is not null)
+                    {
+                        items.Add(new Models.DynamicIndex(_pendingDynamicIndexSource,
+                                                          _pendingDynamicIndexExpression,
+                                                          Variables));
+                        _pendingDynamicIndexSource = null;
+                        _pendingDynamicIndexExpression = null;
                         continue;
                     }
                 }
@@ -558,8 +620,12 @@ public class Operation : IOperation {
         string signalName = token[..apostropheIndex].Trim();
         string attributeName = token[(apostropheIndex + 1)..].Trim().ToLower();
 
-        // Known signal attributes
-        string[] validAttributes = ["event", "last_value", "stable", "active"];
+        // Known signal attributes. Bench bug #23 (P4): 'length is a
+        // value-class array attribute (returns the vector / array length
+        // as an integer). Without it, `to_unsigned(N, slot_cnt'length)`
+        // tokens corrupted the surrounding function-call arg list and the
+        // parser ran past `end architecture;` consuming tokens until EOF.
+        string[] validAttributes = ["event", "last_value", "stable", "active", "length", "high", "low", "left", "right"];
 
         if (!validAttributes.Contains(attributeName))
         {
@@ -577,17 +643,32 @@ public class Operation : IOperation {
         var handler = SignalAttributeHandler.Instance;
         object attributeValue = attributeName switch
         {
-            "event" => handler.GetEvent(signal),
+            "event"      => handler.GetEvent(signal),
             "last_value" => handler.GetLastValue(signal),
-            "stable" => handler.GetStable(signal),
-            "active" => handler.GetActive(signal),
+            "stable"     => handler.GetStable(signal),
+            "active"     => handler.GetActive(signal),
+            // Array / vector attributes return an integer derived from the
+            // signal's declared range. Static at runtime — VHDL forbids
+            // dynamic resizing.
+            "length"     => signal.Size,
+            "high"       => Math.Max(0, signal.Size - 1),
+            "low"        => 0,
+            "left"       => Math.Max(0, signal.Size - 1),
+            "right"      => 0,
             _ => false
         };
 
-        // Create a variable representing the attribute result
-        Constants.DATATYPES resultType = attributeName == "last_value"
-            ? signal.Type
-            : Constants.DATATYPES.BOOLEAN;
+        // Create a variable representing the attribute result. The boolean
+        // edge / stability attributes stay BOOLEAN; the integer-class ones
+        // promote to INTEGER so callers like `to_unsigned(N, x'length)`
+        // see them as a width literal.
+        Constants.DATATYPES resultType;
+        if (attributeName == "last_value")
+            resultType = signal.Type;
+        else if (attributeName is "length" or "high" or "low" or "left" or "right")
+            resultType = Constants.DATATYPES.INTEGER;
+        else
+            resultType = Constants.DATATYPES.BOOLEAN;
 
         var resultVar = new Variable(
             $"Attribute-{signalName}'{attributeName}",
@@ -704,9 +785,29 @@ public class Operation : IOperation {
         }
         _currentSyntetizeIndex++; // Skip (
 
-        // Collect arguments until closing parenthesis
+        // Collect arguments until closing parenthesis.
+        //
+        // Historical shape: each token at depth 1 was pushed to `args`
+        // individually; commas were the ONLY arg separator (and were
+        // no-op'd rather than triggering a flush). That collapsed a
+        // sub-expression like `unsigned(a) + unsigned(b)` into three
+        // args `[a-val, "+", b-val]` — the outer cast primitive then
+        // saw a malformed arg count and returned empty. `argBuffer`
+        // buffers tokens *within one comma-separated arg*, and
+        // `FoldArgExpression` reduces the buffered items (which may
+        // contain Operators) to a single Variable before pushing to
+        // `args`. Single-token args behave identically to the legacy
+        // path — the fix is invisible unless the arg is a sub-expr.
         List<object> args = new();
+        List<object> argBuffer = new();
         int parenDepth = 1;
+
+        void FlushArg()
+        {
+            if (argBuffer.Count == 0) return;
+            args.Add(FoldArgExpression(argBuffer));
+            argBuffer.Clear();
+        }
 
         while (_currentSyntetizeIndex < _data.Length && parenDepth > 0)
         {
@@ -721,13 +822,14 @@ public class Operation : IOperation {
                 parenDepth--;
                 if (parenDepth == 0)
                 {
+                    FlushArg();
                     _currentSyntetizeIndex++;
                     break;
                 }
             }
             else if (token == "," && parenDepth == 1)
             {
-                // Argument separator - skip
+                FlushArg();
             }
             else if (token != ";" && parenDepth == 1)
             {
@@ -759,7 +861,7 @@ public class Operation : IOperation {
                     var nested = ParseFunctionCall(token);
                     if (nested.success)
                     {
-                        args.Add(nested.result);
+                        argBuffer.Add(nested.result);
                         continue;
                     }
                     // Recursive parse failed — fall through to the legacy
@@ -772,22 +874,50 @@ public class Operation : IOperation {
                 var variable = Variables.Where(v => !ReferenceEquals(v, null))
                     .FirstOrDefault(v => !string.IsNullOrEmpty(v.Name) &&
                         v.Name.Equals(token, StringComparison.OrdinalIgnoreCase));
+
+                // Bench bug #20 (P2A LOAD pipeline): a slice / index access
+                // on a Variable arg — `mbr_reg(7 downto 0)`, `mem(idx)` —
+                // would otherwise lose the slice info and the called
+                // function would see the whole vector. When the arg looks
+                // like `<var> ( <int> [downto|to <int>] )`, build a
+                // DeferredIndex so the slice is re-evaluated at call time.
+                if (!ReferenceEquals(variable, null) && nextIsParen)
+                {
+                    var idxArg = TryConsumeSliceArg(variable);
+                    if (idxArg != null)
+                    {
+                        argBuffer.Add(idxArg);
+                        continue; // index already past the inner ')'
+                    }
+                }
+
                 if (!ReferenceEquals(variable, null))
                 {
-                    args.Add(variable);
+                    argBuffer.Add(variable);
                 }
                 else if (int.TryParse(token, out int intVal))
                 {
-                    args.Add(intVal);
+                    argBuffer.Add(intVal);
+                }
+                else if (_arithOperators.IsMatch(token) || _logicOperators.IsMatch(token.ToLower()))
+                {
+                    // Binary / unary operator inside a function-call argument.
+                    // Recording it as an Operator (not a bare string) lets
+                    // FoldArgExpression collapse the sub-expression into a
+                    // single Variable when the arg is flushed. Was the
+                    // silent-empty-arg trap that broke `std_logic_vector(
+                    // unsigned(a) + unsigned(b))`-style one-liners.
+                    argBuffer.Add(new Operator(token));
                 }
                 else
                 {
-                    args.Add(token);
+                    argBuffer.Add(token);
                 }
             }
 
             _currentSyntetizeIndex++;
         }
+        FlushArg();
 
         // Determine result type
         Constants.DATATYPES resultType = functionName.ToLower() switch
@@ -821,11 +951,87 @@ public class Operation : IOperation {
         return (true, resultVar);
     }
 
+    // Reduce a buffered function-call argument (mix of Variables,
+    // DeferredFunctions, DeferredIndex, ints, and Operators) into a single
+    // value suitable for passing to a StandardFunctions primitive.
+    //
+    // Called by ParseFunctionCall on every comma / closing paren so a
+    // sub-expression like `unsigned(a) + unsigned(b)` inside
+    // `std_logic_vector(...)` reduces to one arg rather than three
+    // pseudo-args.
+    //
+    // When the buffer holds a real expression (>1 item), we wrap the item
+    // list in a DeferredExpression instead of evaluating at parse time.
+    // This is essential: IEEE cast/arith primitives run through
+    // DeferredFunction — evaluating the sub-expression at parse time
+    // would capture the pre-elaboration values of any Variables it
+    // reads (typically all 0s), and the outer DeferredFunction would
+    // keep evaluating that frozen constant on every tick regardless of
+    // how the source ports change. The DeferredExpression re-folds on
+    // each Evaluate call so live values flow through.
+    private static object FoldArgExpression(List<object> items)
+    {
+        if (items.Count == 0) return "";
+        if (items.Count == 1) return items[0];
+        // Preserve the buffered list under a defensive copy so subsequent
+        // ParseFunctionCall reuse of the shared buffer doesn't mutate us.
+        return new Models.DeferredExpression(new List<object>(items));
+    }
+
+    // Exposed to Models.DeferredExpression so it can resolve its buffered
+    // items using the same rules as the parse-time fold. Kept as a
+    // static helper because DeferredExpression is a Model / lightweight
+    // wrapper and shouldn't drag in Operation instance state.
+    public static Variable ToArgVariablePublic(object item) => ToArgVariable(item);
+
+    private static Variable ToArgVariable(object item)
+    {
+        Variable v = item switch
+        {
+            Variable vv => vv,
+            Models.DeferredFunction df => df.Evaluate(),
+            Models.DeferredIndex di => di.Evaluate(),
+            Models.DynamicIndex dyn => dyn.Evaluate(),
+            Models.DeferredExpression de => de.Evaluate(),
+            int i => new Variable("__ArgInt", i, Constants.DATATYPES.INTEGER),
+            _ => new Variable("__ArgRaw", item?.ToString() ?? "", Constants.DATATYPES.STD_LOGIC_VECTOR),
+        };
+        // Function-call return Variables (Name="Function-<fn>") come out of
+        // ParseFunctionCall / StandardFunctions without a Size set. When
+        // they're then used as an arith operand inside a folded expression,
+        // SolveArithOperation reads Size to pick the modular-arith width —
+        // a missing Size collapses width to 1 and turns 3+5 into 0. Infer
+        // Size from the string length of the current Value so downstream
+        // arith uses the right width. Only touches vector-typed values so
+        // we don't clobber INTEGER / BOOLEAN sizes elsewhere.
+        if (v.Type == Constants.DATATYPES.STD_LOGIC_VECTOR && v.Size <= 0)
+        {
+            var s = v.Value?.ToString();
+            if (!string.IsNullOrEmpty(s)) v.Size = s.Length;
+        }
+        return v;
+    }
+
     /// <summary>
-    /// Parses a user-defined function call and returns a stub value.
-    /// This allows synthesizing code that uses user-defined functions without executing them.
+    /// Parse a user-defined function call and return either a
+    /// <see cref="Models.DeferredUserFunction"/> wrapper (when the function
+    /// body is registered — Evaluate each fire) or a static stub
+    /// <see cref="Variable"/> (unknown / IEEE-stub — pre-existing legacy path).
     /// </summary>
-    private (bool success, Variable variable) ParseUserDefinedFunctionCall(string functionName)
+    /// <remarks>
+    /// 2026-07-20 — pre-fix, this method evaluated argument expressions
+    /// eagerly and baked the function result into a <see cref="Variable"/>
+    /// pushed onto the operation's <c>Items</c>. On re-fire of the
+    /// enclosing <see cref="Operation"/> the frozen variable just
+    /// re-pushed its stale value — an LFSR routed through a user
+    /// <c>function</c> would transition once then freeze. Now the wrapper
+    /// carries the argument <b>expressions</b> and re-evaluates them
+    /// against the live scope on every <see cref="Models.DeferredUserFunction.Evaluate"/>
+    /// call. Returned as <c>object</c> so the caller pushes it as-is onto
+    /// <c>Items</c> — <see cref="Execute()"/> switches on the type and
+    /// invokes <c>Evaluate</c> per fire.
+    /// </remarks>
+    private (bool success, object item) ParseUserDefinedFunctionCall(string functionName)
     {
         // Skip the function name (already processed), move to "("
         _currentSyntetizeIndex++;
@@ -833,25 +1039,64 @@ public class Operation : IOperation {
         if (_currentSyntetizeIndex >= _data.Length || _data[_currentSyntetizeIndex] != "(")
             return (false, null!);
 
-        // Skip to matching closing parenthesis
-        int parenDepth = 0;
-        while (_currentSyntetizeIndex < _data.Length)
+        // Bench bug #19 follow-up: collect each top-level comma-separated
+        // argument expression so we can hand them to FunctionExecutor.
+        _currentSyntetizeIndex++; // consume '('
+        var argExpressions = new List<string>();
+        var currentArg = new System.Text.StringBuilder();
+        int parenDepth = 1;
+        while (_currentSyntetizeIndex < _data.Length && parenDepth > 0)
         {
             string token = _data[_currentSyntetizeIndex];
             if (token == "(") parenDepth++;
             else if (token == ")")
             {
                 parenDepth--;
-                if (parenDepth == 0)
+                if (parenDepth == 0) { _currentSyntetizeIndex++; break; }
+            }
+            if (parenDepth == 1 && token == ",")
+            {
+                if (currentArg.Length > 0)
                 {
-                    _currentSyntetizeIndex++;
-                    break;
+                    argExpressions.Add(currentArg.ToString().Trim());
+                    currentArg.Clear();
                 }
+            }
+            else
+            {
+                currentArg.Append(token).Append(' ');
             }
             _currentSyntetizeIndex++;
         }
+        if (currentArg.Length > 0)
+            argExpressions.Add(currentArg.ToString().Trim());
 
-        // Return a stub variable representing the function result
+        // Real path: function body registered → build a DeferredUserFunction
+        // wrapper that re-evaluates on every Operation.Execute. Falls back
+        // to the legacy "0" stub Variable when the function is unknown or
+        // has no body (keeps black-box / IEEE stubs working as before).
+        try
+        {
+            var def = PackageRegistry.Instance.GetFunction(functionName);
+            if (def != null && !string.IsNullOrEmpty(def.BodyRaw))
+            {
+                var deferred = new Models.DeferredUserFunction(
+                    functionName,
+                    argExpressions,
+                    def.ReturnType,
+                    def.ReturnTypeSize,
+                    Variables);
+                return (true, deferred);
+            }
+        }
+        catch
+        {
+            // Fall through to stub on any registry error so the rest of
+            // the expression still synthesises.
+        }
+
+        // Return a stub variable representing an unresolved function result
+        // (black-box / package-header / unknown-name path).
         var resultVar = new Variable(
             $"UserFunction-{functionName}",
             "0",
@@ -888,12 +1133,33 @@ public class Operation : IOperation {
             _currentSyntetizeIndex++; // skip '=>'
         }
 
-        // Get the value
+        // Get the value. Handle three cases:
+        //   1. Literal char/bitstring:           others => '0'
+        //   2. Nested-aggregate (2D arrays):     others => ( others => '0' )
+        //   3. Plain identifier (e.g. constant): others => MY_BLANK
         string value = "0";
         if (_currentSyntetizeIndex < _data.Length)
         {
-            value = _data[_currentSyntetizeIndex].Replace("'", "").Replace("\"", "");
-            _currentSyntetizeIndex++;
+            // Nested aggregate? Look for the `( others => ...)` shape.
+            if (_data[_currentSyntetizeIndex] == "("
+                && _currentSyntetizeIndex + 1 < _data.Length
+                && string.Equals(_data[_currentSyntetizeIndex + 1], "others", StringComparison.OrdinalIgnoreCase))
+            {
+                _currentSyntetizeIndex++; // skip inner '('
+                var inner = ParseOthersAggregate();
+                if (inner.success)
+                {
+                    // Use the inner aggregate's value as the per-row payload.
+                    // The outer aggregate's repeated rows each get the inner
+                    // value verbatim.
+                    value = inner.variable.Value?.ToString() ?? "0";
+                }
+            }
+            else
+            {
+                value = _data[_currentSyntetizeIndex].Replace("'", "").Replace("\"", "");
+                _currentSyntetizeIndex++;
+            }
         }
 
         // Skip closing ')' if present
@@ -902,10 +1168,21 @@ public class Operation : IOperation {
             _currentSyntetizeIndex++;
         }
 
-        // Create a variable that represents the aggregate
-        // The actual size will be determined by the assignment target
-        var resultVar = new Variable($"Aggregate_others_{value}", $"(others=>{value})", Constants.DATATYPES.STD_LOGIC_VECTOR);
-        resultVar.PortType = Constants.PortType.OUT;
+        // Create a variable that represents the aggregate. We DELIBERATELY
+        // do NOT pass Size to the constructor — the 4-arg ctor calls the
+        // Size setter with `value=0`, which in turn triggers
+        // `Variable.Size`'s `(others=>X)` expansion path (Variable.cs:135)
+        // and collapses our marker to an empty string. Keeping Size at its
+        // default (0) AND skipping the setter preserves the marker string
+        // intact so `SignalScheduler.ExpandAggregateMarker` can expand it
+        // against the LHS target's declared width at assignment time.
+        var resultVar = new Variable
+        {
+            Name = $"Aggregate_others_{value}",
+            Type = Constants.DATATYPES.STD_LOGIC_VECTOR,
+            Value = $"(others=>{value})",
+            PortType = Constants.PortType.OUT,
+        };
 
         return (true, resultVar);
     }
@@ -948,18 +1225,23 @@ public class Operation : IOperation {
         bool isDownto = false;
         bool isTo = false;
 
-        // Get start index - could be a simple number, variable, or expression
+        // Get start index - could be a simple number, variable, or expression.
+        // Paren-aware: the index expression itself may contain nested parens
+        // (e.g. `rom(to_integer(unsigned(addr)))`), so we track depth and
+        // only break on `downto`/`to`/`)` at the outer (depth==0) level.
         if (_currentSyntetizeIndex < _data.Length)
         {
-            // Collect tokens until we hit 'downto', 'to', or ')'
             string expr = "";
             int tokenCount = 0;
+            int parenDepth = 0;
             while (_currentSyntetizeIndex + tokenCount < _data.Length)
             {
                 string token = _data[_currentSyntetizeIndex + tokenCount];
                 string tokenLower = token.ToLower();
-                if (tokenLower == "downto" || tokenLower == "to" || token == ")")
+                if (parenDepth == 0 && (tokenLower == "downto" || tokenLower == "to" || token == ")"))
                     break;
+                if (token == "(") parenDepth++;
+                else if (token == ")") parenDepth--;
                 expr += token + " ";
                 tokenCount++;
             }
@@ -1011,6 +1293,20 @@ public class Operation : IOperation {
                             _currentSyntetizeIndex++;
                         return (false, null);
                     }
+                }
+
+                // Bench bug #19: still no concrete int but the expression is
+                // non-trivial (function call, signal-dependent arithmetic).
+                // Capture it as a runtime-deferred expression that will be
+                // re-evaluated each delta cycle when the indexed access fires.
+                if (startIndex < 0)
+                {
+                    _pendingDynamicIndexSource = variable;
+                    _pendingDynamicIndexExpression = expr;
+                    // Swallow the closing ')' so the outer stream stays aligned.
+                    if (_currentSyntetizeIndex < _data.Length && _data[_currentSyntetizeIndex] == ")")
+                        _currentSyntetizeIndex++;
+                    return (false, null);
                 }
             }
         }
@@ -1066,10 +1362,55 @@ public class Operation : IOperation {
         return (true, new Models.DeferredIndex(variable, high, low, isSlice));
     }
 
+    /// <summary>
+    /// Bench bug #20 (P2A LOAD): when ParseFunctionCall encounters an arg
+    /// shaped like <c>&lt;var&gt; ( &lt;int&gt; [downto|to &lt;int&gt;] )</c>,
+    /// produce a <see cref="Models.DeferredIndex"/> so the inner slice is
+    /// re-read at call time rather than collapsing to the whole vector.
+    /// Returns null when the next tokens don't fit the slice pattern; in
+    /// that case the caller falls back to passing the Variable bare.
+    /// </summary>
+    private Models.DeferredIndex? TryConsumeSliceArg(Variable source)
+    {
+        int sliceStart = _currentSyntetizeIndex + 1; // points at '('
+        if (sliceStart >= _data.Length || _data[sliceStart] != "(") return null;
+
+        // Need at least `( <int> )`.
+        if (sliceStart + 2 >= _data.Length) return null;
+        if (!int.TryParse(_data[sliceStart + 1], out int hi)) return null;
+
+        // Single-bit form: `var(N)`.
+        if (_data[sliceStart + 2] == ")")
+        {
+            // Advance past the slice tokens.
+            _currentSyntetizeIndex = sliceStart + 3;
+            return new Models.DeferredIndex(source, hi, hi, isSlice: false);
+        }
+
+        // Range form: `var(H downto L)` or `var(L to H)`.
+        if (sliceStart + 4 >= _data.Length) return null;
+        string dir = _data[sliceStart + 2].ToLower();
+        if (dir != "downto" && dir != "to") return null;
+        if (!int.TryParse(_data[sliceStart + 3], out int lo)) return null;
+        if (_data[sliceStart + 4] != ")") return null;
+
+        int high = dir == "downto" ? hi : lo;
+        int low  = dir == "downto" ? lo : hi;
+        _currentSyntetizeIndex = sliceStart + 5;
+        return new Models.DeferredIndex(source, high, low, isSlice: true);
+    }
+
     // Bug #14 side-channel: ParseIndexedAccessDeferred writes the source +
     // index Variable pair here when it detects a runtime-variable index;
     // Syntetize() reads + clears them right after the call to install a
     // DynamicIndex operand instead of a frozen DeferredIndex.
     private Variable? _pendingDynamicIndexSource;
     private Variable? _pendingDynamicIndexVar;
+
+    // Bench bug #19 side-channel: ParseIndexedAccessDeferred writes the raw
+    // index expression text here when the index is a non-trivial expression
+    // (function call, signal-dependent arithmetic) that the parser can't
+    // reduce to a single integer Variable at parse time. The DynamicIndex
+    // operand built from this re-evaluates the expression each delta cycle.
+    private string? _pendingDynamicIndexExpression;
 }
