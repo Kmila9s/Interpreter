@@ -112,6 +112,13 @@ public class CaseStructure : ISControl
     public List<CaseWhenBranch> Branches { get; private set; } = new();
 
     /// <summary>
+    /// True when the statement was written as VHDL-2008 <c>case? … is?</c>
+    /// (matching-case). In this mode, a `-` character in any choice acts as
+    /// a don't-care and matches any bit of the selector at that position.
+    /// </summary>
+    public bool IsMatching { get; private set; } = false;
+
+    /// <summary>
     /// Initializes a new instance of the <see cref="CaseStructure"/> class.
     /// </summary>
     /// <param name="Variables">The set of variables available in the current scope.</param>
@@ -127,7 +134,7 @@ public class CaseStructure : ISControl
     /// </summary>
     public async Task ExecuteAsync()
     {
-        if (_selector == null) return;
+        if (_selector is null) return;
 
         string selectorValue = _selector.Value?.ToString() ?? "";
 
@@ -147,7 +154,10 @@ public class CaseStructure : ISControl
                 string cleanChoice = choice.Replace("\"", "").Replace("'", "").Trim();
                 string cleanSelector = selectorValue.Replace("\"", "").Replace("'", "").Trim();
 
-                if (cleanChoice.Equals(cleanSelector, StringComparison.OrdinalIgnoreCase))
+                bool hit = IsMatching
+                    ? MatchesWithWildcards(cleanChoice, cleanSelector)
+                    : cleanChoice.Equals(cleanSelector, StringComparison.OrdinalIgnoreCase);
+                if (hit)
                 {
                     Executer executer = new(branch.Tasks);
                     await executer.ExecuteAsync();
@@ -158,12 +168,41 @@ public class CaseStructure : ISControl
     }
 
     /// <summary>
+    /// VHDL-2008 matching-case comparison: `-` in the choice matches any bit
+    /// of the selector at that position; everything else is a bit-for-bit
+    /// exact compare (case-insensitive). A length mismatch is treated as
+    /// non-match rather than an error so the run continues to the next arm
+    /// (or falls through to `others`) instead of throwing mid-simulation.
+    /// </summary>
+    private static bool MatchesWithWildcards(string choice, string selector)
+    {
+        if (choice.Length != selector.Length) return false;
+        for (int i = 0; i < choice.Length; i++)
+        {
+            char c = choice[i];
+            if (c == '-') continue; // don't-care
+            if (char.ToUpperInvariant(c) != char.ToUpperInvariant(selector[i])) return false;
+        }
+        return true;
+    }
+
+    /// <summary>
     /// Synthesizes the case structure from the token stream.
     /// </summary>
     public void Syntetize()
     {
         Interpreter.Services.ParseTrace.Log($"CaseStructure @{(_streamer.Current?.Line ?? 0) + 1}");
         _streamer.Expect(KEYWORDS); // consume 'case'
+        // VHDL-2008 matching-case (Tier 4.2, 2026-07-28) — the lexer splits
+        // `case?` into two tokens (`case` + `?`) because `?` is a special
+        // char. Consume the optional `?` here, again after `is`, and again
+        // after the closing `end case`. IsMatching gates the wildcard
+        // semantics in ExecuteAsync.
+        if (_streamer.Current?.Value == "?")
+        {
+            IsMatching = true;
+            _streamer.MoveNext();
+        }
 
         // v0.16.1: Handle optional parentheses around selector: case (selector) is
         bool hasParens = _streamer.Current?.Value == "(";
@@ -195,6 +234,7 @@ public class CaseStructure : ISControl
         }
 
         _streamer.Expect(KEYWORDS); // consume 'is'
+        if (IsMatching && _streamer.Current?.Value == "?") _streamer.MoveNext();
 
         // Parse all 'when' branches
         // Safety: limit iterations to prevent infinite loop
@@ -412,9 +452,14 @@ public class CaseStructure : ISControl
                         branch.Tasks.Add(returnStmt);
                         break;
 
-                    // F-G-08 pass 4 (2026-07-17): testbench-only statements.
+                    // F-G-13d (Phase 2, 2026-07-22): capture the wait as a
+                    // real task so the engine's process-aware case-arm
+                    // executor can yield here. Mirrors F-G-13c on the
+                    // loop repositories.
                     case "wait":
-                        Interpreter.Services.ParseTrace.SkipWaitStatement(_streamer);
+                        var _wait = new WaitForStatement(_streamer, _variables);
+                        _wait.Syntetize();
+                        branch.Tasks.Add(_wait);
                         break;
                     case "report":
                         // F-G-11b (2026-07-18): execute reports nested inside
@@ -437,7 +482,18 @@ public class CaseStructure : ISControl
             }
             else
             {
-                SyntetizeAssignment(branch);
+                // Phase 3 (2026-07-22): dispatch procedure calls before
+                // falling to assignment parsing (mirror IfStructure).
+                if (ProcedureCallStatement.IsProcedureCall(_streamer, _variables))
+                {
+                    var _call = new ProcedureCallStatement(_variables, _streamer);
+                    _call.Syntetize();
+                    if (_call.IsValid) branch.Tasks.Add(_call);
+                }
+                else
+                {
+                    SyntetizeAssignment(branch);
+                }
             }
         }
 
@@ -469,6 +525,8 @@ public class CaseStructure : ISControl
             {
                 _streamer.MoveNext();
             }
+            // VHDL-2008 matching-case: `end case?;`
+            if (_streamer.Current?.Value == "?") _streamer.MoveNext();
             if (_streamer.Current?.Value == ";")
             {
                 _streamer.MoveNext();

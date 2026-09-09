@@ -201,11 +201,33 @@ public class SignalScheduler
     /// of the operation that drove each change (0 when unknown). When
     /// multiple updates target the same signal in the same delta, the
     /// LAST update wins for both value AND line — matches scheduler semantics.
+    ///
+    /// Tier 4.1 (2026-07-28): back-compat thin shim over
+    /// <see cref="ApplyCurrentUpdatesWithLinesAndOldValues"/>. Existing callers
+    /// that only need the changed-lines map keep working; the engine's hot
+    /// path uses the two-out variant to feed <c>SignalAttributeHandler.OnDeltaCommit</c>.
     /// </summary>
     public Dictionary<Variable, int> ApplyCurrentUpdatesWithLines()
     {
+        var (changed, _) = ApplyCurrentUpdatesWithLinesAndOldValues();
+        return changed;
+    }
+
+    private readonly Dictionary<Variable, object?> _oldValuesScratch = new();
+
+    /// <summary>
+    /// Tier 4.1: same commit pass as <see cref="ApplyCurrentUpdatesWithLines"/>
+    /// but also exposes the per-signal value-immediately-before-the-commit.
+    /// <c>SignalAttributeHandler.OnDeltaCommit</c> consumes the OldValues dict
+    /// to populate `'last_value`, `'event`, and `'stable(T)` per-delta state.
+    /// </summary>
+    public (Dictionary<Variable, int> ChangedLines, Dictionary<Variable, object?> OldValues)
+        ApplyCurrentUpdatesWithLinesAndOldValues()
+    {
         var changed = _changedScratch;
+        var oldValues = _oldValuesScratch;
         changed.Clear();
+        oldValues.Clear();
         lock (_lock)
         {
             while (_currentDeltaUpdates.Count > 0)
@@ -216,6 +238,13 @@ public class SignalScheduler
                 if (!Equals(oldValue, update.Target.Value))
                 {
                     changed[update.Target] = update.SourceLine;
+                    // First writer for this target within the delta wins the
+                    // "before" snapshot; if the same signal is updated more
+                    // than once, later writes replace update.Target.Value
+                    // but the ORIGINAL delta-start value is what LRM's
+                    // `'last_value` demands.
+                    if (!oldValues.ContainsKey(update.Target))
+                        oldValues[update.Target] = oldValue;
                 }
             }
 
@@ -244,11 +273,13 @@ public class SignalScheduler
                 if (!Equals(oldValue, target.Value))
                 {
                     changed[target] = lastLine;
+                    if (!oldValues.ContainsKey(target))
+                        oldValues[target] = oldValue;
                 }
             }
             _pendingBitWrites.Clear();
         }
-        return changed;
+        return (changed, oldValues);
     }
 
     /// <summary>

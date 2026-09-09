@@ -7,8 +7,8 @@ This module is a core component of **Kmila-9s**, a project officially titled "Ap
 **Author:** Ulrich Tamayo Daniel
 **Email:** dulricht1700@alumno.ipn.mx
 **Email 2:** danielulrichtamayo@gmail.com
-**Version:** 1.14.1
-**Last Updated:** May 1, 2026
+**Version:** 1.2.0 (branch `v1.2.0`)
+**Last Updated:** 2026-08-03
 
 ---
 
@@ -106,6 +106,9 @@ ISControl (Interface) - Sequential control structures with async execution
 ├── NullStatement            - null no-op statement
 ├── ReturnStatement          - return statement (throws ReturnException)
 ├── ProcedureCallStatement   - procedure call with argument evaluation
+├── ReportStatement          - VHDL `report` statement, renders + emits via ReportBus
+├── AssertStatement          - VHDL `assert` statement, emits on false condition via ReportBus
+├── WaitForStatement         - `wait for N ns` / `wait` statement handling
 ├── ConditionalAssignment    - concurrent when...else assignment
 ├── SelectedAssignment       - concurrent with...select assignment
 ├── GenerateBlock            - for-generate and if-generate statements
@@ -138,7 +141,14 @@ Utility / Singleton Services
 ├── SignalHistory           - Signal value recording for waveforms
 ├── PackageRegistry         - Package constants/functions/procedures (singleton)
 ├── EntityRegistry          - Multi-file entity discovery (singleton)
+├── FunctionRegistry        - FunctionDefinition stubs for skipped funcs/procs (singleton)
+├── PackageSubtypeScanner   - Cross-file `subtype` scanner → PackageRegistry
 ├── TypeRegistry            - Custom VHDL type definitions
+├── SourceElaborator        - Component-instance elaboration + string-safe source splitting
+├── ReportBus               - Singleton event sink for `report` / `assert` output
+├── ParseTrace              - Shared static skip/render helpers + skip-iteration cap
+├── SkipDiagnosticLog       - Records silent-skip events with stable codes
+├── IEEELibraryLoader       - Thin façade delegating to the LibraryCompiler module
 ├── ProgressReporter        - Event-based progress tracking (singleton)
 └── Resources               - FPGA resource estimation
 
@@ -157,12 +167,18 @@ Models
 Synthesis Namespace (Interpreter.Synthesis) - behavioral → structural lowering
 ├── Synthesizer                  - Static façade: Synthesize(Entity) → Netlist
 ├── SynthesisContext             - Per-entity build context (nets, cells, ports, diagnostics)
+├── ComponentSynthesizer         - Emits BLACKBOX_COMPONENT cells for component instantiations
+│                                  registered in EntityRegistry (shallow; honours pin direction)
 ├── ConcurrentAssignSynthesizer  - Lowers concurrent signal assignments
 ├── ConditionalAssignSynthesizer - Lowers `when…else` concurrent assignments
 ├── SelectedAssignSynthesizer    - Lowers `with…select` concurrent assignments
 ├── ProcessSynthesizer           - Lowers VHDL processes (registered FFs, combinational paths)
+├── IEEEPrimitives               - Table-driven IEEE-function → primitive-cell emitter
+│                                  (internal IIEEEPrimitive registry; extensible via Register)
+├── SelectionFilter              - Filters a Netlist + LaidOutNetlist for export
+│                                  (SelectionPicks → FilteredLayout for the Schematic basket)
 ├── Models.cs                    - Records: Net, Pin, Cell, PortPin, Netlist, Diagnostic
-│                                  Enums: CellKind, NetOrigin, NetKind, PortDir
+│                                  Enums: CellKind, NetOrigin, NetKind, PortDir, DiagnosticSeverity
 └── Layout/LayeredLayout         - Sugiyama-style placement → LaidOutNetlist (rects + wire paths)
 
 Façade
@@ -242,13 +258,16 @@ Placeholder
 *   **`Services/DataStructure.cs`**: Reserved placeholder class — currently empty constructor only. Real type operations live in `VariableSyntetizer`, `TypeRegistry`, and `TypeDefinition`.
 
 **Synthesis Namespace (`Interpreter.Synthesis`):**
-*   **`Synthesizer.cs`**: Static entry point — `Netlist Synthesize(Entity entity)` walks the entity's architecture body and dispatches each construct to a per-construct synthesizer.
+*   **`Synthesizer.cs`**: Static entry point — `Netlist Synthesize(Entity entity)` first calls `ComponentSynthesizer.SynthesizeAll` for the entity's instantiations, then walks the architecture body and dispatches each concurrent construct (`Operation` / conditional / selected / `Process`) to a per-construct synthesizer.
 *   **`SynthesisContext.cs`**: Build context per entity. Owns nets/cells lists and exposes `GetOrCreateNet`, `NewInternal`, `Constant`, `AddCell`, `AddPort`, `AddSignal`, `AddDiagnostic`, and finally `Build()` which returns a frozen `Netlist`.
-*   **`ConcurrentAssignSynthesizer.cs`**: Lowers concurrent signal assignments, including `Synthesize(Operation, ctx)` and `SynthesizeInto(Operation, outputNet, ctx)` overloads + `SynthesizeExpression(expr, scope, ctx, targetWidth)` for sub-expression reuse.
+*   **`ComponentSynthesizer.cs`**: `internal static`; `SynthesizeAll(parentEntityName, ctx)` emits one `CellKind.BLACKBOX_COMPONENT` cell per component instantiation the parser registered against the entity in `EntityRegistry.Instance`. Deliberately shallow — it does not descend into the referenced component's own architecture (that is covered by `SourceElaborator` at simulation time); it only makes the top-level hierarchy visible in the Schematic. Honours formal-pin direction when the referenced entity is resolved, otherwise emits every formal as an input pin.
+*   **`ConcurrentAssignSynthesizer.cs`**: Lowers concurrent signal assignments, including `Synthesize(Operation, ctx)` and `SynthesizeInto(Operation, outputNet, ctx)` overloads + `SynthesizeExpression(expr, scope, ctx, targetWidth)` for sub-expression reuse. Resolves `DeferredFunction` args (including nested calls) and lowers IEEE calls through `IEEEPrimitives.TryLower`.
 *   **`ConditionalAssignSynthesizer.cs`**: Lowers `when…else` chains.
 *   **`SelectedAssignSynthesizer.cs`**: Lowers `with…select` blocks.
 *   **`ProcessSynthesizer.cs`**: Lowers a `Process` to a mix of registered (clocked) and combinational cells.
-*   **`Synthesis/Models.cs`**: Hosts the record types that make up a netlist — `Net`, `Pin`, `Cell`, `PortPin`, `Netlist`, `Diagnostic` — and the enums `CellKind`, `NetOrigin`, `NetKind`, `PortDir`.
+*   **`IEEEPrimitives.cs`**: Table-driven lowering of IEEE function calls to real cells (`EDGE_DETECT`, `TO_INTEGER`, `TO_VECTOR`, `RESIZE`, `SHL`/`SHR`/`ROL`/`ROR`, `BUF`, …). The `IEEEPrimitiveArgs` / `IEEEPrimitiveResult` / `IIEEEPrimitive` / `IEEEPrimitives` types are `internal` (they reference the internal `SynthesisContext`); hosts extend the table via the public `IEEEPrimitives.Register` static. `TryLower` returns the emitted output net or a placeholder + `UnknownIEEEFunction` diagnostic on miss.
+*   **`SelectionFilter.cs`**: Public filter that trims a `Netlist` + `LaidOutNetlist` down to a user-selected subset for export — `SelectionPicks` (basketed cell / net / port-net ids + optional `FocusedSourceLine`) → `FilteredLayout` (same coordinate space, with a `Bounds` box). Backs the SchematicViewer's export basket and Naive-view focus.
+*   **`Synthesis/Models.cs`**: Hosts the record types that make up a netlist — `Net`, `Pin`, `Cell`, `PortPin`, `Netlist`, `Diagnostic` — and the enums `CellKind`, `NetOrigin`, `NetKind`, `PortDir`, `DiagnosticSeverity`.
 *   **`Synthesis/Layout/LayeredLayout.cs`**: Sugiyama-style layout pass — `Layout(Netlist) → LaidOutNetlist` (with `Rect` boxes and `WirePath` polylines). Consumed by the Editor's Schematic component.
 
 ---
@@ -1335,6 +1354,10 @@ while (_streamer.Current != null)
 ---
 
 ## 10. Changelog
+
+### Documentation re-sync (2026-08-03, branch `v1.2.0`)
+
+*   Updated the header stamp to the current branch (`v1.2.0`) and date. Re-checked the §3 structure lists against the on-disk tree and closed the drift the synthesis work had opened: added `ComponentSynthesizer`, `IEEEPrimitives`, and `SelectionFilter` to the `Interpreter.Synthesis` namespace listing; added the `ReportStatement` / `AssertStatement` / `WaitForStatement` control-statement files (all `ISControl`) to the class hierarchy; and added the newer `Services/` entries (`FunctionRegistry`, `PackageSubtypeScanner`, `SourceElaborator`, `ReportBus`, `ParseTrace`, `SkipDiagnosticLog`, `IEEELibraryLoader`) to the services listing. No source changes — documentation only; the detailed feature narratives below (Ring 5 report/assert, v1.15–v1.19 IEEE lowering, practica-hardening) were already current.
 
 ### v1.14.1 - Documentation Re-alignment (2026-05-01)
 
@@ -2561,15 +2584,17 @@ Full release notes: [`../Documentacion/CHANGELOG_v1.19.md`](../Documentacion/CHA
 ```
 Interpreter sweep (test*.vhdl) ............... 54 / 54
 Interpreter --test-delta:
-  DeltaCycleEngine ........................... 16 / 16
-  Synthesis .................................. 12 / 12
-  IEEELibraryLoader ...........................  6 /  6
-  LibraryCompiler ............................ 17 / 17
-  IEEEPrimitives ............................. 18 / 18
-  IEEELoweringEndToEnd ........................  6 /  6
-  NestedIEEECall ..............................  7 /  7
+  DeltaCycleEngine ........................... 12 / 12
+  Synthesis .................................. 16 / 16
+  IEEELibraryLoader ...........................  7 /  7
+  LibraryCompiler ............................ 21 / 21
+  IEEEPrimitives ............................. 19 / 19
+  IEEELoweringEndToEnd ........................  7 /  7
+  NestedIEEECall ..............................  8 /  8
+  PortStrictness ..............................  5 /  5
+  PracticeExercise ............................  1 /  1
 ─────────────────────────────────────────────────
-                                              136 / 136
+                                              150 / 150
 ```
 
 Plus 40 (Parser) + 31 (Debugger) + 23 (TimeMachine) for a grand total of 230 / 230 across the whole simulator stack.

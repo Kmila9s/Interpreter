@@ -142,6 +142,222 @@ public class ProcedureCallStatement : ISControl
     }
 
     /// <summary>
+    /// Phase 3 (Session 26, 2026-07-22): produces the per-call bound body
+    /// used by the delta-cycle engine's <c>RunTopProcedureFromEntryAsync</c>.
+    /// Textually substitutes formal identifiers with actual identifiers in
+    /// <c>def.BodyRaw</c> and re-parses through
+    /// <see cref="FunctionExecutor.ParseFunctionBodyStatic"/> against a
+    /// caller-facing scope. Result: every <c>Operation</c> in the returned
+    /// task list binds to caller-side <c>Variable</c>s, so signal writes
+    /// route through the caller's scheduler and <c>wait until</c>
+    /// sensitivity sets capture actual signal identity — no per-execute
+    /// remap needed at engine level.
+    /// </summary>
+    /// <remarks>
+    /// <para>Cache: (procedure name, joined-actual-name-signature) keyed
+    /// on the <c>FunctionDefinition</c> so amortized cost is one parse
+    /// per unique call-site actual pattern.</para>
+    /// <para>Returns an empty list if the procedure is not in
+    /// <see cref="FunctionRegistry"/> — callers should fall back to the
+    /// legacy <see cref="ExecuteAsync(SignalScheduler?)"/> for
+    /// PackageRegistry-only procedures.</para>
+    /// </remarks>
+    public List<object> ResolveBoundBody(
+        SignalScheduler? scheduler,
+        out Dictionary<ParameterDefinition, Variable> outMap,
+        out HashSet<Variable> boundScope)
+    {
+        outMap = new Dictionary<ParameterDefinition, Variable>();
+        boundScope = new HashSet<Variable>(_variables);
+
+        var def = Interpreter.Services.FunctionRegistry.Instance.Get(ProcedureName);
+        if (def == null || string.IsNullOrEmpty(def.BodyRaw))
+            return new List<object>();
+
+        // Build formal→actual textual rename map + cache-key signature.
+        // Values in the map can be multi-token strings (space-separated),
+        // matching how BodyRaw is stored (space-tokenized).
+        var renameMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var actualSig = new List<string>(def.Parameters.Count);
+
+        for (int i = 0; i < def.Parameters.Count && i < Arguments.Count; i++)
+        {
+            var formal = def.Parameters[i];
+            var argRaw = Arguments[i].Trim();
+            var argTokens = argRaw.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+            Variable? actualVar = null;
+            if (argTokens.Length == 1 && IsIdentifierStart(argTokens[0]))
+            {
+                actualVar = _variables.FirstOrDefault(v =>
+                    v.Name.Equals(argTokens[0], StringComparison.OrdinalIgnoreCase));
+            }
+
+            // 2026-07-23 — use `is not null` (not `!= null`): `Variable`
+            // overloads `operator ==`/`!=` to compare Names, and the
+            // compiler picks that overload over the reference check.
+            // A null Variable therefore falls into the `!= null` branch,
+            // NREs on `actualVar.Name`. See memory
+            // `project-constant-array-fix` ("the trap that ate hours").
+            if (actualVar is not null)
+            {
+                renameMap[formal.Name] = actualVar.Name;
+                actualSig.Add(actualVar.Name.ToLowerInvariant());
+                if (formal.Mode == ParameterMode.Out || formal.Mode == ParameterMode.InOut)
+                    outMap[formal] = actualVar;
+            }
+            else
+            {
+                // Literal / expression / multi-token actual — textual splice.
+                // Cache-key entry uses the raw arg to avoid false hits between
+                // callsites passing different literals.
+                renameMap[formal.Name] = string.Join(' ', argTokens);
+                actualSig.Add("$lit:" + argRaw.ToLowerInvariant());
+            }
+        }
+
+        // Clone locals into bound scope (share ref — locals are declared
+        // per-procedure not per-call, and Phase 3 accepts the recursion
+        // limitation of shared locals for now; testbench-shape procedures
+        // don't recurse).
+        foreach (var lv in def.LocalVariables)
+            boundScope.Add(lv);
+
+        // Cache probe.
+        string signature = string.Join('|', actualSig);
+        var key = (def.Name.ToLowerInvariant(), signature);
+        def.BoundBodyCache ??= new Dictionary<(string, string), List<object>>();
+        if (def.BoundBodyCache.TryGetValue(key, out var cached))
+            return cached;
+
+        // Textual formal→actual substitution over BodyRaw (skip inside
+        // string literals — quote-parity toggle, same pattern as EmitReport).
+        string substituted = SubstituteFormalsInBody(def.BodyRaw, renameMap);
+
+        // Re-tokenize + reparse via the shared static entry so the
+        // wait/report/assert/nested-call dispatch stays in sync between
+        // registration-time synth (SynthesizeProcedureBody) and this
+        // call-time resolve.
+        var tokenizer = new Parser.Repositories.Tokenizer(string.Empty);
+        foreach (var line in substituted.Split('\n'))
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            tokenizer.TokenizeLine(line);
+        }
+        tokenizer.Evaluate();
+        var tokens = tokenizer.GetDictionaryType();
+        var streamer = new Parser.Repositories.TokenStream(tokens);
+
+        var tasks = Interpreter.Services.FunctionExecutor
+            .ParseFunctionBodyStatic(streamer, boundScope);
+
+        def.BoundBodyCache[key] = tasks;
+        return tasks;
+    }
+
+    /// <summary>
+    /// Tier 4.3 pass 8 (2026-07-28): runtime-scope-aware bound-body resolve
+    /// for procedures called from inside a function body. Unlike
+    /// <see cref="ResolveBoundBody"/>, this overload does NOT touch the
+    /// parse-time <c>_variables</c> — actuals are looked up in the
+    /// caller-provided <paramref name="runtimeScope"/> (typically the
+    /// function's <c>localScope</c> from <c>FunctionExecutor.CreateLocalScope</c>)
+    /// so the returned Operations write back into the fresh per-call
+    /// Variable instances. Bypasses <c>BoundBodyCache</c> — since function
+    /// locals get new identities on every invocation, a cache hit is
+    /// impossible anyway; the re-parse cost is amortized against one
+    /// procedure call per function invocation.
+    /// </summary>
+    /// <remarks>
+    /// The rename map key is the formal name; the value is the raw actual
+    /// argument text (multi-token OK), spliced into the body via the same
+    /// <see cref="SubstituteFormalsInBody"/> helper the process-side path
+    /// uses. Procedure locals declared on the <see cref="FunctionDefinition"/>
+    /// are cloned into the parse scope so the procedure body has its own
+    /// per-call state (no cross-call leakage).
+    /// </remarks>
+    public List<object> ResolveBoundBodyAgainstScope(HashSet<Variable> runtimeScope)
+    {
+        var def = Interpreter.Services.FunctionRegistry.Instance.Get(ProcedureName);
+        if (def == null || string.IsNullOrEmpty(def.BodyRaw))
+            return new List<object>();
+
+        var renameMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < def.Parameters.Count && i < Arguments.Count; i++)
+        {
+            var formal = def.Parameters[i];
+            var argRaw = Arguments[i].Trim();
+            if (!string.IsNullOrEmpty(argRaw))
+                renameMap[formal.Name] = argRaw;
+        }
+
+        var parseScope = new HashSet<Variable>(runtimeScope);
+        foreach (var lv in def.LocalVariables)
+        {
+            if (!parseScope.Any(v => v.Name.Equals(lv.Name, StringComparison.OrdinalIgnoreCase)))
+            {
+                parseScope.Add(new Variable(lv.Name, lv.Value?.ToString() ?? string.Empty, lv.Type)
+                {
+                    Size = lv.Size,
+                    CustomTypeName = lv.CustomTypeName,
+                    PortType = Parser.Models.Constants.PortType.OUT
+                });
+            }
+        }
+
+        string substituted = SubstituteFormalsInBody(def.BodyRaw, renameMap);
+
+        var tokenizer = new Parser.Repositories.Tokenizer(string.Empty);
+        foreach (var line in substituted.Split('\n'))
+        {
+            if (!string.IsNullOrWhiteSpace(line))
+                tokenizer.TokenizeLine(line);
+        }
+        tokenizer.Evaluate();
+        var tokens = tokenizer.GetDictionaryType();
+        var streamer = new Parser.Repositories.TokenStream(tokens);
+
+        return Interpreter.Services.FunctionExecutor
+            .ParseFunctionBodyStatic(streamer, parseScope);
+    }
+
+    /// <summary>
+    /// Phase 3: whitespace-tokenized substitution over the procedure's
+    /// <c>BodyRaw</c>. Skips tokens inside string literals (quote-parity
+    /// toggle mirrors <see cref="EmitReport"/>).
+    /// </summary>
+    private static string SubstituteFormalsInBody(string bodyRaw, Dictionary<string, string> renameMap)
+    {
+        if (renameMap.Count == 0) return bodyRaw;
+
+        var sb = new StringBuilder(bodyRaw.Length + 32);
+        var lines = bodyRaw.Split('\n');
+        for (int li = 0; li < lines.Length; li++)
+        {
+            var line = lines[li];
+            var tokens = line.Split(' ');
+            bool insideString = false;
+            for (int i = 0; i < tokens.Length; i++)
+            {
+                var t = tokens[i];
+                int qc = 0;
+                foreach (var c in t) if (c == '"') qc++;
+                bool wasInside = insideString;
+                if (qc % 2 == 1) insideString = !insideString;
+
+                if (!wasInside && renameMap.TryGetValue(t, out var repl))
+                    sb.Append(repl);
+                else
+                    sb.Append(t);
+
+                if (i < tokens.Length - 1) sb.Append(' ');
+            }
+            if (li < lines.Length - 1) sb.Append('\n');
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
     /// F-G-14: renders one <c>report … ;</c> starting at token index <paramref name="start"/>
     /// and returns the index of the terminating <c>;</c> (the outer loop's
     /// post-increment moves past it).

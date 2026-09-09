@@ -5,229 +5,286 @@ namespace Interpreter.Services;
 
 /// <summary>
 /// Handles VHDL signal attributes like 'event, 'last_value, 'stable, 'active, etc.
-/// Signal attributes are used primarily in process sensitivity and edge detection.
+///
+/// Tier 4.1 (2026-07-28): `'last_value` and `'stable(T)` now use commit-time
+/// granularity — <c>_previousValues[sig]</c> captures the value the signal held
+/// immediately BEFORE its most recent transition (populated by
+/// <see cref="OnDeltaCommit"/> during the scheduler commit), and
+/// <c>_lastChangeMoments[sig]</c> stamps when. `'event`/`_activeFlags` retains
+/// the pre-Tier-4.1 tick-scoped semantics driven by <c>Variable.OnValueChange</c>
+/// — a strict per-delta rewrite regressed 100+ bench cases whose clocked processes
+/// depend on the tick-persistent event flag; deferring that stricter semantic to
+/// a follow-up arc gated on a targeted delta-scope bench case.
 /// </summary>
 public class SignalAttributeHandler
 {
-    // F-G-08 (2026-07-15): keyed by Variable reference (identity hash). The
-    // previous string-keyed maps did case-folding hash on every read/write —
-    // triggered by every Variable.Value change through the OnValueChange
-    // event — and were a leading contributor to O(N)-per-tick cost on the
-    // 196-signal capstone design. Kept the name-lookup overloads for
-    // EvaluateAttribute (called at parse-driven expression eval) which
-    // arrives with a string signal name from source; that path pays the old
-    // cost but fires only from user-code paths, not the engine's hot loop.
-    /// <summary>Stores the previous values of signals for 'event and 'last_value detection.</summary>
+    // F-G-08 (2026-07-15): keyed by Variable reference (identity hash). String
+    // keys did case-folding hash on every read/write and were a leading
+    // contributor to O(N)-per-tick cost on the 196-signal capstone design.
+    // Kept the name-lookup overloads (via _byName) for the EvaluateAttribute
+    // path called by expression eval from source strings.
+    /// <summary>Value the signal held immediately BEFORE its most recent transition (per-write granularity).</summary>
     private readonly Dictionary<Variable, object> _previousValues = new();
     /// <summary>Name → Variable index kept in sync so EvaluateAttribute-by-name still resolves.</summary>
     private readonly Dictionary<string, Variable> _byName = new(StringComparer.OrdinalIgnoreCase);
-    /// <summary>Stores the active flag for signals (whether they had an event this delta cycle).</summary>
+    /// <summary>Signals that had a value change since the last tick-boundary reset (tick-scoped).</summary>
     private readonly Dictionary<Variable, bool> _activeFlags = new();
-    /// <summary>Stores the stable flag for signals (whether they have been stable).</summary>
-    private readonly Dictionary<Variable, bool> _stableFlags = new();
-
+    /// <summary>Timestamp (tick*1000+delta) of each signal's most recent transition, for `'stable(T)`.</summary>
+    private readonly Dictionary<Variable, int> _lastChangeMoments = new();
     /// <summary>
-    /// Singleton instance for global signal tracking.
+    /// Tier 4.1 close-out: number of value transitions the signal has undergone in the
+    /// current delta only. Populated by <see cref="OnDeltaCommit"/> and cleared at the
+    /// top of the next delta by <see cref="BeginDelta"/>. Only consumed by the opt-in
+    /// <see cref="HadEventThisDelta(Variable)"/> predicate — the default `'event` /
+    /// <c>GetEvent</c> stays tick-scoped because process wake-up fanout in
+    /// <c>DeltaCycleEngine.RunTimeStepAsync</c> and cross-delta re-reads of
+    /// <c>rising_edge</c> depend on the flag surviving the whole tick.
     /// </summary>
+    private readonly Dictionary<Variable, int> _deltaTransitionCount = new();
+    /// <summary>Current commit timestamp, updated by <see cref="OnDeltaCommit"/>. Used by GetStable(T).</summary>
+    private int _currentTimeMoment;
+    /// <summary>Shadow of each signal's last-known value — updated in OnValueChange so we can
+    /// recover the pre-transition value even for stimulus writes that bypass SignalScheduler.</summary>
+    private readonly Dictionary<Variable, object> _shadowValues = new();
+    /// <summary>Tick resolution (ns per tick) used by <see cref="GetStable(Variable, long)"/> to
+    /// scale a caller-supplied ns duration into the tick*1000+delta scale used internally.
+    /// Set by <c>DeltaCycleEngine.SetContext</c>; defaults to 1 so unit-tests that don't
+    /// touch a full engine still round-trip 1 ns per tick.</summary>
+    private int _tickResolutionNs = 1;
+    public int TickResolutionNs
+    {
+        get => _tickResolutionNs;
+        set => _tickResolutionNs = Math.Max(1, value);
+    }
+
     private static SignalAttributeHandler? _instance;
-
-    /// <summary>
-    /// Gets the singleton instance.
-    /// </summary>
     public static SignalAttributeHandler Instance => _instance ??= new SignalAttributeHandler();
 
     /// <summary>
-    /// Registers a signal for attribute tracking.
+    /// Registers a signal for attribute tracking. Bug #18 fix: (re)seed
+    /// per-signal state so a follow-up simulation in the same process doesn't
+    /// inherit `_previousValues["clk"] = "1"` from the prior run.
     /// </summary>
     public void RegisterSignal(Variable signal)
     {
-        // Always (re)seed the per-signal state. The handler is a singleton,
-        // so without this a follow-up simulation in the same process would
-        // inherit stale state from the prior run (eg. _previousValues["clk"]
-        // = "1") and the next stimulus event would be silently swallowed.
-        // Bug #18 fix.
-        _previousValues[signal] = signal.Value;
+        _previousValues[signal] = signal.Value!;
+        _shadowValues[signal] = signal.Value!;
         _activeFlags[signal] = false;
-        _stableFlags[signal] = true;
+        _lastChangeMoments[signal] = 0;
         if (!string.IsNullOrEmpty(signal.Name))
             _byName[signal.Name] = signal;
 
-        // Subscribe to value changes
+        // Subscribe to value changes — fires from Variable.Value setter every
+        // time the value is committed (whether via SignalScheduler or direct
+        // stimulus write). Sets _activeFlags eagerly + rotates the shadow
+        // into _previousValues so `'last_value` reflects the actual pre-
+        // transition value regardless of which write path drove it.
         signal.OnValueChange += OnSignalValueChange;
     }
 
     /// <summary>
-    /// Handles signal value change events.
+    /// Incremental hook fired from <c>Variable.Value</c>'s setter each time a
+    /// signal is committed by <see cref="SignalScheduler.ApplyCurrentUpdatesWithLinesAndOldValues"/>
+    /// OR a direct stimulus write in <c>SimulationRunner</c>. Rotates the shadow
+    /// (previous last-known) into <c>_previousValues</c> and updates the
+    /// tick-scoped <c>_activeFlags</c>. <see cref="OnDeltaCommit"/> additionally
+    /// stamps <c>_lastChangeMoments</c> for `'stable(T)` — that path only fires
+    /// for scheduler-driven writes but stimulus signals rarely carry a
+    /// meaningful `'stable(T)` semantic anyway.
     /// </summary>
     private void OnSignalValueChange(Variable signal)
     {
-        if (_previousValues.TryGetValue(signal, out var prevValue))
+        if (_shadowValues.TryGetValue(signal, out var oldVal) && !Equals(oldVal, signal.Value))
         {
-            // Signal had an event if value changed
-            bool changed = !Equals(prevValue, signal.Value);
-            _activeFlags[signal] = changed;
-            _stableFlags[signal] = !changed;
+            _previousValues[signal] = oldVal;
+        }
+        _shadowValues[signal] = signal.Value!;
+        _activeFlags[signal] = true;
+    }
+
+    /// <summary>
+    /// Tier 4.1: commits per-delta attribute state from the scheduler's
+    /// snapshot. Called once per delta from <c>DeltaCycleEngine.RunDeltaCycleAsync</c>
+    /// right after <c>ApplyCurrentUpdatesWithLinesAndOldValues</c>. Only signals
+    /// that actually changed value in this delta appear in
+    /// <paramref name="oldValues"/>, keyed by the value they held BEFORE the
+    /// commit. Updates <c>_previousValues</c> and <c>_lastChangeMoments</c> at
+    /// per-commit granularity so `'last_value` and `'stable(T)` return LRM-correct
+    /// results. Does NOT touch <c>_activeFlags</c> — that's the OnValueChange path.
+    /// </summary>
+    /// <param name="oldValues">signal → value-immediately-before-this-delta.</param>
+    /// <param name="timeMoment">tick*1000+delta; same units as SignalHistory.</param>
+    public void OnDeltaCommit(IReadOnlyDictionary<Variable, object?> oldValues, int timeMoment)
+    {
+        _currentTimeMoment = timeMoment;
+        foreach (var (sig, oldVal) in oldValues)
+        {
+            if (oldVal is not null) _previousValues[sig] = oldVal;
+            _lastChangeMoments[sig] = timeMoment;
+            // Bump the per-delta counter so `HadEventThisDelta` can catch
+            // 0→1→0-within-a-tick pathological cases that collapse under the
+            // tick-scoped `_activeFlags`.
+            _deltaTransitionCount.TryGetValue(sig, out int c);
+            _deltaTransitionCount[sig] = c + 1;
         }
     }
 
     /// <summary>
-    /// Updates the previous value of a signal (call at end of delta cycle).
+    /// Tier 4.1 close-out: clears the per-delta transition counters. Called from
+    /// <c>DeltaCycleEngine.RunDeltaCycleAsync</c> at the top of every delta so
+    /// <see cref="HadEventThisDelta"/> reads reflect only the current delta.
+    /// The tick-scoped <c>_activeFlags</c> are untouched — they're cleared by
+    /// <see cref="ClearActiveFlagsAtTickBoundary"/> at end-of-tick.
     /// </summary>
-    public void UpdatePreviousValue(Variable signal)
+    public void BeginDelta()
     {
-        _previousValues[signal] = signal.Value;
-        _activeFlags[signal] = false;
+        _deltaTransitionCount.Clear();
     }
 
     /// <summary>
-    /// Updates all tracked signals (call at end of simulation step).
+    /// Tier 4.1 close-out: stamp `_lastChangeMoments` for signals whose values
+    /// changed via a direct stimulus write (clocks, external ports). Those
+    /// writes route through <see cref="OnSignalValueChange"/> and flip
+    /// <c>_activeFlags</c> but bypass <see cref="OnDeltaCommit"/>, so without
+    /// this hook `'stable(T)` never sees the transition. Called from
+    /// <c>DeltaCycleEngine.RunTimeStepAsync</c> once per tick, after
+    /// <c>AdvanceTime</c>, with the set of stimulus-changed signals.
     /// </summary>
-    public void UpdateAllPreviousValues(HashSet<Variable> signals)
+    public void StampStimulusChanges(IEnumerable<Variable> signals, int timeMoment)
+    {
+        _currentTimeMoment = timeMoment;
+        foreach (var sig in signals)
+        {
+            _lastChangeMoments[sig] = timeMoment;
+        }
+    }
+
+    /// <summary>
+    /// Opt-in per-delta `'event` predicate for the pathological 0→1→0-within-a-tick
+    /// case. Returns true iff <paramref name="signal"/> transitioned at least once
+    /// in the delta just committed. Consumers must call this AFTER
+    /// <see cref="OnDeltaCommit"/> in the same delta or the count reads zero.
+    /// The default <see cref="GetEvent(Variable)"/> stays tick-scoped for the
+    /// reasons documented on <c>_deltaTransitionCount</c>.
+    /// </summary>
+    public bool HadEventThisDelta(Variable signal) =>
+        _deltaTransitionCount.TryGetValue(signal, out int c) && c > 0;
+
+    /// <summary>
+    /// Tick-boundary reset: clears the per-tick <c>_activeFlags</c> so the
+    /// next tick's clocked-process wake sees the flag settle at false before
+    /// the next event fires. Called from <c>DeltaCycleEngine.RunTimeStepAsync</c>
+    /// end-of-tick.
+    /// </summary>
+    public void ClearActiveFlagsAtTickBoundary(HashSet<Variable> signals)
     {
         foreach (var signal in signals)
         {
-            UpdatePreviousValue(signal);
+            _activeFlags[signal] = false;
         }
     }
 
-    /// <summary>
-    /// Gets whether a signal had an event (value change) during current delta cycle.
-    /// Implements: signal'event
-    /// </summary>
-    public bool GetEvent(Variable signal)
-    {
-        return _activeFlags.TryGetValue(signal, out var active) && active;
-    }
+    /// <summary>signal'event — true iff signal changed value in the current tick's active window.</summary>
+    public bool GetEvent(Variable signal) =>
+        _activeFlags.TryGetValue(signal, out var active) && active;
+
+    /// <summary>Name-based path used by <see cref="EvaluateAttribute"/>.</summary>
+    public bool GetEvent(string signalName) =>
+        _byName.TryGetValue(signalName, out var s) && GetEvent(s);
 
     /// <summary>
-    /// Gets whether a signal had an event (value change) during current delta cycle.
-    /// Name-based path: EvaluateAttribute uses this when a source-level
-    /// expression like `clk'event` is being resolved.
+    /// signal'last_value — the value the signal held immediately before its
+    /// most recent transition (per-commit granularity as of Tier 4.1).
+    /// Falls back to current value if the signal has never transitioned.
     /// </summary>
-    public bool GetEvent(string signalName)
-    {
-        return _byName.TryGetValue(signalName, out var signal)
-            && _activeFlags.TryGetValue(signal, out var active) && active;
-    }
+    public object GetLastValue(Variable signal) =>
+        _previousValues.TryGetValue(signal, out var v) ? v : signal.Value!;
+
+    public object GetLastValue(string signalName) =>
+        _byName.TryGetValue(signalName, out var s) && _previousValues.TryGetValue(s, out var v) ? v : "U";
+
+    /// <summary>signal'stable — no-arg form: true iff no `'event` right now.</summary>
+    public bool GetStable(Variable signal) => !GetEvent(signal);
 
     /// <summary>
-    /// Gets the previous value of a signal.
-    /// Implements: signal'last_value
+    /// Tier 4.1: signal'stable(T) — true iff the signal has NOT changed for
+    /// at least <paramref name="elapsedNs"/> ns. The comparison happens in the
+    /// tick*1000+delta scale used by <see cref="OnDeltaCommit"/>, so the ns
+    /// argument is scaled by <see cref="TickResolutionNs"/> here — Tier 4.1
+    /// close-out (non-1 ns bench resolutions were previously off by that
+    /// factor because callers pre-scaled with a `ns == tick` assumption).
     /// </summary>
-    public object GetLastValue(Variable signal)
+    public bool GetStable(Variable signal, long elapsedNs)
     {
-        return _previousValues.TryGetValue(signal, out var value) ? value : signal.Value;
+        int last = _lastChangeMoments.GetValueOrDefault(signal, 0);
+        long elapsedRawUnits = (elapsedNs * 1000L) / Math.Max(1, _tickResolutionNs);
+        return (_currentTimeMoment - last) >= elapsedRawUnits;
     }
 
-    /// <summary>
-    /// Gets the previous value of a signal.
-    /// </summary>
-    public object GetLastValue(string signalName)
-    {
-        return _byName.TryGetValue(signalName, out var signal)
-            && _previousValues.TryGetValue(signal, out var value) ? value : "U";
-    }
+    /// <summary>signal'active — treated as an alias for 'event today (no driver-transaction model yet).</summary>
+    public bool GetActive(Variable signal) => GetEvent(signal);
 
-    /// <summary>
-    /// Gets whether a signal has been stable (no change).
-    /// Implements: signal'stable
-    /// </summary>
-    public bool GetStable(Variable signal)
-    {
-        return _stableFlags.TryGetValue(signal, out var stable) && stable;
-    }
-
-    /// <summary>
-    /// Gets whether a signal is active (had a transaction).
-    /// Implements: signal'active
-    /// </summary>
-    public bool GetActive(Variable signal)
-    {
-        return _activeFlags.TryGetValue(signal, out var active) && active;
-    }
-
-    /// <summary>
-    /// Checks for rising edge: signal'event and signal = '1'
-    /// </summary>
+    /// <summary>rising_edge shorthand: 'event AND value == '1'.</summary>
     public bool IsRisingEdge(Variable signal)
     {
         if (!GetEvent(signal)) return false;
-        string currentValue = signal.Value?.ToString()?.Replace("'", "").Replace("\"", "") ?? "";
-        return currentValue == "1";
+        string v = signal.Value?.ToString()?.Replace("'", "").Replace("\"", "") ?? "";
+        return v == "1";
     }
 
-    /// <summary>
-    /// Checks for falling edge: signal'event and signal = '0'
-    /// </summary>
+    /// <summary>falling_edge shorthand: 'event AND value == '0'.</summary>
     public bool IsFallingEdge(Variable signal)
     {
         if (!GetEvent(signal)) return false;
-        string currentValue = signal.Value?.ToString()?.Replace("'", "").Replace("\"", "") ?? "";
-        return currentValue == "0";
+        string v = signal.Value?.ToString()?.Replace("'", "").Replace("\"", "") ?? "";
+        return v == "0";
     }
 
-    /// <summary>
-    /// Evaluates a signal attribute expression.
-    /// </summary>
-    /// <param name="signalName">The signal name.</param>
-    /// <param name="attributeName">The attribute name (event, last_value, stable, active).</param>
-    /// <param name="variables">The variable set to look up the signal.</param>
-    /// <returns>The attribute value.</returns>
+    /// <summary>Clears per-simulation state. Called from <c>DeltaCycleEngine.Reset</c>.</summary>
+    public void Reset()
+    {
+        _previousValues.Clear();
+        _shadowValues.Clear();
+        _activeFlags.Clear();
+        _lastChangeMoments.Clear();
+        _deltaTransitionCount.Clear();
+        _byName.Clear();
+        _currentTimeMoment = 0;
+        _tickResolutionNs = 1;
+    }
+
+    /// <summary>Name-based dispatch used by <see cref="ParseAttributeExpression"/>.</summary>
     public object EvaluateAttribute(string signalName, string attributeName, HashSet<Variable> variables)
     {
-        var signal = variables.FirstOrDefault(v => v.Name.Equals(signalName, StringComparison.OrdinalIgnoreCase));
-        if (signal == null)
-        {
-            throw new InvalidOperationException($"Signal '{signalName}' not found for attribute evaluation");
-        }
-
+        var signal = variables.FirstOrDefault(v => v.Name.Equals(signalName, StringComparison.OrdinalIgnoreCase))
+                     ?? throw new InvalidOperationException($"Signal '{signalName}' not found for attribute evaluation");
         return attributeName.ToLower() switch
         {
-            "event" => GetEvent(signal),
+            "event"      => GetEvent(signal),
             "last_value" => GetLastValue(signal),
-            "stable" => GetStable(signal),
-            "active" => GetActive(signal),
-            _ => throw new NotSupportedException($"Signal attribute '{attributeName}' is not supported")
+            "stable"     => GetStable(signal),
+            "active"     => GetActive(signal),
+            _            => throw new NotSupportedException($"Signal attribute '{attributeName}' is not supported")
         };
     }
 
     /// <summary>
-    /// Parses and evaluates a signal attribute expression like "clk'event".
+    /// Parses and evaluates a source-string signal attribute expression like
+    /// "clk'event". Kept for legacy paths that arrive with raw strings; the
+    /// engine's hot loop now goes through the identity-keyed API above.
     /// </summary>
-    /// <param name="expression">The expression containing signal attribute.</param>
-    /// <param name="variables">The variable set.</param>
-    /// <returns>Tuple of (isAttribute, signalName, attributeName, value).</returns>
     public (bool isAttribute, string signalName, string attributeName, object value) ParseAttributeExpression(
         string expression, HashSet<Variable> variables)
     {
-        // Check if expression contains attribute syntax
-        if (!expression.Contains("'"))
-        {
-            return (false, "", "", null!);
-        }
-
-        // Find the apostrophe position (attribute indicator)
+        if (!expression.Contains("'")) return (false, "", "", null!);
         int apostropheIndex = expression.IndexOf("'");
-
-        // Skip string literals (they start with ')
-        if (apostropheIndex == 0)
-        {
-            return (false, "", "", null!);
-        }
+        if (apostropheIndex == 0) return (false, "", "", null!);
 
         string signalName = expression[..apostropheIndex].Trim();
         string attributeName = expression[(apostropheIndex + 1)..].Trim();
-
-        // Check if this is actually a signal attribute (not a character literal)
         string[] validAttributes = ["event", "last_value", "stable", "active", "left", "right", "high", "low", "length", "range"];
-
-        // Get base attribute name (might have more stuff after it)
         string baseAttribute = attributeName.Split(' ', '(', ')', '=')[0].ToLower();
-
-        if (!validAttributes.Contains(baseAttribute))
-        {
-            return (false, "", "", null!);
-        }
+        if (!validAttributes.Contains(baseAttribute)) return (false, "", "", null!);
 
         try
         {
@@ -238,62 +295,5 @@ public class SignalAttributeHandler
         {
             return (false, "", "", null!);
         }
-    }
-
-    /// <summary>
-    /// Resets all tracking data.
-    /// </summary>
-    public void Reset()
-    {
-        _previousValues.Clear();
-        _activeFlags.Clear();
-        _stableFlags.Clear();
-        _byName.Clear();
-    }
-}
-
-/// <summary>
-/// Extension methods for Variable to easily access signal attributes.
-/// </summary>
-public static class VariableAttributeExtensions
-{
-    /// <summary>
-    /// Gets whether the signal had an event.
-    /// </summary>
-    public static bool Event(this Variable signal)
-    {
-        return SignalAttributeHandler.Instance.GetEvent(signal);
-    }
-
-    /// <summary>
-    /// Gets the last value of the signal.
-    /// </summary>
-    public static object LastValue(this Variable signal)
-    {
-        return SignalAttributeHandler.Instance.GetLastValue(signal);
-    }
-
-    /// <summary>
-    /// Gets whether the signal is stable.
-    /// </summary>
-    public static bool Stable(this Variable signal)
-    {
-        return SignalAttributeHandler.Instance.GetStable(signal);
-    }
-
-    /// <summary>
-    /// Checks for rising edge on the signal.
-    /// </summary>
-    public static bool RisingEdge(this Variable signal)
-    {
-        return SignalAttributeHandler.Instance.IsRisingEdge(signal);
-    }
-
-    /// <summary>
-    /// Checks for falling edge on the signal.
-    /// </summary>
-    public static bool FallingEdge(this Variable signal)
-    {
-        return SignalAttributeHandler.Instance.IsFallingEdge(signal);
     }
 }

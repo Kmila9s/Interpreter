@@ -2439,10 +2439,58 @@ public class VariableSyntetizer : ISControl
             _streamer.MoveNext();
         }
 
-        // Skip local declarations (variables, constants) until top-level `begin`.
+        // Parse local declarations (variables, constants) until top-level
+        // `begin`. Tier 4.3 (2026-07-28): capture `variable <n> : <type>[(hi
+        // downto lo)] [:= <init>];` into a list so synth-time body inlining
+        // can recognise SSA writes to locals via the scope-alias stack.
+        // Constants and other declaration kinds are still skipped.
+        var localVariables = new List<Variable>();
         while (_streamer.Current != null && _streamer.Current.Value?.ToLower() != "begin")
         {
             ParseTrace.Step(ref _fnIter, _streamer, _currentCt);
+            if (_streamer.Current.Value?.ToLower() == "variable")
+            {
+                _streamer.MoveNext(); // 'variable'
+                string localName = _streamer.Current?.Value ?? string.Empty;
+                if (!string.IsNullOrEmpty(localName)) _streamer.MoveNext();
+                if (_streamer.Current?.Value == ":") _streamer.MoveNext();
+                string localTypeTok = _streamer.Current?.Value ?? "std_logic";
+                var localType = Variable.GetDatatype(localTypeTok);
+                if (_streamer.Current != null) _streamer.MoveNext();
+                int localSize = 0;
+                if (_streamer.Current?.Value == "(")
+                {
+                    _streamer.MoveNext(); // '('
+                    if (int.TryParse(_streamer.Current?.Value, out int hi))
+                    {
+                        _streamer.MoveNext(); // hi
+                        _streamer.MoveNext(); // downto/to
+                        if (int.TryParse(_streamer.Current?.Value, out int lo))
+                        {
+                            localSize = Math.Abs(hi - lo) + 1;
+                            _streamer.MoveNext(); // lo
+                        }
+                    }
+                    while (_streamer.Current != null && _streamer.Current.Value != ")")
+                    {
+                        _streamer.MoveNext();
+                    }
+                    if (_streamer.Current?.Value == ")") _streamer.MoveNext();
+                }
+                // Skip optional `:= <init>` and any trailing tokens up to ';'.
+                while (_streamer.Current != null && _streamer.Current.Value != ";"
+                    && _streamer.Current.Value?.ToLower() != "begin")
+                {
+                    _streamer.MoveNext();
+                }
+                if (_streamer.Current?.Value == ";") _streamer.MoveNext();
+
+                if (!string.IsNullOrEmpty(localName))
+                {
+                    localVariables.Add(new Variable(localName, string.Empty, localType) { Size = localSize });
+                }
+                continue;
+            }
             _streamer.MoveNext();
         }
         if (_streamer.Current?.Value?.ToLower() == "begin")
@@ -2546,6 +2594,7 @@ public class VariableSyntetizer : ISControl
                 ReturnTypeSize = returnTypeSize,
                 CustomReturnTypeName = customReturnTypeName,
                 BodyRaw = bodyRaw,
+                LocalVariables = localVariables,
                 IsPure = true,
             };
             FunctionRegistry.Instance.Register(def);

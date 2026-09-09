@@ -91,10 +91,38 @@ public enum OperationType : int {
 /// Contains regular expressions used to identify different types of operations in the code.
 /// </summary>
 public class OperationsRegex {
+    // Pass 18 (2026-07-30): balanced-paren index/slice suffix for LHS
+    // targets. Nested calls like `mem(to_integer(unsigned(addr)))` need
+    // the `.NET` balancing group so the inner `)`s don't close the outer
+    // one prematurely. Reused by VhdlBlockBuilder.AssignConcurrentRe /
+    // AssignSeqRe / VariableAssignSeqRe and ReplayBuilder/ReplayState
+    // LHS extractors — every site formerly using `\([^()]*\)` was
+    // silently dropping RAM-shaped statements.
+    // Group name `lhsP` is unique to reduce collision with caller groups;
+    // callers must avoid using `lhsP` for their own captures.
+    public const string BalancedIndexSuffix =
+        @"(?:\s*\((?>[^()]+|\((?<lhsP>)|\)(?<-lhsP>))*(?(lhsP)(?!))\))?";
+
+    // Pass 21 (2026-07-30): match one balanced-paren-containing expression
+    // inside a slice or edge-detect arg. Accepts nested calls like
+    // `to_integer(x)` or `clk_bus(0)`. Group name `expP` is reserved for
+    // this fragment (parallel to `lhsP` for BalancedIndexSuffix); callers
+    // must avoid `expP` for their own captures. Non-empty (`+` outer)
+    // so callers don't have to add explicit ".+" guards.
+    public const string BalancedExpression =
+        @"(?:[^()]+|\((?>[^()]+|\((?<expP>)|\)(?<-expP>))*(?(expP)(?!))\))+";
+
     /// <summary>Regex to detect a VHDL signal assignment (<=) or variable assignment (:=).</summary>
     /// <remarks>v0.16.1: Added support for := variable assignments used in processes and procedures.
     /// 2026-06-03 (bench bug #5): Also accept an indexed/sliced target like `output(0) &lt;= …` —
     /// the previous regex's single `\s?` couldn't span `name ( 0 ) ` so per-bit assignments
     /// were classified as UNKNOWN and silently dropped during architecture synthesis.</remarks>
-    public static string ASSIGNATION = @"[A-Za-z_][_a-zA-Z0-9]*(\s*\(\s*[^()]*\s*\))?\s*(\<\=|:\=)\s?.+";
+    // Pass 17 (2026-07-29): allow nested parens in the LHS index — the
+    // previous `[^()]*` rejected `mem(to_integer(unsigned(addr))) <= din`
+    // as UNKNOWN, silently dropping RAM-write statements at parse time.
+    // Pass 18 (2026-07-30): swap greedy `\(.*\)` for the shared balanced-
+    // paren fragment so the LHS bound is exact (no cross-statement
+    // runaway on `);` inside comments or strings).
+    public static string ASSIGNATION =
+        @"[A-Za-z_][_a-zA-Z0-9]*" + BalancedIndexSuffix + @"\s*(\<\=|:\=)\s?.+";
 }

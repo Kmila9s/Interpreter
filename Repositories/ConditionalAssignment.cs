@@ -104,7 +104,7 @@ public class ConditionalAssignment : ISControl
     /// </summary>
     public Task ExecuteAsync(Services.SignalScheduler? scheduler)
     {
-        if (Target == null || Branches.Count == 0)
+        if (Target is null || Branches.Count == 0)
             return Task.CompletedTask;
 
         foreach (var branch in Branches)
@@ -137,7 +137,7 @@ public class ConditionalAssignment : ISControl
     /// <param name="valueExpression">The expression to evaluate and assign.</param>
     private void AssignValue(string valueExpression, Services.SignalScheduler? scheduler = null)
     {
-        if (Target == null)
+        if (Target is null)
             return;
 
         Operation valueOp = new(valueExpression, _variables);
@@ -324,7 +324,7 @@ public class ConditionalAssignment : ISControl
         string valuePart = operation[(assignIndex + 2)..].Trim();
 
         var assignment = new ConditionalAssignment(variables, targetPart);
-        if (assignment.Target == null)
+        if (assignment.Target is null)
         {
             // Try to create stub target
             assignment.Target = new Variable(targetPart, "0", Constants.DATATYPES.STD_LOGIC_VECTOR);

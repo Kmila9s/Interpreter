@@ -27,6 +27,16 @@ public class Process : ISControl, IControl
     /// </summary>
     public List<object> Tasks { get; private set; } = new();
     private HashSet<Variable> _variables = new();
+
+    /// <summary>
+    /// Pass 19 (2026-07-30) — process-local variable declarations (from
+    /// the <c>process</c>'s <c>begin</c>-preceding decl part). The runtime
+    /// consumes these via <c>allVariables = SignalsPorts ∪ _variables</c>;
+    /// the synth path also needs to see them so signal-typed array
+    /// locals (<c>variable mem : mem_t</c>) can be lowered into RAM
+    /// cells the same way architecture-level signals are.
+    /// </summary>
+    public HashSet<Variable> Variables => _variables;
     private readonly TokenStream _streamer;
     private readonly OperationDetector _detector = new();
 
@@ -49,6 +59,18 @@ public class Process : ISControl, IControl
     public bool HasWait { get; private set; } = false;
 
     /// <summary>
+    /// F-G-13d (Phase 2, 2026-07-22): tracks whether the process has
+    /// yielded (via any wait) since the last time it started iterating
+    /// from <c>Pc = 0</c>. Used by
+    /// <c>DeltaCycleEngine.ExecuteProcessSegmentAsync</c> to decide whether
+    /// an implicit loop-back is safe: <c>HasWait &amp;&amp; YieldedSinceLoopStart</c>
+    /// means the last body pass advanced time, so we can re-enter safely.
+    /// If the pass fell off end without yielding, we terminate to prevent
+    /// a spin-loop.
+    /// </summary>
+    public bool YieldedSinceLoopStart { get; set; } = false;
+
+    /// <summary>
     /// F-G-13 MVP: true when the process has hit a terminal wait (bare
     /// <c>wait;</c> or unsupported <c>wait on</c>) — the engine should
     /// NOT schedule any further resumes.
@@ -64,7 +86,7 @@ public class Process : ISControl, IControl
     /// Empty stack means "not currently paused inside a loop" — resume
     /// falls through to the normal top-level <see cref="Pc"/> walk.
     /// </summary>
-    public Stack<Interpreter.Models.LoopFrame> Frames { get; } = new();
+    public Stack<Interpreter.Models.IProcessFrame> Frames { get; } = new();
 
     /// <summary>
     /// Initializes a new instance of the <see cref="Process"/> class.
@@ -159,7 +181,102 @@ public class Process : ISControl, IControl
 
         progress.ReportPhase(0.7f, "Synthesizing process behavior", ProcessingPhase.ParsingProcess);
         SyntetizeBehaviour(cancellationToken);
+        // F-G-13d (Phase 2, 2026-07-22): if any nested body (if branch,
+        // case arm, loop) contains a wait, promote the process to
+        // wait-driven so the engine's process-wake scheduler picks it up
+        // instead of routing it through the sensitivity-driven path.
+        // Pre-Phase-2 HasWait was only set for TOP-level `wait` tokens,
+        // so a process with waits only inside an if body ran through
+        // its full body once at t=0 with the waits behaving as zero-delay
+        // yields — no time actually advanced.
+        if (!HasWait && ContainsNestedWait(Tasks)) HasWait = true;
         progress.ReportPhase(1f, $"Process complete ({Tasks.Count} tasks)", ProcessingPhase.ParsingProcess);
+    }
+
+    /// <summary>
+    /// F-G-13d: recursively walk a task list looking for any
+    /// <see cref="Interpreter.Repositories.WaitForStatement"/> anchored
+    /// inside an if / case / loop body. Used to promote a process to
+    /// wait-driven when top-level SyntetizeBehaviour didn't see a bare
+    /// `wait` keyword. Cheap because process task lists rarely exceed
+    /// a few dozen items and nesting depth is small.
+    /// </summary>
+    private static bool ContainsNestedWait(List<object> tasks, HashSet<string>? visitedProcs = null)
+    {
+        foreach (var t in tasks)
+        {
+            if (t is Interpreter.Repositories.WaitForStatement) return true;
+            if (t is Interpreter.Repositories.IfStructure ifs)
+            {
+                foreach (var b in ifs.Branches)
+                    if (ContainsNestedWait(b.Tasks, visitedProcs)) return true;
+            }
+            else if (t is Interpreter.Repositories.CaseStructure cs)
+            {
+                foreach (var b in cs.Branches)
+                    if (ContainsNestedWait(b.Tasks, visitedProcs)) return true;
+            }
+            else if (t is Interpreter.Repositories.ForLoopStructure fs)
+            {
+                if (ContainsNestedWait(fs.Tasks, visitedProcs)) return true;
+            }
+            else if (t is Interpreter.Repositories.WhileLoopStructure ws)
+            {
+                if (ContainsNestedWait(ws.Tasks, visitedProcs)) return true;
+            }
+            else if (t is Interpreter.Repositories.SimpleLoopStructure ss)
+            {
+                if (ContainsNestedWait(ss.Tasks, visitedProcs)) return true;
+            }
+            // Phase 3 (Session 26, 2026-07-22): detect waits reached only
+            // through procedure calls. Without this, a process that
+            // exclusively waits by delegating to a procedure would have
+            // HasWait = false, the delta engine would skip its implicit
+            // outer-loop wrapper, and the simulation would silently drop
+            // the wait behaviour.
+            //
+            // Detection is textual on the callee's BodyRaw (fast) with a
+            // visited-set cycle guard — VHDL permits mutually recursive
+            // procedures, and without the guard `A calls B calls A` would
+            // stack-overflow during Process.Syntetize.
+            else if (t is Interpreter.Repositories.ProcedureCallStatement pcall)
+            {
+                visitedProcs ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (!visitedProcs.Add(pcall.ProcedureName)) continue; // cycle → skip
+                var def = FunctionRegistry.Instance.Get(pcall.ProcedureName);
+                if (def != null && !string.IsNullOrEmpty(def.BodyRaw)
+                    && BodyRawContainsWait(def.BodyRaw))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Phase 3 (2026-07-22): cheap textual scan for a bare <c>wait</c>
+    /// token in a procedure's raw body. Tracks string-literal parity via
+    /// double-quote counting so a <c>report "wait"</c> doesn't false-fire.
+    /// Correct for the vast majority of well-formed VHDL — an obfuscated
+    /// procedure that hides a wait behind identifier concatenation would
+    /// slip through, but that shape doesn't occur in practice.
+    /// </summary>
+    private static bool BodyRawContainsWait(string bodyRaw)
+    {
+        var tokens = bodyRaw.Split(new[] { ' ', '\n', '\r', '\t' },
+            StringSplitOptions.RemoveEmptyEntries);
+        bool insideString = false;
+        foreach (var t in tokens)
+        {
+            int qc = 0;
+            foreach (var c in t) if (c == '"') qc++;
+            bool wasInside = insideString;
+            if (qc % 2 == 1) insideString = !insideString;
+            if (!wasInside && t.Equals("wait", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -408,6 +525,9 @@ public class Process : ISControl, IControl
             {
                 _streamer.MoveNext(); // consume keyword
             }
+            // VHDL-2008 matching-case closes with `end case?;` — accept the
+            // optional trailing `?` between keyword and semicolon.
+            if (_streamer.Current?.Value == "?") _streamer.MoveNext();
             if (_streamer.Current?.Value == ";")
             {
                 _streamer.MoveNext(); // consume ';'

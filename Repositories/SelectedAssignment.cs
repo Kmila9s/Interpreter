@@ -123,7 +123,7 @@ public class SelectedAssignment : ISControl
     /// </summary>
     public Task ExecuteAsync(Services.SignalScheduler? scheduler)
     {
-        if (Target == null || string.IsNullOrEmpty(SelectorExpression) || Choices.Count == 0)
+        if (Target is null || string.IsNullOrEmpty(SelectorExpression) || Choices.Count == 0)
             return Task.CompletedTask;
 
         // Evaluate selector
@@ -237,7 +237,7 @@ public class SelectedAssignment : ISControl
     /// </summary>
     private void AssignValue(string valueExpression, Services.SignalScheduler? scheduler = null)
     {
-        if (Target == null)
+        if (Target is null)
             return;
 
         // Strip `after N <unit>` from the value expression and capture the

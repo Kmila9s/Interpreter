@@ -27,6 +27,49 @@ public enum CellKind {
     RESIZE,
     /// <summary>Posedge or negedge detector on a clock-class wire.</summary>
     EDGE_DETECT,
+    /// <summary>Signal 'last_value attribute: sample of the source signal
+    /// at its previous transition. Opaque cell — implementation uses the
+    /// engine's shadow-rotation store, not a discrete hardware primitive,
+    /// so the schematic shows a labeled box rather than gates. Emitted by
+    /// the DeferredAttribute walker case in ConcurrentAssignSynthesizer.
+    /// Width matches the source signal.</summary>
+    LAST_VALUE,
+    /// <summary>Signal 'stable[(T)] attribute: predicate that reports
+    /// whether the source has remained unchanged for T ns (or since
+    /// the last delta if T is omitted). Opaque cell — implementation
+    /// uses the engine's per-signal change-time store. Emitted by the
+    /// DeferredAttribute walker case; the T value (if present) rides
+    /// on the cell's Attrs["TimeNs"]. Always 1-bit output.</summary>
+    STABLE,
+    /// <summary>Constant-array lookup with a runtime-computed integer
+    /// index — a real N-to-1 MUX in hardware. Emitted by the
+    /// DynamicIndex walker case when the source is a constant array of
+    /// vectors (Source.Value non-empty, Source.ElementSize > 0) AND the
+    /// index doesn't resolve statically. Pin shape: `Sel` (selector,
+    /// integer-typed), `D0`..`D{N-1}` (constant data pins, one per array
+    /// entry), `Y` (output, ElementSize wide). Attrs["N"] carries the
+    /// entry count so the renderer can stamp `rom(N)` on the box.</summary>
+    ROM_LOOKUP,
+    /// <summary>Signal-typed array read with a runtime-computed index —
+    /// the mutable-memory counterpart to <see cref="ROM_LOOKUP"/>. Emitted
+    /// when the source is a signal (not constant) whose ElementSize > 0.
+    /// Doesn't carry frozen data pins (the RAM's contents change at
+    /// runtime); the source signal net feeds the `Src` pin as a bus of
+    /// N*ElementSize bits and the cell semantically slices at `Sel *
+    /// ElementSize`. Attrs["N"] and Attrs["Element"] label the box; the
+    /// renderer stamps `ram(N)`. Pass 16 (2026-07-29).</summary>
+    RAM_READ,
+    /// <summary>Signal-typed array WRITE with a runtime-computed index —
+    /// the write-side counterpart of <see cref="RAM_READ"/>. Emitted for
+    /// dynamic-index assignments like <c>mem(to_integer(unsigned(addr))) &lt;= din</c>
+    /// inside a process. Pin shape: `MemIn` (current memory state),
+    /// `Sel` (index selector), `Din` (data to write) — output pin
+    /// `MemOut` becomes the new memory state driving the base signal.
+    /// Attrs["Element"], ["Source"], and ["N"] mirror RAM_READ. Pass 17
+    /// (2026-07-29). Before pass 17 these writes silently dropped as
+    /// Operation.ConditionResult placeholders — the RAM's write side
+    /// was invisible on the schematic.</summary>
+    RAM_WRITE,
     BLACKBOX_PROCESS,
     /// <summary>Opaque module for a component instantiation. Rendered as a
     /// rectangle with one pin per port-map binding; the label carries the
@@ -109,7 +152,22 @@ public sealed record Netlist(
 );
 
 /// <summary>
+/// Severity of a synthesis-time <see cref="Diagnostic"/>. Info surfaces
+/// covered-path fall-backs where the runtime is still correct and only the
+/// schematic degrades (e.g. UserFunctionBlackBox for shapes we haven't
+/// inlined yet); Warning surfaces the traditional black-box fall-back;
+/// Error is reserved for structurally broken inputs.
+/// </summary>
+public enum DiagnosticSeverity { Info, Warning, Error }
+
+/// <summary>
 /// Synthesis-time message surfaced to the UI (e.g. "process body fell back
 /// to BLACKBOX_PROCESS"). Doesn't fail the build — just informs.
+/// <see cref="Severity"/> defaults to <c>Warning</c> for source compatibility
+/// with call sites that predate the severity field.
 /// </summary>
-public sealed record Diagnostic(string Kind, string Message, string? SourceLine = null);
+public sealed record Diagnostic(
+    string Kind,
+    string Message,
+    string? SourceLine = null,
+    DiagnosticSeverity Severity = DiagnosticSeverity.Warning);

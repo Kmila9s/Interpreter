@@ -82,6 +82,20 @@ public class FunctionDefinition
     public HashSet<Variable>? CachedScope { get; set; } = null;
 
     /// <summary>
+    /// Phase 3 (Session 26, 2026-07-22): per-call-site cached bound
+    /// bodies for procedures with waits. Key is (procedure name,
+    /// joined-actual-names-lowercase). Value is the re-parsed
+    /// <c>List&lt;object&gt;</c> with formal identifiers substituted for
+    /// actuals, produced once per unique callsite by
+    /// <see cref="Interpreter.Repositories.ProcedureCallStatement.ResolveBoundBody"/>.
+    /// Testbenches typically call the same procedure with the same
+    /// actuals many times, so the cache absorbs the per-call re-parse
+    /// cost after the first call. Null until the first bound-body
+    /// resolution.
+    /// </summary>
+    public Dictionary<(string, string), List<object>>? BoundBodyCache { get; set; }
+
+    /// <summary>
     /// Gets or sets the package this function belongs to.
     /// </summary>
     public string? PackageName { get; set; }

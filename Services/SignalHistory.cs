@@ -245,7 +245,7 @@ public class SignalHistory
             var signal = _history.Keys.FirstOrDefault(v =>
                 v.Name.Equals(signalName, StringComparison.OrdinalIgnoreCase));
 
-            if (signal != null)
+            if (signal is not null)
             {
                 return new List<Tuple<int, object>>(_history[signal]);
             }

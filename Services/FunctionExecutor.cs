@@ -140,8 +140,8 @@ public class FunctionExecutor
             object? value = arguments[i];
             if (value is Variable varValue) value = varValue.Value;
             var existing = localScope.FirstOrDefault(v =>
-                v.Name.Equals(param.Name, StringComparison.OrdinalIgnoreCase));
-            if (existing != null && value != null)
+                v is not null && v.Name.Equals(param.Name, StringComparison.OrdinalIgnoreCase));
+            if (existing is not null && value != null)
             {
                 existing.Value = value;
             }
@@ -152,8 +152,8 @@ public class FunctionExecutor
         foreach (var localVar in function.LocalVariables)
         {
             var existing = localScope.FirstOrDefault(v =>
-                v.Name.Equals(localVar.Name, StringComparison.OrdinalIgnoreCase));
-            if (existing != null && localVar.Value != null)
+                v is not null && v.Name.Equals(localVar.Name, StringComparison.OrdinalIgnoreCase));
+            if (existing is not null && localVar.Value != null)
             {
                 existing.Value = localVar.Value;
             }
@@ -195,11 +195,18 @@ public class FunctionExecutor
         // Add local variables declared in the function
         foreach (var localVar in function.LocalVariables)
         {
-            // Clone the variable so we don't modify the template
+            // Clone the variable so we don't modify the template. Fn locals
+            // are writable inside the body — set PortType.OUT so Operation
+            // .Execute's "input ports are not eligible for assignations"
+            // check doesn't false-fire on `v := <expr>` (the default
+            // Variable.PortType is IN). Pass 8 (2026-07-29): without this,
+            // procedure calls inside function bodies that write to caller
+            // locals via bound-body Operations throw before the write.
             var clone = new Variable(localVar.Name, localVar.Value?.ToString() ?? "", localVar.Type)
             {
                 Size = localVar.Size,
-                CustomTypeName = localVar.CustomTypeName
+                CustomTypeName = localVar.CustomTypeName,
+                PortType = Parser.Models.Constants.PortType.OUT
             };
             localScope.Add(clone);
         }
@@ -259,7 +266,19 @@ public class FunctionExecutor
     /// <summary>
     /// Parses a function body into executable tasks.
     /// </summary>
-    private List<object> ParseFunctionBody(TokenStream streamer, HashSet<Variable> variables)
+    internal List<object> ParseFunctionBody(TokenStream streamer, HashSet<Variable> variables)
+        => ParseFunctionBodyStatic(streamer, variables);
+
+    /// <summary>
+    /// Phase 3 (2026-07-22): shared body-parser used by both
+    /// <see cref="SynthesizeProcedureBody"/> (registration-time synth against
+    /// formal scope) and <see cref="ProcedureCallStatement.ResolveBoundBody"/>
+    /// (call-time rebuild against caller-facing scope for the delta-engine
+    /// runner). Exposed as <c>public static</c> so both call sites plus the
+    /// xUnit parse-side pins hit one code path — keeps waits + reports +
+    /// asserts + nested procedure-call dispatch in sync.
+    /// </summary>
+    public static List<object> ParseFunctionBodyStatic(TokenStream streamer, HashSet<Variable> variables)
     {
         List<object> tasks = new();
         OperationDetector detector = new();
@@ -283,35 +302,35 @@ public class FunctionExecutor
                         IfStructure ifStructure = new(variables, streamer);
                         ifStructure.Syntetize();
                         tasks.Add(ifStructure);
-                        ConsumeEndKeyword(streamer, "if");
+                        ConsumeEndKeywordStatic(streamer, "if");
                         break;
 
                     case "case":
                         CaseStructure caseStructure = new(variables, streamer);
                         caseStructure.Syntetize();
                         tasks.Add(caseStructure);
-                        ConsumeEndKeyword(streamer, "case");
+                        ConsumeEndKeywordStatic(streamer, "case");
                         break;
 
                     case "for":
                         ForLoopStructure forLoop = new(variables, streamer);
                         forLoop.Syntetize();
                         tasks.Add(forLoop);
-                        ConsumeEndKeyword(streamer, "loop");
+                        ConsumeEndKeywordStatic(streamer, "loop");
                         break;
 
                     case "while":
                         WhileLoopStructure whileLoop = new(variables, streamer);
                         whileLoop.Syntetize();
                         tasks.Add(whileLoop);
-                        ConsumeEndKeyword(streamer, "loop");
+                        ConsumeEndKeywordStatic(streamer, "loop");
                         break;
 
                     case "loop":
                         SimpleLoopStructure simpleLoop = new(variables, streamer);
                         simpleLoop.Syntetize();
                         tasks.Add(simpleLoop);
-                        ConsumeEndKeyword(streamer, "loop");
+                        ConsumeEndKeywordStatic(streamer, "loop");
                         break;
 
                     case "return":
@@ -338,6 +357,27 @@ public class FunctionExecutor
                         tasks.Add(nullStmt);
                         break;
 
+                    // Phase 3 (2026-07-22): dispatch wait/report/assert so
+                    // procedure-body walks match Process.SyntetizeBehaviour
+                    // instead of silently dropping the token.
+                    case "wait":
+                        var waitStmt = new WaitForStatement(streamer, variables);
+                        waitStmt.Syntetize();
+                        tasks.Add(waitStmt);
+                        break;
+
+                    case "report":
+                        var reportStmt = new ReportStatement(variables, streamer);
+                        reportStmt.Syntetize();
+                        tasks.Add(reportStmt);
+                        break;
+
+                    case "assert":
+                        var assertStmt = new AssertStatement(variables, streamer);
+                        assertStmt.Syntetize();
+                        tasks.Add(assertStmt);
+                        break;
+
                     default:
                         streamer.MoveNext();
                         break;
@@ -345,6 +385,16 @@ public class FunctionExecutor
             }
             else
             {
+                // Phase 3 (2026-07-22): procedure-call dispatch before the
+                // assignment-parser fallback (mirrors Process.cs:400-407).
+                if (ProcedureCallStatement.IsProcedureCall(streamer, variables))
+                {
+                    var call = new ProcedureCallStatement(variables, streamer);
+                    call.Syntetize();
+                    if (call.IsValid) tasks.Add(call);
+                    continue;
+                }
+
                 // Parse assignment statement
                 var rawDataBuilder = new StringBuilder();
                 while (streamer.Current?.Value != ";" && streamer.Current?.Value.ToLower() != "end")
@@ -372,6 +422,20 @@ public class FunctionExecutor
         return tasks;
     }
 
+    private static void ConsumeEndKeywordStatic(TokenStream streamer, string keyword)
+    {
+        if (streamer.Current?.Value.ToLower() == "end")
+        {
+            streamer.MoveNext();
+            if (streamer.Current?.Value.ToLower() == keyword)
+                streamer.MoveNext();
+            // VHDL-2008 matching-case: `end case?;`
+            if (streamer.Current?.Value == "?") streamer.MoveNext();
+            if (streamer.Current?.Value == ";")
+                streamer.MoveNext();
+        }
+    }
+
     /// <summary>
     /// Consumes 'end keyword ;' tokens.
     /// </summary>
@@ -384,6 +448,8 @@ public class FunctionExecutor
             {
                 streamer.MoveNext();
             }
+            // VHDL-2008 matching-case: `end case?;`
+            if (streamer.Current?.Value == "?") streamer.MoveNext();
             if (streamer.Current?.Value == ";")
             {
                 streamer.MoveNext();
@@ -409,6 +475,39 @@ public class FunctionExecutor
                 if (task is Operation operation)
                 {
                     operation.Execute();
+                }
+                else if (task is Interpreter.Repositories.ProcedureCallStatement pcall)
+                {
+                    // Tier 4.3 pass 8 (2026-07-28): the legacy path fell
+                    // through to `pcall.ExecuteAsync()` (which only handles
+                    // report + signal-assign) OR to `pcall.ResolveBoundBody`
+                    // (which binds actuals against the parse-time
+                    // `_variables` snapshot, missing the fresh per-call
+                    // Variable instances that `CreateLocalScope` produced).
+                    // Either way, out-mode variable writes to caller-side
+                    // function locals were lost. Fix: resolve the bound body
+                    // against the runtime `localScope` via the new
+                    // ResolveBoundBodyAgainstScope helper, then execute each
+                    // bound task inline so Operation.Execute writes into the
+                    // runtime Variable identities. Bench 156-proc-in-fn is
+                    // the fence.
+                    try
+                    {
+                        var bound = pcall.ResolveBoundBodyAgainstScope(localScope);
+                        foreach (var boundTask in bound)
+                        {
+                            if (boundTask is Operation boundOp)
+                            {
+                                boundOp.Execute();
+                            }
+                            else if (boundTask is ISControl boundCtl)
+                            {
+                                boundCtl.ExecuteAsync().GetAwaiter().GetResult();
+                            }
+                        }
+                    }
+                    catch (ReturnException) { throw; }
+                    catch { /* partial-progress tolerance */ }
                 }
                 else if (task is ISControl sControl)
                 {
@@ -505,13 +604,17 @@ public class FunctionExecutor
             localScope.Add(variable);
         }
 
-        // Add local variables
+        // Add local variables. Pass 9 (2026-07-29): mark PortType.OUT so
+        // Operation.Execute's "input ports not eligible" check doesn't
+        // reject writes to the local (Variable.PortType defaults to IN);
+        // parallel to the fn-local fix in CreateLocalScope at :205.
         foreach (var localVar in procedure.LocalVariables)
         {
             var clone = new Variable(localVar.Name, localVar.Value?.ToString() ?? "", localVar.Type)
             {
                 Size = localVar.Size,
-                CustomTypeName = localVar.CustomTypeName
+                CustomTypeName = localVar.CustomTypeName,
+                PortType = Parser.Models.Constants.PortType.OUT
             };
             localScope.Add(clone);
         }
@@ -608,7 +711,7 @@ public class FunctionExecutor
                 var localVar = localScope.FirstOrDefault(v => v.Name.Equals(param.Name, StringComparison.OrdinalIgnoreCase));
 
                 // If the argument was a Variable, update it
-                if (arguments[i] is Variable argVar && localVar != null)
+                if (arguments[i] is Variable argVar && localVar is not null)
                 {
                     argVar.Value = localVar.Value;
                 }

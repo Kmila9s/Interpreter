@@ -319,11 +319,17 @@ public class IfStructure : ISControl
                         branch.Tasks.Add(returnStmt);
                         break;
 
-                    // F-G-08 pass 4 (2026-07-17): testbench-only statements.
-                    // Prevents nested `wait for … ns;` / `report …;` / `assert …;`
-                    // from mis-dispatching their trailing tokens as for/while headers.
+                    // F-G-13d (Phase 2, 2026-07-22): capture the wait as a
+                    // real task so the engine's process-aware if-branch
+                    // executor can yield here (mirrors F-G-13c in
+                    // ForLoopStructure/WhileLoopStructure/SimpleLoopStructure).
+                    // Prior to F-G-13d this was silently skipped via
+                    // ParseTrace.SkipWaitStatement — testbenches with
+                    // `if halt then wait; end if;` looped forever.
                     case "wait":
-                        Interpreter.Services.ParseTrace.SkipWaitStatement(_streamer);
+                        var _wait = new WaitForStatement(_streamer, _variables);
+                        _wait.Syntetize();
+                        branch.Tasks.Add(_wait);
                         break;
                     case "report":
                         // F-G-11b (2026-07-18): execute reports nested inside
@@ -347,8 +353,21 @@ public class IfStructure : ISControl
             }
             else
             {
-                // Simple assignations
-                SyntetizeAssingation(branch);
+                // Phase 3 (2026-07-22): dispatch procedure calls before
+                // falling to assignment parsing. Without this, a
+                // `press_key(state);` inside an if-branch was silently
+                // consumed by SyntetizeAssingation and dropped.
+                if (ProcedureCallStatement.IsProcedureCall(_streamer, _variables))
+                {
+                    var _call = new ProcedureCallStatement(_variables, _streamer);
+                    _call.Syntetize();
+                    if (_call.IsValid) branch.Tasks.Add(_call);
+                }
+                else
+                {
+                    // Simple assignations
+                    SyntetizeAssingation(branch);
+                }
             }
         }
     }
@@ -380,6 +399,8 @@ public class IfStructure : ISControl
             {
                 _streamer.MoveNext(); // consume keyword
             }
+            // VHDL-2008 matching-case: `end case?;`
+            if (_streamer.Current?.Value == "?") _streamer.MoveNext();
             if (_streamer.Current?.Value == ";")
             {
                 _streamer.MoveNext(); // consume ';'

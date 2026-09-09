@@ -56,6 +56,22 @@ internal static class ProcessSynthesizer
             return;
         }
 
+        // Pass 19 (2026-07-30): merge process-local variable declarations
+        // into the scope handed to the walker. Without this, a shape like
+        // `variable mem : mem_t; mem(i) := din;` couldn't lower to
+        // RAM_WRITE because TryHandleDynamicIndexWrite's base lookup
+        // searched only architecture-level signals. The merged scope is
+        // used everywhere downstream (walker + end-of-Synthesize closure).
+        // Local vars are also tracked separately so we can classify their
+        // Q nets at closure time.
+        var localVars = process.Variables ?? new HashSet<Variable>();
+        HashSet<Variable> mergedScope = scope;
+        if (localVars.Count > 0)
+        {
+            mergedScope = new HashSet<Variable>(scope);
+            foreach (var lv in localVars) mergedScope.Add(lv);
+        }
+
         // Seed the running map with the named output nets for every
         // signal the body assigns. For clocked, this acts as the Q
         // feedback when a branch doesn't drive the signal (the "hold"
@@ -65,7 +81,7 @@ internal static class ProcessSynthesizer
         var allLhs = CollectAssignedLhs(bodyTasks);
         foreach (var lhsName in allLhs)
         {
-            var lhsVar = scope.FirstOrDefault(v =>
+            var lhsVar = mergedScope.FirstOrDefault(v =>
                 v is not null && v.Name is not null
                 && v.Name.Equals(lhsName, StringComparison.OrdinalIgnoreCase));
             if (lhsVar is null) continue;
@@ -74,14 +90,14 @@ internal static class ProcessSynthesizer
 
         string sensList = process.SensitiveList != null
             ? string.Join(",", process.SensitiveList
-                .Where(v => v != null && !string.IsNullOrEmpty(v.Name))
+                .Where(v => v is not null && !string.IsNullOrEmpty(v.Name))
                 .Select(v => v.Name))
             : "";
         string sourceLineKey = isClocked
             ? $"process: {(clockedHigh ? "rising_edge" : "falling_edge")}({clockSig!.Name})"
             : $"process({sensList})";
 
-        WalkTasks(bodyTasks, scope, ctx, running, sourceLineKey);
+        WalkTasks(bodyTasks, mergedScope, ctx, running, sourceLineKey);
 
         // Drive each output. For clocked signals: D <- running, Q is
         // the named net; the DFF closes the feedback loop the walker
@@ -95,8 +111,8 @@ internal static class ProcessSynthesizer
 
         foreach (var (lhsName, valueNet) in running)
         {
-            var lhsVar = scope.FirstOrDefault(v => v.Name.Equals(lhsName, StringComparison.OrdinalIgnoreCase));
-            if (lhsVar == null) continue;
+            var lhsVar = mergedScope.FirstOrDefault(v => v.Name.Equals(lhsName, StringComparison.OrdinalIgnoreCase));
+            if (lhsVar is null) continue;
             var qNet = NetForLhs(lhsVar, ctx);
 
             // No-op assignment? Walker may have left running[lhs] ==
@@ -133,7 +149,7 @@ internal static class ProcessSynthesizer
     /// representing the value the LHS should be driven with given the
     /// control flow seen so far.
     /// </summary>
-    private static void WalkTasks(IList<object> tasks, HashSet<Variable> scope,
+    internal static void WalkTasks(IList<object> tasks, HashSet<Variable> scope,
         SynthesisContext ctx, Dictionary<string, Net> running, string sourceLine)
     {
         foreach (var task in tasks)
@@ -141,7 +157,10 @@ internal static class ProcessSynthesizer
             switch (task)
             {
                 case Operation op:
-                    HandleAssignment(op, scope, ctx, running, sourceLine);
+                    if (!TryHandleDynamicIndexWrite(op, scope, ctx, running, sourceLine))
+                    {
+                        HandleAssignment(op, scope, ctx, running, sourceLine);
+                    }
                     break;
                 case IfStructure ifs:
                     HandleIf(ifs, scope, ctx, running, sourceLine);
@@ -149,11 +168,224 @@ internal static class ProcessSynthesizer
                 case CaseStructure cs:
                     HandleCase(cs, scope, ctx, running, sourceLine);
                     break;
+                case ProcedureCallStatement pcall:
+                    // Tier 4.3 B2 (2026-07-28): resolve the procedure's bound
+                    // body (formals textually substituted with actuals via
+                    // ProcedureCallStatement.ResolveBoundBody — same cache the
+                    // runtime uses) and walk it inline. Bound-body assignments
+                    // to signal actuals thread directly into the caller's
+                    // `running` map because the formal→actual rename already
+                    // resolved to caller-scope Variable names. Runs against
+                    // <paramref name="scope"/> (caller scope + locals cloned
+                    // by ResolveBoundBody) so any callee-local names materialise
+                    // as their own nets. Recursion / procedure-in-procedure
+                    // works transparently: each nested call resolves + walks
+                    // through this same branch.
+                    try
+                    {
+                        var bound = pcall.ResolveBoundBody(null, out _, out var boundScope);
+                        if (bound != null && bound.Count > 0)
+                        {
+                            WalkTasks(bound, boundScope, ctx, running, sourceLine);
+                        }
+                    }
+                    catch { /* CanWalk already vetted; a resolve throw is
+                             * treated as a no-op so partial synth doesn't
+                             * abort the whole process. */ }
+                    break;
+                case ForLoopStructure fls:
+                    // Tier 4.3 pass 10 (2026-07-29): synth-time unroll for
+                    // bounded for-loops. On each iteration mutate the
+                    // loop variable's Value to the current index so any
+                    // DynamicIndex references inside the body pick up the
+                    // per-iteration integer (see ConcurrentAssignSynthesizer's
+                    // DynamicIndex case for the static-tap resolution).
+                    // Writes to `running` accumulate across iterations —
+                    // loop-carried dependencies are modelled correctly
+                    // because subsequent iterations reference the previous
+                    // iteration's driver net through the same map.
+                    if (fls.Tasks != null)
+                    {
+                        var loopVar = scope.FirstOrDefault(v =>
+                            v is not null && v.Name.Equals(fls.LoopVariableName, StringComparison.OrdinalIgnoreCase));
+                        Variable? iterVar = loopVar;
+                        HashSet<Variable> iterScope = scope;
+                        // `is null` is required — Variable overloads ==/!= on Name
+                        // which compares strings, not reference identity, so
+                        // `iterVar == null` gives the wrong answer for ref-null
+                        // (see project_constant_array_fix memory).
+                        if (iterVar is null)
+                        {
+                            iterVar = new Variable(fls.LoopVariableName, fls.RangeStart.ToString(),
+                                Constants.DATATYPES.INTEGER);
+                            iterScope = new HashSet<Variable>(scope) { iterVar };
+                        }
+
+                        if (fls.IsAscending)
+                        {
+                            for (int i = fls.RangeStart; i <= fls.RangeEnd; i++)
+                            {
+                                iterVar.Value = i.ToString();
+                                WalkTasks(fls.Tasks, iterScope, ctx, running, sourceLine);
+                            }
+                        }
+                        else
+                        {
+                            for (int i = fls.RangeStart; i >= fls.RangeEnd; i--)
+                            {
+                                iterVar.Value = i.ToString();
+                                WalkTasks(fls.Tasks, iterScope, ctx, running, sourceLine);
+                            }
+                        }
+                    }
+                    break;
                 // Anything else slips silently — CanWalk already
                 // gated entry, so reaching this branch means a kind
                 // we accept but don't drive.
             }
         }
+    }
+
+    /// <summary>
+    /// Tier 4.3 pass 17 (2026-07-29): detect a dynamic-index signal write
+    /// like <c>mem(to_integer(unsigned(addr))) &lt;= din</c> before it
+    /// falls into the regular <see cref="HandleAssignment"/> path. The
+    /// Operation constructor collapses this shape's LHS to a
+    /// <c>ConditionResult</c> placeholder (its regex only matches static
+    /// integer indices), which the assignment walker then silently drops.
+    /// Instead, emit a <see cref="CellKind.RAM_WRITE"/> cell so the RAM's
+    /// write side is visible in the schematic and update the running dict
+    /// to point at the post-write memory net.
+    /// </summary>
+    /// <returns>True if this Operation was a dynamic-index write and was
+    /// handled here; false to fall through to the default assignment
+    /// path.</returns>
+    /// <summary>
+    /// Extracts the base signal name from a dynamic-index write's raw
+    /// text (e.g. "mem ( to_integer(unsigned(addr)) ) &lt;= din" →
+    /// "mem"). Returns null when the shape doesn't match.
+    /// </summary>
+    private static string? TryExtractDynamicIndexBase(string? rawData)
+    {
+        if (string.IsNullOrEmpty(rawData)) return null;
+        int arrow = FindAssignmentArrow(rawData, out _);
+        if (arrow <= 0) return null;
+        string lhs = rawData.Substring(0, arrow).Trim();
+        int paren = lhs.IndexOf('(');
+        if (paren <= 0 || lhs[^1] != ')') return null;
+        string baseName = lhs.Substring(0, paren).Trim();
+        string indexExpr = lhs.Substring(paren + 1, lhs.Length - paren - 2).Trim();
+        if (string.IsNullOrEmpty(baseName) || string.IsNullOrEmpty(indexExpr)) return null;
+        if (int.TryParse(indexExpr, out _)) return null; // static: legacy path
+        return baseName;
+    }
+
+    /// <summary>
+    /// Pass 19 (2026-07-30) — finds the assignment arrow (<c>&lt;=</c>
+    /// for signals, <c>:=</c> for variables) in a raw Operation line
+    /// and reports which one matched. Returns the byte offset of the
+    /// arrow (0 or negative if none found) and sets <paramref name="isVariable"/>.
+    /// Chooses the leftmost arrow so a RHS with `foo &lt;= bar` embedded
+    /// in a variable assign like `mem(i) := (a &lt;= b)` still splits at
+    /// the `:=` first.
+    /// </summary>
+    private static int FindAssignmentArrow(string rawData, out bool isVariable)
+    {
+        int sigArrow = rawData.IndexOf("<=", StringComparison.Ordinal);
+        int varArrow = rawData.IndexOf(":=", StringComparison.Ordinal);
+        if (varArrow >= 0 && (sigArrow < 0 || varArrow < sigArrow))
+        {
+            isVariable = true;
+            return varArrow;
+        }
+        isVariable = false;
+        return sigArrow;
+    }
+
+    private static bool TryHandleDynamicIndexWrite(Operation op, HashSet<Variable> scope,
+        SynthesisContext ctx, Dictionary<string, Net> running, string sourceLine)
+    {
+        if (string.IsNullOrEmpty(op.RawData)) return false;
+        int arrowIdx = FindAssignmentArrow(op.RawData, out bool isVariable);
+        if (arrowIdx <= 0) return false;
+
+        string lhsRaw = op.RawData.Substring(0, arrowIdx).Trim();
+        string rhsRaw = op.RawData.Substring(arrowIdx + 2).Trim();
+        if (string.IsNullOrEmpty(lhsRaw) || string.IsNullOrEmpty(rhsRaw)) return false;
+
+        // LHS must be `<baseName> ( <indexExpr> )`. Static integer indices
+        // (`mem(3) <= …`) fall through — the Operation constructor already
+        // handles them via ResultBitIndex and HandleAssignment writes them
+        // straight to the named net.
+        int firstParen = lhsRaw.IndexOf('(');
+        if (firstParen <= 0) return false;
+        int lastParen = lhsRaw.LastIndexOf(')');
+        if (lastParen != lhsRaw.Length - 1) return false;
+        string baseName = lhsRaw.Substring(0, firstParen).Trim();
+        string indexExpr = lhsRaw.Substring(firstParen + 1, lastParen - firstParen - 1).Trim();
+        if (string.IsNullOrEmpty(baseName) || string.IsNullOrEmpty(indexExpr)) return false;
+        if (int.TryParse(indexExpr, out _)) return false; // static index: legacy path handles
+
+        var baseVar = scope.FirstOrDefault(v =>
+            v is not null && v.Name is not null
+            && v.Name.Equals(baseName, StringComparison.OrdinalIgnoreCase));
+        if (baseVar is null) return false;
+        int elemSize = baseVar.ElementSize;
+        if (elemSize <= 0) return false; // not an array-of-vectors
+
+        Net dataNet;
+        try
+        {
+            var dataOp = new Operation($"{baseName} <= {rhsRaw}", scope);
+            var dataOut = ctx.NewInternal(elemSize, sourceLine);
+            ConcurrentAssignSynthesizer.SynthesizeInto(dataOp, dataOut, ctx);
+            dataNet = dataOut;
+        }
+        catch { return false; }
+
+        Net selNet;
+        try
+        {
+            var selOp = new Operation($"{baseName}_idx_sel <= {indexExpr}", scope);
+            var selOut = ctx.NewInternal(1, sourceLine);
+            ConcurrentAssignSynthesizer.SynthesizeInto(selOp, selOut, ctx);
+            selNet = selOut;
+        }
+        catch { return false; }
+
+        var memInNet = running.TryGetValue(baseName, out var prev)
+            ? prev
+            : NetForLhs(baseVar, ctx);
+        var memOutNet = ctx.NewInternal(Math.Max(1, baseVar.Size), sourceLine);
+        int knownN = baseVar.Size > 0 && elemSize > 0 && baseVar.Size % elemSize == 0
+            ? baseVar.Size / elemSize
+            : 0;
+        var attrs = new Dictionary<string, string>
+        {
+            ["Element"] = elemSize.ToString(),
+            ["Source"]  = baseName,
+        };
+        if (knownN > 0) attrs["N"] = knownN.ToString();
+        // Pass 19 (2026-07-30): mark writes originating from `:=` (process-
+        // local variable assign) so the schematic renderer / audit can
+        // distinguish them from signal `<=` writes. Semantically both
+        // still route through a DFF at end-of-Synthesize for state
+        // retention across process activations, but reads within the
+        // same process pass see the immediate MemOut for variables.
+        if (isVariable) attrs["IsVariable"] = "true";
+        ctx.AddCell(
+            kind:    CellKind.RAM_WRITE,
+            inputs:  new[] {
+                new Pin("MemIn", memInNet.Id),
+                new Pin("Sel",   selNet.Id),
+                new Pin("Din",   dataNet.Id),
+            },
+            outputs: new[] { new Pin("MemOut", memOutNet.Id) },
+            sourceLine: sourceLine,
+            attrs:   attrs);
+
+        running[baseName] = memOutNet;
+        return true;
     }
 
     private static void HandleAssignment(Operation op, HashSet<Variable> scope,
@@ -276,18 +508,16 @@ internal static class ProcessSynthesizer
                 continue;
             }
 
-            // Build OR-of-EQ for the choices.
+            // Build OR-of-EQ for the choices. For VHDL-2008 `case?` (matching-
+            // case, cs.IsMatching), any choice literal containing `-` acts
+            // as a don't-care per-bit: we split the raw literal into (value,
+            // mask) and build `EQ(selector AND mask, value)` instead of a
+            // plain `EQ`. Choices with no `-` fall through to the plain path
+            // — same wire budget as pre-2026-07-28.
             Net? matchNet = null;
             foreach (var raw in br.Choices)
             {
-                var literalNet = ctx.Constant(raw, selWidth, sourceLine);
-                var eqOut = ctx.NewInternal(width: 1, sourceLine: sourceLine);
-                ctx.AddCell(
-                    kind: CellKind.EQ,
-                    inputs: new[] { new Pin("A", selNet.Id), new Pin("B", literalNet.Id) },
-                    outputs: new[] { new Pin("Y", eqOut.Id) },
-                    sourceLine: sourceLine,
-                    attrs: new Dictionary<string, string> { ["Choice"] = raw });
+                Net eqOut = BuildChoiceCompare(cs.IsMatching, raw, selNet, selWidth, ctx, sourceLine);
 
                 if (matchNet == null)
                 {
@@ -360,6 +590,59 @@ internal static class ProcessSynthesizer
     // ─── Helpers ─────────────────────────────────────────────────────
 
     /// <summary>
+    /// Build the per-choice comparator net for a case-arm. When
+    /// `isMatching` is true (VHDL-2008 `case?`) and the choice literal
+    /// contains `-` don't-care bits, we generate a mask+EQ pair; otherwise
+    /// we fall through to a plain EQ against the raw literal — same shape
+    /// as pre-Tier-4.2.
+    /// </summary>
+    internal static Net BuildChoiceCompare(bool isMatching, string raw, Net selNet,
+        int selWidth, SynthesisContext ctx, string sourceLine)
+    {
+        if (isMatching)
+        {
+            string clean = raw.Replace("\"", "").Replace("'", "").Trim();
+            if (clean.Contains('-'))
+            {
+                var value = new System.Text.StringBuilder(clean.Length);
+                var mask  = new System.Text.StringBuilder(clean.Length);
+                foreach (char c in clean)
+                {
+                    if (c == '-') { value.Append('0'); mask.Append('0'); }
+                    else          { value.Append(c);   mask.Append('1'); }
+                }
+                // Requote so Constant()'s cleaner strips them the same way as raw.
+                var valueNet = ctx.Constant("\"" + value + "\"", selWidth, sourceLine);
+                var maskNet  = ctx.Constant("\"" + mask  + "\"", selWidth, sourceLine);
+                var andOut = ctx.NewInternal(width: selWidth, sourceLine: sourceLine);
+                ctx.AddCell(
+                    kind: CellKind.AND,
+                    inputs: new[] { new Pin("A", selNet.Id), new Pin("B", maskNet.Id) },
+                    outputs: new[] { new Pin("Y", andOut.Id) },
+                    sourceLine: sourceLine);
+                var eqOut = ctx.NewInternal(width: 1, sourceLine: sourceLine);
+                ctx.AddCell(
+                    kind: CellKind.EQ,
+                    inputs: new[] { new Pin("A", andOut.Id), new Pin("B", valueNet.Id) },
+                    outputs: new[] { new Pin("Y", eqOut.Id) },
+                    sourceLine: sourceLine,
+                    attrs: new Dictionary<string, string> { ["Choice"] = raw, ["Mask"] = mask.ToString() });
+                return eqOut;
+            }
+        }
+        // Standard exact-match path.
+        var literalNet = ctx.Constant(raw, selWidth, sourceLine);
+        var plainEq = ctx.NewInternal(width: 1, sourceLine: sourceLine);
+        ctx.AddCell(
+            kind: CellKind.EQ,
+            inputs: new[] { new Pin("A", selNet.Id), new Pin("B", literalNet.Id) },
+            outputs: new[] { new Pin("Y", plainEq.Id) },
+            sourceLine: sourceLine,
+            attrs: new Dictionary<string, string> { ["Choice"] = raw });
+        return plainEq;
+    }
+
+    /// <summary>
     /// Synthesise an Operation that represents a boolean condition
     /// into a single 1-bit net. The Operation already carries the
     /// postfix item list — we just wire it into a fresh net via the
@@ -400,6 +683,41 @@ internal static class ProcessSynthesizer
                     foreach (var br in cs.Branches)
                         if (br == null || !CanWalk(br.Tasks)) return false;
                     break;
+                case ProcedureCallStatement pcall:
+                    // Tier 4.3 B2 (2026-07-28): a process containing a
+                    // procedure call is walkable iff the call resolves to a
+                    // registered body and that body itself walks. Runs the
+                    // shared body-parser (cached on FunctionDefinition
+                    // BoundBodyCache) — same output the runtime consumes.
+                    try
+                    {
+                        var bound = pcall.ResolveBoundBody(null, out _, out _);
+                        if (bound == null || bound.Count == 0) return false;
+                        if (!CanWalk(bound)) return false;
+                    }
+                    catch { return false; }
+                    break;
+                case NullStatement:
+                    // Tier 4.3 pass 9 (2026-07-29): `null;` is a no-op —
+                    // walkable, doesn't drive any nets. Closes 5
+                    // BlackboxProcess fallbacks whose case-arms use
+                    // `when X => null;` (encoder-16to4, flipflop-jk,
+                    // priority, hamming, ser-fsm).
+                    break;
+                case ForLoopStructure fls:
+                    // Tier 4.3 pass 10 (2026-07-29): bounded for-loops
+                    // walk via synth-time unroll — the range must be a
+                    // pair of statically-known integer bounds (already
+                    // enforced by parse-time int properties on the AST)
+                    // and the body must itself be walkable. Iteration is
+                    // handled in WalkTasks by mutating LoopVar.Value and
+                    // re-walking Tasks per index; the DynamicIndex walker
+                    // case picks up the current integer value and emits
+                    // per-iteration static-index taps so the schematic
+                    // shows a real cell chain instead of a black box.
+                    if (fls.Tasks == null) return false;
+                    if (!CanWalk(fls.Tasks)) return false;
+                    break;
                 default:
                     return false;
             }
@@ -428,6 +746,16 @@ internal static class ProcessSynthesizer
                     case Operation op when op.Result?.Name is { Length: > 0 } name
                                          && !name.StartsWith("Condition", StringComparison.OrdinalIgnoreCase):
                         set.Add(name);
+                        break;
+                    case Operation dynWrite when TryExtractDynamicIndexBase(dynWrite.RawData) is string dynBase:
+                        // Pass 17 (2026-07-29): dynamic-index writes land
+                        // with Op.Result.Name == "ConditionResult" because
+                        // the Operation constructor's LHS regex only
+                        // handles static integer indices. The base signal
+                        // still needs to appear in `running` so
+                        // TryHandleDynamicIndexWrite's MemOut threads
+                        // through the process-level MUX/DFF closure.
+                        set.Add(dynBase);
                         break;
                     case IfStructure ifs:
                         foreach (var br in ifs.Branches) Visit(br.Tasks);
@@ -508,7 +836,7 @@ internal static class ProcessSynthesizer
                 if (df.Arguments.Length > 0 && df.Arguments[0] is string sname)
                 {
                     var found = df.Variables.FirstOrDefault(x => x.Name.Equals(sname, StringComparison.OrdinalIgnoreCase));
-                    if (found != null)
+                    if (found is not null)
                         return (found, df.FunctionName.Equals("rising_edge", StringComparison.OrdinalIgnoreCase));
                 }
             }
@@ -575,8 +903,53 @@ internal static class ProcessSynthesizer
                 ["Reason"] = "Process body uses constructs not yet decomposed (loops / function calls / etc.).",
             });
 
-        ctx.AddDiagnostic("BlackboxProcess",
-            "Process body kept as opaque cell — unsupported constructs encountered.");
+        // Phase 4 (2026-07-22): include the type of the first unwalkable
+        // task so the diagnostic explains what triggered the fallback
+        // (procedure call, wait, for-loop, procedure-call, etc.) instead
+        // of the generic "unsupported constructs" message.
+        var firstUnwalkable = FirstUnwalkableTaskName(process.Tasks);
+        var reason = firstUnwalkable != null
+            ? $"Process body kept as opaque cell — first unwalkable task is {firstUnwalkable}."
+            : "Process body kept as opaque cell — unsupported constructs encountered.";
+        ctx.AddDiagnostic("BlackboxProcess", reason);
+    }
+
+    /// <summary>
+    /// Phase 4 (2026-07-22): recursively find the first task shape that
+    /// <see cref="CanWalk"/> would reject, and return its type name for
+    /// use in the diagnostic message. Returns <c>null</c> if the tree is
+    /// entirely walkable (shouldn't happen in the fallback path).
+    /// </summary>
+    private static string? FirstUnwalkableTaskName(IList<object>? tasks)
+    {
+        if (tasks == null) return "(null task list)";
+        foreach (var t in tasks)
+        {
+            if (t is null) return "(null task)";
+            if (t is Operation) continue;
+            if (t is IfStructure ifs)
+            {
+                if (ifs.Branches == null) return "IfStructure (no branches)";
+                foreach (var br in ifs.Branches)
+                {
+                    var sub = FirstUnwalkableTaskName(br?.Tasks);
+                    if (sub != null) return $"if-branch → {sub}";
+                }
+                continue;
+            }
+            if (t is CaseStructure cs)
+            {
+                if (cs.Branches == null) return "CaseStructure (no branches)";
+                foreach (var br in cs.Branches)
+                {
+                    var sub = FirstUnwalkableTaskName(br?.Tasks);
+                    if (sub != null) return $"case-arm → {sub}";
+                }
+                continue;
+            }
+            return t.GetType().Name;
+        }
+        return null;
     }
 
     private static void CollectDrivenSignals(IEnumerable<object> tasks, SynthesisContext ctx,

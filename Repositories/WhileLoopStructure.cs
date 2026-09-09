@@ -305,7 +305,18 @@ public class WhileLoopStructure : ISControl
             }
             else
             {
-                SyntetizeAssignment();
+                // Phase 3 (2026-07-22): dispatch procedure calls before
+                // falling to assignment parsing (mirror ForLoopStructure).
+                if (ProcedureCallStatement.IsProcedureCall(_streamer, _variables))
+                {
+                    var _call = new ProcedureCallStatement(_variables, _streamer);
+                    _call.Syntetize();
+                    if (_call.IsValid) Tasks.Add(_call);
+                }
+                else
+                {
+                    SyntetizeAssignment();
+                }
             }
         }
     }
@@ -333,6 +344,8 @@ public class WhileLoopStructure : ISControl
             {
                 _streamer.MoveNext();
             }
+            // VHDL-2008 matching-case: `end case?;`
+            if (_streamer.Current?.Value == "?") _streamer.MoveNext();
             if (_streamer.Current?.Value == ";")
             {
                 _streamer.MoveNext();

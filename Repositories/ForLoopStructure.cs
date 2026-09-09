@@ -319,7 +319,7 @@ public class ForLoopStructure : ISControl
         if (!expr.Contains(' '))
         {
             var variable = _variables.FirstOrDefault(v => v.Name.Equals(expr, StringComparison.OrdinalIgnoreCase));
-            if (variable != null && int.TryParse(variable.Value?.ToString(), out int varValue))
+            if (variable is not null && int.TryParse(variable.Value?.ToString(), out int varValue))
                 return varValue;
         }
 
@@ -454,7 +454,22 @@ public class ForLoopStructure : ISControl
             }
             else
             {
-                SyntetizeAssignment(loopVariables);
+                // Phase 3 (Session 26, 2026-07-22): dispatch procedure calls
+                // nested inside a for-loop body before falling to assignment
+                // parsing. Mirrors Process.SyntetizeBehaviour identifier
+                // fallback. Without this, `step_state(state, 20 ns);` inside
+                // the loop body was consumed by SyntetizeAssignment which
+                // silently discarded it.
+                if (ProcedureCallStatement.IsProcedureCall(_streamer, loopVariables))
+                {
+                    var _call = new ProcedureCallStatement(loopVariables, _streamer);
+                    _call.Syntetize();
+                    if (_call.IsValid) Tasks.Add(_call);
+                }
+                else
+                {
+                    SyntetizeAssignment(loopVariables);
+                }
             }
         }
     }
@@ -482,6 +497,8 @@ public class ForLoopStructure : ISControl
             {
                 _streamer.MoveNext();
             }
+            // VHDL-2008 matching-case: `end case?;`
+            if (_streamer.Current?.Value == "?") _streamer.MoveNext();
             if (_streamer.Current?.Value == ";")
             {
                 _streamer.MoveNext();

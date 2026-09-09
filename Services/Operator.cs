@@ -880,19 +880,45 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             return SolveShiftOperation(v1, v2);
         }
 
-        if (v1.Size != v2.Size)
+        // Pass 23 (2026-07-30): Operation.Syntetize wraps a std_logic_vector
+        // literal like `"0011"` in a Variable with the raw quoted string
+        // as Value and Size=0. That was safe as long as literals only
+        // reached signal-assign paths (which strip quotes downstream),
+        // but SolveVectorLogicOperation's bit-by-bit loop keys on v.Size
+        // — with Size=0 the loop runs 0 iterations and the result is an
+        // empty string. Downstream `Result.Value = ""` then propagates
+        // 0000 (padded) even when the operator would have produced a
+        // real value. Fix: strip quotes and derive the effective width
+        // from the unquoted string length; use the max as the operand
+        // width (padding shorter vectors with '0's if necessary, but
+        // still throwing on true size mismatches).
+        string clean1 = StripLiteralQuotes(v1.Value);
+        string clean2 = StripLiteralQuotes(v2.Value);
+        int size1 = v1.Size > 0 ? v1.Size : clean1.Length;
+        int size2 = v2.Size > 0 ? v2.Size : clean2.Length;
+        if (size1 != size2)
             throw new ParserException(
-                $"Vector size mismatch in '{OperatorName}' operation: '{v1.Name}' has {v1.Size} bits, '{v2.Name}' has {v2.Size} bits");
-        string result = "",
-        vectorString1 = (string)v1.Value,
-        vectorString2 = (string)v2.Value;
-        for (int i = 0; i < v1.Size; i++)
+                $"Vector size mismatch in '{OperatorName}' operation: '{v1.Name}' has {size1} bits, '{v2.Name}' has {size2} bits");
+        // Left-pad each string to its declared width so a Value like "10"
+        // stored against a 4-bit Variable still bit-aligns correctly.
+        if (clean1.Length < size1) clean1 = clean1.PadLeft(size1, '0');
+        if (clean2.Length < size2) clean2 = clean2.PadLeft(size2, '0');
+        string result = "";
+        for (int i = 0; i < size1; i++)
         {
-            Variable valueA = new("tempA", vectorString1[i], DATATYPES.STD_LOGIC),
-            valueB = new("tempB", vectorString2[i], DATATYPES.STD_LOGIC);
+            Variable valueA = new("tempA", clean1[i], DATATYPES.STD_LOGIC),
+            valueB = new("tempB", clean2[i], DATATYPES.STD_LOGIC);
             result += Convert.ToString(SolveLogicOperation(valueA, valueB));
         }
         return result;
+    }
+
+    private static string StripLiteralQuotes(object? value)
+    {
+        var s = value?.ToString() ?? string.Empty;
+        if (s.Length >= 2 && s[0] == '"' && s[^1] == '"') return s.Substring(1, s.Length - 2);
+        if (s.Length >= 2 && s[0] == '\'' && s[^1] == '\'') return s.Substring(1, s.Length - 2);
+        return s;
     }
 
     /// <summary>

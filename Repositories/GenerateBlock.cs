@@ -222,7 +222,7 @@ public class GenerateBlock : ISControl
         if (!expr.Contains(' '))
         {
             var variable = _variables.FirstOrDefault(v => v.Name.Equals(expr, StringComparison.OrdinalIgnoreCase));
-            if (variable != null && int.TryParse(variable.Value?.ToString(), out int varValue))
+            if (variable is not null && int.TryParse(variable.Value?.ToString(), out int varValue))
                 return varValue;
         }
 
@@ -481,6 +481,8 @@ public class GenerateBlock : ISControl
             {
                 stream.MoveNext();
             }
+            // VHDL-2008 matching-case: `end case?;`
+            if (stream.Current?.Value == "?") stream.MoveNext();
             if (stream.Current?.Value == ";")
             {
                 stream.MoveNext();

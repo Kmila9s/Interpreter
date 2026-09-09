@@ -262,7 +262,7 @@ public static class ParseTrace
         var sigName = tokens[startIdx + 2];
         var v = variables.FirstOrDefault(x =>
             x.Name.Equals(sigName, StringComparison.OrdinalIgnoreCase));
-        if (v == null) return false;
+        if (v is null) return false;
 
         // Form 1: <caller>(<name>) — no slice.
         if (tokens[startIdx + 3] == ")")

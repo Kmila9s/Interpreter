@@ -40,7 +40,10 @@ public class ShuntingYard {
             // functions whose body is registered — need re-evaluation on
             // every Operation.Execute so calls inside clocked processes
             // don't freeze at first-fire values).
-            if(item is Variable || item is Models.DeferredFunction || item is Models.DeferredIndex || item is Models.DynamicIndex || item is Models.DeferredUserFunction) Result.Add(item);
+            // Tier 4.1 (2026-07-28): DeferredAttribute for signal'event /
+            // 'last_value / 'stable[(T)] — same lifecycle as DeferredFunction:
+            // pass through as an operand, re-evaluated at Execute time.
+            if(item is Variable || item is Models.DeferredFunction || item is Models.DeferredIndex || item is Models.DynamicIndex || item is Models.DeferredUserFunction || item is Models.DeferredAttribute) Result.Add(item);
             else if(item is Operator operation ){
                 // Left parenthesis: push onto operator stack
                 if(operation.OperatorName == "(")

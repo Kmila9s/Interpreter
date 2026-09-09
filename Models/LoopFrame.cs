@@ -26,7 +26,7 @@ namespace Interpreter.Models;
 /// dropped at parse time (future work) because the frame model only
 /// tracks one level of loop nesting per pushed frame.
 /// </remarks>
-public sealed class LoopFrame
+public sealed class LoopFrame : IProcessFrame
 {
     /// <summary>
     /// The loop AST node — a <see cref="Repositories.ForLoopStructure"/>,

@@ -500,8 +500,124 @@ public static class StandardFunctions
                 }
                 return 0;
 
+            // Phase 5 (2026-07-22): std_logic_arith arithmetic aliases.
+            // Previously registered by name only in the bundled stub, so
+            // callers received null! and the caller-coerced "0" masqueraded
+            // as valid data. All six delegate to existing helpers.
+            case "shl":
+                if (arguments.Length >= 2)
+                    return ShiftLeft(GetStringValue(arguments[0], variables),
+                                     GetIntValue(arguments[1], variables));
+                return "";
+
+            case "shr":
+                if (arguments.Length >= 2)
+                    return ShiftRight(GetStringValue(arguments[0], variables),
+                                      GetIntValue(arguments[1], variables));
+                return "";
+
+            case "ext": // zero-extend
+                if (arguments.Length >= 2)
+                    return Resize(GetStringValue(arguments[0], variables),
+                                  GetIntValue(arguments[1], variables));
+                return "";
+
+            case "sxt": // sign-extend — same code path as Resize;
+                       // signed shape is tracked separately.
+                if (arguments.Length >= 2)
+                    return Resize(GetStringValue(arguments[0], variables),
+                                  GetIntValue(arguments[1], variables));
+                return "";
+
+            case "conv_unsigned":
+                if (arguments.Length >= 2)
+                    return ToStdLogicVector(GetIntValue(arguments[0], variables),
+                                            GetIntValue(arguments[1], variables));
+                return "";
+
+            case "conv_signed":
+                if (arguments.Length >= 2)
+                    return ToStdLogicVector(GetIntValue(arguments[0], variables),
+                                            GetIntValue(arguments[1], variables));
+                return "";
+
+            // Phase 5: math_real transcendentals. Constant-init contexts
+            // only (VHDL prohibits math_real inside synthesized designs);
+            // return the result formatted as a string so it flows through
+            // GetIntValue / GetStringValue as expected downstream.
+            case "floor":
+                if (arguments.Length >= 1)
+                    return ((long)Math.Floor(GetDoubleValue(arguments[0], variables))).ToString();
+                return "0";
+
+            case "ceil":
+                if (arguments.Length >= 1)
+                    return ((long)Math.Ceiling(GetDoubleValue(arguments[0], variables))).ToString();
+                return "0";
+
+            case "round":
+                if (arguments.Length >= 1)
+                    return ((long)Math.Round(GetDoubleValue(arguments[0], variables))).ToString();
+                return "0";
+
+            case "sqrt":
+                if (arguments.Length >= 1)
+                {
+                    double x = GetDoubleValue(arguments[0], variables);
+                    if (x < 0) return "0";
+                    return Math.Sqrt(x).ToString(System.Globalization.CultureInfo.InvariantCulture);
+                }
+                return "0";
+
+            // Phase 5: meta-value normalization from std_logic_1164.
+            // to_x01: map U/X/Z/W/-/L/H → X/X/X/X/X/0/1; keep 0/1.
+            // is_x:   returns true iff any bit is one of the meta-values.
+            case "to_x01":
+                if (arguments.Length >= 1)
+                {
+                    string s = GetStringValue(arguments[0], variables);
+                    var sb = new System.Text.StringBuilder(s.Length);
+                    foreach (char c in s)
+                    {
+                        sb.Append(c switch {
+                            '0' or 'L' or 'l' => '0',
+                            '1' or 'H' or 'h' => '1',
+                            'U' or 'u' or 'X' or 'x' or 'Z' or 'z'
+                                or 'W' or 'w' or '-' => 'X',
+                            _ => c,
+                        });
+                    }
+                    return sb.ToString();
+                }
+                return "";
+
+            case "is_x":
+                if (arguments.Length >= 1)
+                {
+                    string s = GetStringValue(arguments[0], variables);
+                    foreach (char c in s)
+                    {
+                        if (c is 'U' or 'u' or 'X' or 'x' or 'Z' or 'z'
+                             or 'W' or 'w' or '-')
+                            return true;
+                    }
+                    return false;
+                }
+                return false;
+
             default:
-                return null!;
+                // Phase 4 (2026-07-22): surface a diagnostic instead of
+                // returning null! silently. Callers coerce null → "0"/""
+                // downstream, but the user never sees WHY their function
+                // returned a stub. IEEE-STUB entries appear in the shared
+                // SkipDiagnosticLog alongside VHD-PROC-PARTIAL and friends.
+                SkipDiagnosticLog.Instance.AddWarning(
+                    "IEEE-STUB",
+                    functionName,
+                    $"Function '{functionName}' is name-registered but not implemented — " +
+                    "returning \"0\" placeholder. Add a case in " +
+                    "StandardFunctions.EvaluateFunction to implement.");
+                return "0";
         }
     }
 
@@ -556,6 +672,23 @@ public static class StandardFunctions
     /// <summary>
     /// Gets an integer value from an argument.
     /// </summary>
+    /// <summary>
+    /// Phase 5 (2026-07-22): read an argument as a double. Used by
+    /// math_real transcendentals (floor/ceil/round/sqrt). Accepts:
+    /// - a numeric literal string via <c>double.TryParse</c>,
+    /// - an integer via <see cref="GetIntValue"/> as fallback,
+    /// - a <see cref="Variable"/> whose Value is a numeric string.
+    /// Falls back to 0.0 if none parse.
+    /// </summary>
+    private static double GetDoubleValue(object arg, HashSet<Variable> variables)
+    {
+        string s = GetStringValue(arg, variables);
+        if (double.TryParse(s, System.Globalization.NumberStyles.Float,
+                            System.Globalization.CultureInfo.InvariantCulture, out double d))
+            return d;
+        return GetIntValue(arg, variables);
+    }
+
     private static int GetIntValue(object arg, HashSet<Variable> variables)
     {
         // Bench bug #20: evaluate DeferredIndex slices live so callers like

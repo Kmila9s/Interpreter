@@ -4,6 +4,7 @@ using Interpreter.Models;
 using Interpreter.Repositories;
 using Parser.Models;
 using Parser.Repositories;
+using Parser.Services;
 using static Parser.Models.Constants.TYPE;
 namespace Interpreter.Services;
 
@@ -852,6 +853,20 @@ public class Architecture : ISControl, IControl
     /// Synthesizes the assignations.
     /// </summary>
     public void SyntetizeAssingations()
+    {
+        var _profileStopwatch = ParseProfile.Enabled ? System.Diagnostics.Stopwatch.StartNew() : null;
+        try { SyntetizeAssingationsInner(); }
+        finally
+        {
+            if (_profileStopwatch != null)
+            {
+                _profileStopwatch.Stop();
+                ParseProfile.RecordSyntetizeAssignations(_profileStopwatch.ElapsedTicks);
+            }
+        }
+    }
+
+    private void SyntetizeAssingationsInner()
     {
         // Strict shape: a concurrent statement must look like
         //   <signal>[ ( <index> ) ] ( <= | := ) <expr> ;

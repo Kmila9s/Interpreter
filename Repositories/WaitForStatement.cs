@@ -184,16 +184,22 @@ public sealed class WaitForStatement : ISControl
             // Operation binding behaviour). This is a name-scan rather
             // than an AST walk so it survives DeferredFunction wrappers
             // like `rising_edge(clk)` — the `clk` token still appears.
+            // Tier 4.1 (2026-07-28): attribute tokens like `clk'event`
+            // arrive glued into one token via VECTORS_ATTRIBUTES; strip the
+            // `'attr` suffix so the underlying signal still registers in
+            // the wait's sensitivity set.
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var t in tokens)
+            foreach (var raw in tokens)
             {
-                if (string.IsNullOrEmpty(t) || !char.IsLetter(t[0])) continue;
+                if (string.IsNullOrEmpty(raw) || !char.IsLetter(raw[0])) continue;
+                int apos = raw.IndexOf('\'');
+                string t = apos > 0 ? raw[..apos] : raw;
                 if (!seen.Add(t)) continue;
                 var match = _variables.FirstOrDefault(v =>
                     !ReferenceEquals(v, null) &&
                     !string.IsNullOrEmpty(v.Name) &&
                     v.Name.Equals(t, StringComparison.OrdinalIgnoreCase));
-                if (match != null) Sensitivity.Add(match);
+                if (match is not null) Sensitivity.Add(match);
             }
 
             if (Sensitivity.Count == 0)

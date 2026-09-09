@@ -678,7 +678,7 @@ public class Resources
             !string.IsNullOrEmpty(v.Name) &&
             !string.IsNullOrEmpty(sel.SelectorExpression) &&
             v.Name.Equals(sel.SelectorExpression.Trim(), StringComparison.OrdinalIgnoreCase));
-        if (selectorSig != null) selectorBits = Math.Max(1, selectorSig.Size);
+        if (selectorSig is not null) selectorBits = Math.Max(1, selectorSig.Size);
 
         foreach (var choice in sel.Choices)
         {

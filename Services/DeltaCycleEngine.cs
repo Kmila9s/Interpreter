@@ -372,7 +372,13 @@ public class DeltaCycleEngine : IDisposable
     public int TickResolutionNs
     {
         get => _signalScheduler.TickResolutionNs;
-        set => _signalScheduler.TickResolutionNs = value;
+        set
+        {
+            _signalScheduler.TickResolutionNs = value;
+            // Keep the attribute handler's copy in step so `'stable(T ns)`
+            // scales correctly regardless of when the caller sets tickRes.
+            SignalAttributeHandler.Instance.TickResolutionNs = value;
+        }
     }
 
     /// <summary>
@@ -429,11 +435,11 @@ public class DeltaCycleEngine : IDisposable
                     if (!string.IsNullOrEmpty(v.Name)) inputs.Add(v);
                     break;
                 case Models.DeferredIndex di:
-                    if (di.Source != null) inputs.Add(di.Source);
+                    if (di.Source is not null) inputs.Add(di.Source);
                     break;
                 case Models.DynamicIndex dyni:
-                    if (dyni.Source != null) inputs.Add(dyni.Source);
-                    if (dyni.IndexSource != null) inputs.Add(dyni.IndexSource);
+                    if (dyni.Source is not null) inputs.Add(dyni.Source);
+                    if (dyni.IndexSource is not null) inputs.Add(dyni.IndexSource);
                     // Expression-mode DynamicIndex may read any signal in
                     // its scope. Mark dynamic so we run unconditionally.
                     if (dyni.IndexExpression != null) dynamic = true;
@@ -441,6 +447,22 @@ public class DeltaCycleEngine : IDisposable
                 case Models.DeferredFunction:
                     // User / deferred function args reach into call-time
                     // state. Treat as dynamic to be safe.
+                    dynamic = true;
+                    break;
+                case Models.DeferredUserFunction:
+                    // Tier 4.3 exposure (2026-07-28): concurrent assigns of
+                    // shape `y <= userFn(a,b);` had no _signalToOps entry
+                    // because the DeferredUserFunction was silently skipped
+                    // by this switch — `y` never updated when a/b changed
+                    // (the arg-string signals are hidden inside the wrapper
+                    // and aren't emitted as Variable items). Treat as dynamic;
+                    // args are re-parsed against live scope on every Evaluate.
+                    dynamic = true;
+                    break;
+                case Models.DeferredAttribute:
+                    // Tier 4.1 close-out companion: same shape — the attr's
+                    // handler reads live SignalAttributeHandler state on every
+                    // Execute, so the enclosing op must run every delta.
                     dynamic = true;
                     break;
             }
@@ -463,6 +485,9 @@ public class DeltaCycleEngine : IDisposable
 
         // Register all signals with the attribute handler
         var handler = SignalAttributeHandler.Instance;
+        // Tier 4.1 close-out: propagate tick resolution so `'stable(T ns)`
+        // scales correctly at non-1 ns tickResNs (bench default is 10 ns).
+        handler.TickResolutionNs = _signalScheduler.TickResolutionNs;
         foreach (var signal in signals)
         {
             handler.RegisterSignal(signal);
@@ -595,6 +620,14 @@ public class DeltaCycleEngine : IDisposable
             if (changedSignals.Count > 0)
             {
                 _processScheduler.NotifySignalChanges(changedSignals);
+                // Tier 4.1 close-out: stamp `_lastChangeMoments` for
+                // stimulus-driven writes so `'stable(T)` reads correctly.
+                // OnDeltaCommit only covers scheduler-driven writes; stimulus
+                // signals (clocks, external ports) bypass that path but flip
+                // `_activeFlags` via OnValueChange. Attribute the change to
+                // the tick just entered (delta 0).
+                int stimulusTimeMoment = (int)(_currentTick * 1000);
+                handler.StampStimulusChanges(changedSignals, stimulusTimeMoment);
             }
 
             // Phase H.3: external-stimulus changes count toward the next
@@ -648,8 +681,11 @@ public class DeltaCycleEngine : IDisposable
         // Simulation is stable at this time point
         OnSimulationStable?.Invoke();
 
-        // Update previous values for all signals (for 'event detection next cycle)
-        SignalAttributeHandler.Instance.UpdateAllPreviousValues(_allSignals);
+        // Tier 4.1: previous-value / last-change-moment updates moved into
+        // SignalAttributeHandler.OnDeltaCommit (per-delta, in RunDeltaCycleAsync).
+        // The tick boundary still needs to clear _activeFlags so the next
+        // tick's OnValueChange-driven events start from a clean slate.
+        SignalAttributeHandler.Instance.ClearActiveFlagsAtTickBoundary(_allSignals);
     }
 
     /// <summary>
@@ -669,6 +705,12 @@ public class DeltaCycleEngine : IDisposable
                 $"cumDeltas={TotalDeltaCycles + _currentDelta} " +
                 $"maxDeltas/tick={MaxDeltasInAnyTick} capHits={CapHitTicks}");
         }
+
+        // Tier 4.1 close-out: clear per-delta `'event` counters at the top of
+        // every delta so `HadEventThisDelta` reads reflect only this delta's
+        // transitions. Tick-scoped `_activeFlags` are untouched — end-of-tick
+        // clear stays in `ClearActiveFlagsAtTickBoundary`.
+        SignalAttributeHandler.Instance.BeginDelta();
 
         // 1. Get pending processes
         var pendingProcesses = _processScheduler.GetPendingProcesses().ToList();
@@ -766,13 +808,22 @@ public class DeltaCycleEngine : IDisposable
         // 4. Apply all scheduled updates. Phase B+ Deep AST: use the
         //    line-aware variant so each change carries the 1-based source
         //    line of the operation that drove it (0 = unknown).
-        var changedWithLines = _signalScheduler.ApplyCurrentUpdatesWithLines();
+        // Tier 4.1: pull old-values alongside so SignalAttributeHandler can
+        //    populate per-delta `'event` / `'last_value` / `'stable(T)` state.
+        var (changedWithLines, oldValuesThisDelta) =
+            _signalScheduler.ApplyCurrentUpdatesWithLinesAndOldValues();
         var changedSignals = new HashSet<Variable>(changedWithLines.Keys);
 
         // 5. Record signal changes in history with source-line metadata.
         // Time moment = tick * 1000 + delta (allows for up to 1000 delta cycles per tick)
         int timeMoment = (int)(_currentTick * 1000) + _currentDelta;
         _signalHistory.RecordChangesWithLines(changedWithLines, timeMoment);
+
+        // 5b. Tier 4.1: refresh signal-attribute state at delta granularity.
+        //     Replaces the tick-boundary UpdateAllPreviousValues call (deleted
+        //     from RunTimeStepAsync). 0→1→0-within-a-tick transitions now
+        //     register two distinct `'event` deltas instead of collapsing.
+        SignalAttributeHandler.Instance.OnDeltaCommit(oldValuesThisDelta, timeMoment);
 
         // 6. Fire signal change events
         foreach (var signal in changedSignals)
@@ -877,15 +928,35 @@ public class DeltaCycleEngine : IDisposable
         // that reports "still suspended" bubbles out immediately.
         while (process.Frames.Count > 0)
         {
-            var frame = process.Frames.Peek();
-            bool stillSuspended = frame.LoopRef switch
+            var top = process.Frames.Peek();
+            bool stillSuspended = top switch
             {
-                Interpreter.Repositories.ForLoopStructure f
-                    => await RunForLoopFromFrameAsync(process, f, frame),
-                Interpreter.Repositories.WhileLoopStructure w
-                    => await RunWhileLoopFromFrameAsync(process, w, frame),
-                Interpreter.Repositories.SimpleLoopStructure s
-                    => await RunSimpleLoopFromFrameAsync(process, s, frame),
+                Interpreter.Models.LoopFrame lf => lf.LoopRef switch
+                {
+                    Interpreter.Repositories.ForLoopStructure f
+                        => await RunForLoopFromFrameAsync(process, f, lf),
+                    Interpreter.Repositories.WhileLoopStructure w
+                        => await RunWhileLoopFromFrameAsync(process, w, lf),
+                    Interpreter.Repositories.SimpleLoopStructure s
+                        => await RunSimpleLoopFromFrameAsync(process, s, lf),
+                    _ => false,
+                },
+                // F-G-13d (Phase 2): drain if/case branch frames the same
+                // way. The runner returns "still suspended" if a wait
+                // fired inside its branch body.
+                Interpreter.Models.BranchFrame bf => bf.StructureRef switch
+                {
+                    Interpreter.Repositories.IfStructure ifs
+                        => await RunIfBranchFromFrameAsync(process, ifs, bf),
+                    Interpreter.Repositories.CaseStructure cs
+                        => await RunCaseBranchFromFrameAsync(process, cs, bf),
+                    _ => false,
+                },
+                // Phase 3 (2026-07-22): drain procedure frames the same
+                // way. A wait anywhere inside the procedure body kept the
+                // frame on the stack; resume from the saved InnerPc.
+                Interpreter.Models.ProcedureFrame pf
+                    => await RunProcedureFromFrameAsync(process, pf),
                 _ => false, // unknown frame type — drop it.
             };
             if (stillSuspended) return;
@@ -893,6 +964,22 @@ public class DeltaCycleEngine : IDisposable
             if (process.IsTerminated) return;
         }
 
+        // F-G-13d: outer implicit-loop for VHDL processes without a
+        // trailing wait. When we fall off end below with HasWait &&
+        // YieldedSinceLoopStart, we continue this outer loop so the
+        // body re-enters from Pc=0. If we fall off without yielding,
+        // we terminate — same semantics as before Phase 2.
+        int loopSafetyCounter = 0;
+        while (true)
+        {
+            if (++loopSafetyCounter > 1_000_000)
+            {
+                // Runaway detector — a process that spun a million
+                // implicit iterations without yielding is definitely
+                // wrong. Terminate defensively.
+                process.IsTerminated = true;
+                return;
+            }
         while (process.Pc < process.Tasks.Count)
         {
             var task = process.Tasks[process.Pc];
@@ -904,8 +991,14 @@ public class DeltaCycleEngine : IDisposable
                 return;
             }
 
-            // F-G-13c: loops at process top level enter the resumable
-            // executor so their body-level waits can suspend the process.
+            // F-G-13c/d: loops and if/case at process top level enter the
+            // resumable executor so their body-level waits can suspend
+            // the process. Pc is bumped BEFORE running so that a resume
+            // via the frame-drain path lands on the NEXT top-level task
+            // after the body completes — see the Pc++ line inside each
+            // block. On suspend we `return` with Pc already past the
+            // task; on completion we fall through and `continue` to the
+            // next top-level task.
             if (task is Interpreter.Repositories.ForLoopStructure fs)
             {
                 var frame = new Interpreter.Models.LoopFrame
@@ -914,12 +1007,12 @@ public class DeltaCycleEngine : IDisposable
                     IterationVal = fs.RangeStart,
                     InnerPc = 0,
                 };
+                process.Pc++;
                 process.Frames.Push(frame);
                 bool suspended = await RunForLoopFromFrameAsync(process, fs, frame);
                 if (suspended) return;
                 process.Frames.Pop();
                 if (process.IsTerminated) return;
-                process.Pc++;
                 continue;
             }
             if (task is Interpreter.Repositories.WhileLoopStructure ws)
@@ -930,12 +1023,12 @@ public class DeltaCycleEngine : IDisposable
                     IterationVal = 0,
                     InnerPc = 0,
                 };
+                process.Pc++;
                 process.Frames.Push(frame);
                 bool suspended = await RunWhileLoopFromFrameAsync(process, ws, frame);
                 if (suspended) return;
                 process.Frames.Pop();
                 if (process.IsTerminated) return;
-                process.Pc++;
                 continue;
             }
             if (task is Interpreter.Repositories.SimpleLoopStructure ss)
@@ -946,18 +1039,54 @@ public class DeltaCycleEngine : IDisposable
                     IterationVal = 0,
                     InnerPc = 0,
                 };
+                process.Pc++;
                 process.Frames.Push(frame);
                 bool suspended = await RunSimpleLoopFromFrameAsync(process, ss, frame);
                 if (suspended) return;
                 process.Frames.Pop();
                 if (process.IsTerminated) return;
-                process.Pc++;
                 continue;
             }
 
             if (task is Operation op)
             {
                 GetScheduledOperation(op).Execute();
+            }
+            // F-G-13d (Phase 2): route top-level if/case through the
+            // process-aware runners so a wait inside a branch can suspend
+            // the process. Non-process paths (concurrent tasks) continue
+            // to use ExecuteControlWithSchedulingAsync, which walks the
+            // branches synchronously and can't yield. Pc is bumped BEFORE
+            // pushing the frame so a wait-driven resume lands on the
+            // NEXT top-level task after the branch completes.
+            else if (task is IfStructure topIf)
+            {
+                process.Pc++;
+                bool suspended = await RunTopIfFromEntryAsync(process, topIf);
+                if (suspended) return;
+                if (process.IsTerminated) return;
+                continue;
+            }
+            else if (task is CaseStructure topCase)
+            {
+                process.Pc++;
+                bool suspended = await RunTopCaseFromEntryAsync(process, topCase);
+                if (suspended) return;
+                if (process.IsTerminated) return;
+                continue;
+            }
+            // Phase 3 (2026-07-22): top-level procedure call routes through
+            // the process-aware runner so a wait anywhere in the procedure
+            // body (top, if/case branch, nested loop, nested call) can
+            // suspend the whole process. Concurrent-context calls without
+            // a Process stay on the ISControl fallback below.
+            else if (task is Interpreter.Repositories.ProcedureCallStatement topCall)
+            {
+                process.Pc++;
+                bool suspended = await RunTopProcedureFromEntryAsync(process, topCall);
+                if (suspended) return;
+                if (process.IsTerminated) return;
+                continue;
             }
             else if (task is ISControl ctrl)
             {
@@ -966,10 +1095,22 @@ public class DeltaCycleEngine : IDisposable
             process.Pc++;
         }
 
-        // Fell off end of body — treat as terminal (VHDL processes without
-        // a trailing wait would restart, but for the F-G-13 MVP we treat
-        // wait-driven processes as run-once).
+        // F-G-13d (Phase 2, 2026-07-22): implicit VHDL-style loop for
+        // wait-driven processes without an explicit terminal wait.
+        // If the body yielded at least once this pass, time advanced —
+        // re-enter from Pc=0 (per VHDL LRM: process without top-level
+        // `wait` is equivalent to `while true loop <body> end loop`).
+        // If we fell off end WITHOUT yielding, don't loop — that would
+        // be an unbounded zero-time spin.
+        if (process.HasWait && process.YieldedSinceLoopStart)
+        {
+            process.Pc = 0;
+            process.YieldedSinceLoopStart = false;
+            continue; // outer while(true): re-enter body from Pc=0
+        }
         process.IsTerminated = true;
+        return;
+        } // end outer while(true)
     }
 
     /// <summary>
@@ -980,6 +1121,10 @@ public class DeltaCycleEngine : IDisposable
     /// </summary>
     private void YieldOnWait(Process process, Interpreter.Repositories.WaitForStatement waitStmt)
     {
+        // F-G-13d (Phase 2): mark that this process yielded at least once
+        // since it last started from Pc=0. Consulted by the fall-off path
+        // below to decide whether an implicit VHDL-style loop-back is safe.
+        process.YieldedSinceLoopStart = true;
         if (waitStmt.IsCondition)
         {
             RegisterConditionBlocked(process, waitStmt);
@@ -1018,7 +1163,7 @@ public class DeltaCycleEngine : IDisposable
         while (isDescending ? i >= end : i <= end)
         {
             frame.IterationVal = i;
-            if (loopVar != null) loopVar.Value = i.ToString();
+            if (loopVar is not null) loopVar.Value = i.ToString();
 
             try
             {
@@ -1034,6 +1179,55 @@ public class DeltaCycleEngine : IDisposable
                     if (task is Operation op)
                     {
                         GetScheduledOperation(op).Execute();
+                    }
+                    // F-G-13d (Phase 2): nested if/case/for/while/simple-loop
+                    // inside a loop body routes through the process-aware
+                    // runner so a wait inside the nested body can suspend
+                    // the whole process stack.
+                    else if (task is IfStructure innerIf)
+                    {
+                        bool suspended = await RunTopIfFromEntryAsync(process, innerIf);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                    }
+                    else if (task is CaseStructure innerCase)
+                    {
+                        bool suspended = await RunTopCaseFromEntryAsync(process, innerCase);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                    }
+                    else if (task is Interpreter.Repositories.ForLoopStructure innerFor)
+                    {
+                        var nf = new Interpreter.Models.LoopFrame
+                        { LoopRef = innerFor, IterationVal = innerFor.RangeStart, InnerPc = 0 };
+                        process.Frames.Push(nf);
+                        bool suspended = await RunForLoopFromFrameAsync(process, innerFor, nf);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                        process.Frames.Pop();
+                    }
+                    else if (task is Interpreter.Repositories.WhileLoopStructure innerWhile)
+                    {
+                        var nf = new Interpreter.Models.LoopFrame
+                        { LoopRef = innerWhile, IterationVal = 0, InnerPc = 0 };
+                        process.Frames.Push(nf);
+                        bool suspended = await RunWhileLoopFromFrameAsync(process, innerWhile, nf);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                        process.Frames.Pop();
+                    }
+                    else if (task is Interpreter.Repositories.SimpleLoopStructure innerSimple)
+                    {
+                        var nf = new Interpreter.Models.LoopFrame
+                        { LoopRef = innerSimple, IterationVal = 0, InnerPc = 0 };
+                        process.Frames.Push(nf);
+                        bool suspended = await RunSimpleLoopFromFrameAsync(process, innerSimple, nf);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                        process.Frames.Pop();
+                    }
+                    // Phase 3 (2026-07-22): nested procedure call inside a
+                    // loop body — recurse via the process-aware runner so a
+                    // wait inside the callee suspends the whole process.
+                    else if (task is Interpreter.Repositories.ProcedureCallStatement innerCall)
+                    {
+                        bool suspended = await RunTopProcedureFromEntryAsync(process, innerCall);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
                     }
                     else if (task is ISControl ctrl)
                     {
@@ -1109,6 +1303,55 @@ public class DeltaCycleEngine : IDisposable
                     {
                         GetScheduledOperation(op).Execute();
                     }
+                    // F-G-13d (Phase 2): nested if/case/for/while/simple-loop
+                    // inside a loop body routes through the process-aware
+                    // runner so a wait inside the nested body can suspend
+                    // the whole process stack.
+                    else if (task is IfStructure innerIf)
+                    {
+                        bool suspended = await RunTopIfFromEntryAsync(process, innerIf);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                    }
+                    else if (task is CaseStructure innerCase)
+                    {
+                        bool suspended = await RunTopCaseFromEntryAsync(process, innerCase);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                    }
+                    else if (task is Interpreter.Repositories.ForLoopStructure innerFor)
+                    {
+                        var nf = new Interpreter.Models.LoopFrame
+                        { LoopRef = innerFor, IterationVal = innerFor.RangeStart, InnerPc = 0 };
+                        process.Frames.Push(nf);
+                        bool suspended = await RunForLoopFromFrameAsync(process, innerFor, nf);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                        process.Frames.Pop();
+                    }
+                    else if (task is Interpreter.Repositories.WhileLoopStructure innerWhile)
+                    {
+                        var nf = new Interpreter.Models.LoopFrame
+                        { LoopRef = innerWhile, IterationVal = 0, InnerPc = 0 };
+                        process.Frames.Push(nf);
+                        bool suspended = await RunWhileLoopFromFrameAsync(process, innerWhile, nf);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                        process.Frames.Pop();
+                    }
+                    else if (task is Interpreter.Repositories.SimpleLoopStructure innerSimple)
+                    {
+                        var nf = new Interpreter.Models.LoopFrame
+                        { LoopRef = innerSimple, IterationVal = 0, InnerPc = 0 };
+                        process.Frames.Push(nf);
+                        bool suspended = await RunSimpleLoopFromFrameAsync(process, innerSimple, nf);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                        process.Frames.Pop();
+                    }
+                    // Phase 3 (2026-07-22): nested procedure call inside a
+                    // loop body — recurse via the process-aware runner so a
+                    // wait inside the callee suspends the whole process.
+                    else if (task is Interpreter.Repositories.ProcedureCallStatement innerCall)
+                    {
+                        bool suspended = await RunTopProcedureFromEntryAsync(process, innerCall);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                    }
                     else if (task is ISControl ctrl)
                     {
                         await ExecuteControlWithSchedulingAsync(ctrl);
@@ -1168,6 +1411,55 @@ public class DeltaCycleEngine : IDisposable
                     {
                         GetScheduledOperation(op).Execute();
                     }
+                    // F-G-13d (Phase 2): nested if/case/for/while/simple-loop
+                    // inside a loop body routes through the process-aware
+                    // runner so a wait inside the nested body can suspend
+                    // the whole process stack.
+                    else if (task is IfStructure innerIf)
+                    {
+                        bool suspended = await RunTopIfFromEntryAsync(process, innerIf);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                    }
+                    else if (task is CaseStructure innerCase)
+                    {
+                        bool suspended = await RunTopCaseFromEntryAsync(process, innerCase);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                    }
+                    else if (task is Interpreter.Repositories.ForLoopStructure innerFor)
+                    {
+                        var nf = new Interpreter.Models.LoopFrame
+                        { LoopRef = innerFor, IterationVal = innerFor.RangeStart, InnerPc = 0 };
+                        process.Frames.Push(nf);
+                        bool suspended = await RunForLoopFromFrameAsync(process, innerFor, nf);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                        process.Frames.Pop();
+                    }
+                    else if (task is Interpreter.Repositories.WhileLoopStructure innerWhile)
+                    {
+                        var nf = new Interpreter.Models.LoopFrame
+                        { LoopRef = innerWhile, IterationVal = 0, InnerPc = 0 };
+                        process.Frames.Push(nf);
+                        bool suspended = await RunWhileLoopFromFrameAsync(process, innerWhile, nf);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                        process.Frames.Pop();
+                    }
+                    else if (task is Interpreter.Repositories.SimpleLoopStructure innerSimple)
+                    {
+                        var nf = new Interpreter.Models.LoopFrame
+                        { LoopRef = innerSimple, IterationVal = 0, InnerPc = 0 };
+                        process.Frames.Push(nf);
+                        bool suspended = await RunSimpleLoopFromFrameAsync(process, innerSimple, nf);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                        process.Frames.Pop();
+                    }
+                    // Phase 3 (2026-07-22): nested procedure call inside a
+                    // loop body — recurse via the process-aware runner so a
+                    // wait inside the callee suspends the whole process.
+                    else if (task is Interpreter.Repositories.ProcedureCallStatement innerCall)
+                    {
+                        bool suspended = await RunTopProcedureFromEntryAsync(process, innerCall);
+                        if (suspended) { frame.InnerPc = idx + 1; return true; }
+                    }
                     else if (task is ISControl ctrl)
                     {
                         await ExecuteControlWithSchedulingAsync(ctrl);
@@ -1196,6 +1488,426 @@ public class DeltaCycleEngine : IDisposable
             frame.IterationVal++;
         }
         return false;
+    }
+
+    // =========================================================================
+    // F-G-13d (Phase 2, 2026-07-22): process-aware if/case runners.
+    //
+    // These mirror the loop runners' shape:
+    //   * Top-level entry (RunTopIfFromEntryAsync / RunTopCaseFromEntryAsync)
+    //     picks the branch, pushes a BranchFrame, calls the frame runner,
+    //     and pops on completion.
+    //   * Frame runner (RunIfBranchFromFrameAsync / RunCaseBranchFromFrameAsync)
+    //     walks the selected branch's Tasks from frame.InnerPc, yielding
+    //     when a wait is hit. Returns true when still suspended.
+    //
+    // The existing ExecuteIfStructureWithSchedulingAsync /
+    // ExecuteCaseStructureWithSchedulingAsync stay in place for callers
+    // outside process bodies (concurrent-context ISControl dispatch via
+    // ExecuteControlWithSchedulingAsync). Those callers never have a
+    // process to suspend, so the old branchless walk is still correct.
+    // =========================================================================
+
+    private async Task<bool> RunTopIfFromEntryAsync(Process process, IfStructure ifStruct)
+    {
+        // Pick the matching branch. Same rules as the legacy
+        // ExecuteIfStructureWithSchedulingAsync above but capture the index
+        // instead of walking the tasks inline.
+        int matchIdx = -1;
+        for (int i = 0; i < ifStruct.Branches.Count; i++)
+        {
+            var b = ifStruct.Branches[i];
+            if (b.IsElse) { matchIdx = i; break; } // else is last per parse
+            if (b.Condition != null)
+            {
+                var result = b.Condition.Execute() as Variable;
+                if (result?.Value is bool cond && cond)
+                {
+                    matchIdx = i;
+                    break;
+                }
+            }
+        }
+        if (matchIdx < 0) return false; // no branch fired
+
+        var pickedBranch = ifStruct.Branches[matchIdx];
+        OnConditionEvaluated?.Invoke(pickedBranch.ConditionLine);
+
+        var frame = new Interpreter.Models.BranchFrame
+        {
+            StructureRef = ifStruct,
+            BranchIdx = matchIdx,
+            InnerPc = 0,
+        };
+        process.Frames.Push(frame);
+        bool suspended = await RunIfBranchFromFrameAsync(process, ifStruct, frame);
+        if (suspended) return true;
+        process.Frames.Pop();
+        return false;
+    }
+
+    private async Task<bool> RunIfBranchFromFrameAsync(
+        Process process,
+        IfStructure ifStruct,
+        Interpreter.Models.BranchFrame frame)
+    {
+        if (frame.BranchIdx < 0 || frame.BranchIdx >= ifStruct.Branches.Count) return false;
+        var branch = ifStruct.Branches[frame.BranchIdx];
+        for (int idx = frame.InnerPc; idx < branch.Tasks.Count; idx++)
+        {
+            var task = branch.Tasks[idx];
+            if (task is Interpreter.Repositories.WaitForStatement w)
+            {
+                frame.InnerPc = idx + 1;
+                YieldOnWait(process, w);
+                return true;
+            }
+            if (task is Operation op)
+            {
+                GetScheduledOperation(op).Execute();
+            }
+            // Nested if/case/loop inside an if branch — recurse via the
+            // process-aware runner. If it suspends, we suspend at the
+            // SAME task (not idx + 1) so the resume re-enters the same
+            // structure; the pushed frame for the nested one keeps its
+            // own InnerPc.
+            else if (task is IfStructure nestedIf)
+            {
+                bool suspended = await RunTopIfFromEntryAsync(process, nestedIf);
+                if (suspended) { frame.InnerPc = idx + 1; return true; }
+            }
+            else if (task is CaseStructure nestedCase)
+            {
+                bool suspended = await RunTopCaseFromEntryAsync(process, nestedCase);
+                if (suspended) { frame.InnerPc = idx + 1; return true; }
+            }
+            else if (task is Interpreter.Repositories.ForLoopStructure nestedFor)
+            {
+                var nf = new Interpreter.Models.LoopFrame
+                { LoopRef = nestedFor, IterationVal = nestedFor.RangeStart, InnerPc = 0 };
+                process.Frames.Push(nf);
+                bool suspended = await RunForLoopFromFrameAsync(process, nestedFor, nf);
+                if (suspended) { frame.InnerPc = idx + 1; return true; }
+                process.Frames.Pop();
+            }
+            else if (task is Interpreter.Repositories.WhileLoopStructure nestedWhile)
+            {
+                var nf = new Interpreter.Models.LoopFrame
+                { LoopRef = nestedWhile, IterationVal = 0, InnerPc = 0 };
+                process.Frames.Push(nf);
+                bool suspended = await RunWhileLoopFromFrameAsync(process, nestedWhile, nf);
+                if (suspended) { frame.InnerPc = idx + 1; return true; }
+                process.Frames.Pop();
+            }
+            else if (task is Interpreter.Repositories.SimpleLoopStructure nestedSimple)
+            {
+                var nf = new Interpreter.Models.LoopFrame
+                { LoopRef = nestedSimple, IterationVal = 0, InnerPc = 0 };
+                process.Frames.Push(nf);
+                bool suspended = await RunSimpleLoopFromFrameAsync(process, nestedSimple, nf);
+                if (suspended) { frame.InnerPc = idx + 1; return true; }
+                process.Frames.Pop();
+            }
+            // Phase 3 (2026-07-22): nested procedure call inside an
+            // if/case branch — recurse via the process-aware runner.
+            else if (task is Interpreter.Repositories.ProcedureCallStatement nestedCall)
+            {
+                bool suspended = await RunTopProcedureFromEntryAsync(process, nestedCall);
+                if (suspended) { frame.InnerPc = idx + 1; return true; }
+            }
+            else if (task is ISControl ctrl)
+            {
+                await ExecuteControlWithSchedulingAsync(ctrl);
+            }
+        }
+        return false;
+    }
+
+    private async Task<bool> RunTopCaseFromEntryAsync(Process process, CaseStructure caseStruct)
+    {
+        if (caseStruct.Selector is null) return false;
+
+        // Mirror the selector-slice + choice-resolution logic from
+        // ExecuteCaseStructureWithSchedulingAsync so behaviour is
+        // identical on the non-wait path.
+        string selectorValue = caseStruct.Selector.Value?.ToString()?.Replace("\"", "").Replace("'", "").Trim() ?? "";
+        if (caseStruct.HasSelectorSlice && selectorValue.Length > 0)
+        {
+            int hi = caseStruct.SelectorSliceHigh;
+            int lo = caseStruct.SelectorSliceLow;
+            int width = hi - lo + 1;
+            int startPos = selectorValue.Length - 1 - hi;
+            if (startPos >= 0 && width > 0 && startPos + width <= selectorValue.Length)
+            {
+                selectorValue = selectorValue.Substring(startPos, width);
+            }
+        }
+
+        int matchIdx = -1;
+        int fallbackOthersIdx = -1;
+        for (int i = 0; i < caseStruct.Branches.Count; i++)
+        {
+            var b = caseStruct.Branches[i];
+            if (b.IsOthers) { if (fallbackOthersIdx < 0) fallbackOthersIdx = i; continue; }
+            foreach (var choice in b.Choices)
+            {
+                string cleanChoice = ResolveChoiceForCase(choice);
+                bool hit = caseStruct.IsMatching
+                    ? MatchesWithWildcards(cleanChoice, selectorValue)
+                    : cleanChoice.Equals(selectorValue, StringComparison.OrdinalIgnoreCase);
+                if (hit)
+                {
+                    matchIdx = i;
+                    break;
+                }
+            }
+            if (matchIdx == i) break;
+        }
+        if (matchIdx < 0) matchIdx = fallbackOthersIdx;
+        if (matchIdx < 0) return false;
+
+        var pickedBranch = caseStruct.Branches[matchIdx];
+        OnConditionEvaluated?.Invoke(pickedBranch.ConditionLine);
+
+        var frame = new Interpreter.Models.BranchFrame
+        {
+            StructureRef = caseStruct,
+            BranchIdx = matchIdx,
+            InnerPc = 0,
+        };
+        process.Frames.Push(frame);
+        bool suspended = await RunCaseBranchFromFrameAsync(process, caseStruct, frame);
+        if (suspended) return true;
+        process.Frames.Pop();
+        return false;
+    }
+
+    private async Task<bool> RunCaseBranchFromFrameAsync(
+        Process process,
+        CaseStructure caseStruct,
+        Interpreter.Models.BranchFrame frame)
+    {
+        if (frame.BranchIdx < 0 || frame.BranchIdx >= caseStruct.Branches.Count) return false;
+        var branch = caseStruct.Branches[frame.BranchIdx];
+        for (int idx = frame.InnerPc; idx < branch.Tasks.Count; idx++)
+        {
+            var task = branch.Tasks[idx];
+            if (task is Interpreter.Repositories.WaitForStatement w)
+            {
+                frame.InnerPc = idx + 1;
+                YieldOnWait(process, w);
+                return true;
+            }
+            if (task is Operation op)
+            {
+                GetScheduledOperation(op).Execute();
+            }
+            else if (task is IfStructure nestedIf)
+            {
+                bool suspended = await RunTopIfFromEntryAsync(process, nestedIf);
+                if (suspended) { frame.InnerPc = idx + 1; return true; }
+            }
+            else if (task is CaseStructure nestedCase)
+            {
+                bool suspended = await RunTopCaseFromEntryAsync(process, nestedCase);
+                if (suspended) { frame.InnerPc = idx + 1; return true; }
+            }
+            else if (task is Interpreter.Repositories.ForLoopStructure nestedFor)
+            {
+                var nf = new Interpreter.Models.LoopFrame
+                { LoopRef = nestedFor, IterationVal = nestedFor.RangeStart, InnerPc = 0 };
+                process.Frames.Push(nf);
+                bool suspended = await RunForLoopFromFrameAsync(process, nestedFor, nf);
+                if (suspended) { frame.InnerPc = idx + 1; return true; }
+                process.Frames.Pop();
+            }
+            else if (task is Interpreter.Repositories.WhileLoopStructure nestedWhile)
+            {
+                var nf = new Interpreter.Models.LoopFrame
+                { LoopRef = nestedWhile, IterationVal = 0, InnerPc = 0 };
+                process.Frames.Push(nf);
+                bool suspended = await RunWhileLoopFromFrameAsync(process, nestedWhile, nf);
+                if (suspended) { frame.InnerPc = idx + 1; return true; }
+                process.Frames.Pop();
+            }
+            else if (task is Interpreter.Repositories.SimpleLoopStructure nestedSimple)
+            {
+                var nf = new Interpreter.Models.LoopFrame
+                { LoopRef = nestedSimple, IterationVal = 0, InnerPc = 0 };
+                process.Frames.Push(nf);
+                bool suspended = await RunSimpleLoopFromFrameAsync(process, nestedSimple, nf);
+                if (suspended) { frame.InnerPc = idx + 1; return true; }
+                process.Frames.Pop();
+            }
+            // Phase 3 (2026-07-22): nested procedure call inside an
+            // if/case branch — recurse via the process-aware runner.
+            else if (task is Interpreter.Repositories.ProcedureCallStatement nestedCall)
+            {
+                bool suspended = await RunTopProcedureFromEntryAsync(process, nestedCall);
+                if (suspended) { frame.InnerPc = idx + 1; return true; }
+            }
+            else if (task is ISControl ctrl)
+            {
+                await ExecuteControlWithSchedulingAsync(ctrl);
+            }
+        }
+        return false;
+    }
+
+    // =========================================================================
+    // Phase 3 (Session 26, 2026-07-22): process-aware procedure runners.
+    //
+    // Entry: RunTopProcedureFromEntryAsync resolves the per-call bound body
+    // via ProcedureCallStatement.ResolveBoundBody, pushes a ProcedureFrame,
+    // and delegates to RunProcedureFromFrameAsync. The frame-drain switch
+    // in ExecuteProcessSegmentAsync resumes the same runner when the
+    // process wakes from a wait fired inside the procedure body.
+    //
+    // Empty-body path (procedure not in FunctionRegistry, e.g.
+    // PackageRegistry-only ProcedureDefinition): falls back to the legacy
+    // ProcedureCallStatement.ExecuteAsync — preserves F-G-12 report + F-G-14
+    // signal-assign semantics for procedures that predate Phase 3's synth.
+    // =========================================================================
+
+    private async Task<bool> RunTopProcedureFromEntryAsync(
+        Process process,
+        Interpreter.Repositories.ProcedureCallStatement call)
+    {
+        var tasks = call.ResolveBoundBody(_signalScheduler, out var outMap, out var boundScope);
+        if (tasks.Count == 0)
+        {
+            // Legacy fallback — procedure isn't registered in FunctionRegistry
+            // (only in PackageRegistry) OR has an empty BodyRaw. The
+            // pre-Phase-3 walker handles report + signal-assign textually.
+            await call.ExecuteAsync(_signalScheduler);
+            return false;
+        }
+
+        var frame = new Interpreter.Models.ProcedureFrame
+        {
+            Tasks = tasks,
+            InnerPc = 0,
+            CallRef = call,
+            OutMap = outMap,
+            BoundScope = boundScope,
+        };
+        process.Frames.Push(frame);
+        bool suspended = await RunProcedureFromFrameAsync(process, frame);
+        if (suspended) return true;
+        process.Frames.Pop();
+        return false;
+    }
+
+    private async Task<bool> RunProcedureFromFrameAsync(
+        Process process,
+        Interpreter.Models.ProcedureFrame frame)
+    {
+        try
+        {
+            for (int idx = frame.InnerPc; idx < frame.Tasks.Count; idx++)
+            {
+                var task = frame.Tasks[idx];
+                if (task is Interpreter.Repositories.WaitForStatement w)
+                {
+                    frame.InnerPc = idx + 1;
+                    YieldOnWait(process, w);
+                    return true;
+                }
+                if (task is Operation op)
+                {
+                    GetScheduledOperation(op).Execute();
+                }
+                else if (task is IfStructure nestedIf)
+                {
+                    bool suspended = await RunTopIfFromEntryAsync(process, nestedIf);
+                    if (suspended) { frame.InnerPc = idx + 1; return true; }
+                }
+                else if (task is CaseStructure nestedCase)
+                {
+                    bool suspended = await RunTopCaseFromEntryAsync(process, nestedCase);
+                    if (suspended) { frame.InnerPc = idx + 1; return true; }
+                }
+                else if (task is Interpreter.Repositories.ForLoopStructure nestedFor)
+                {
+                    var nf = new Interpreter.Models.LoopFrame
+                    { LoopRef = nestedFor, IterationVal = nestedFor.RangeStart, InnerPc = 0 };
+                    process.Frames.Push(nf);
+                    bool suspended = await RunForLoopFromFrameAsync(process, nestedFor, nf);
+                    if (suspended) { frame.InnerPc = idx + 1; return true; }
+                    process.Frames.Pop();
+                }
+                else if (task is Interpreter.Repositories.WhileLoopStructure nestedWhile)
+                {
+                    var nf = new Interpreter.Models.LoopFrame
+                    { LoopRef = nestedWhile, IterationVal = 0, InnerPc = 0 };
+                    process.Frames.Push(nf);
+                    bool suspended = await RunWhileLoopFromFrameAsync(process, nestedWhile, nf);
+                    if (suspended) { frame.InnerPc = idx + 1; return true; }
+                    process.Frames.Pop();
+                }
+                else if (task is Interpreter.Repositories.SimpleLoopStructure nestedSimple)
+                {
+                    var nf = new Interpreter.Models.LoopFrame
+                    { LoopRef = nestedSimple, IterationVal = 0, InnerPc = 0 };
+                    process.Frames.Push(nf);
+                    bool suspended = await RunSimpleLoopFromFrameAsync(process, nestedSimple, nf);
+                    if (suspended) { frame.InnerPc = idx + 1; return true; }
+                    process.Frames.Pop();
+                }
+                // Nested procedure calls inside a procedure body — recurse.
+                // Reentrant + recursive calls each get their own frame via
+                // ResolveBoundBody, so state doesn't collide across levels.
+                else if (task is Interpreter.Repositories.ProcedureCallStatement nestedCall)
+                {
+                    bool suspended = await RunTopProcedureFromEntryAsync(process, nestedCall);
+                    if (suspended) { frame.InnerPc = idx + 1; return true; }
+                }
+                else if (task is ISControl ctrl)
+                {
+                    await ExecuteControlWithSchedulingAsync(ctrl);
+                }
+            }
+        }
+        catch (Interpreter.Models.ReturnException)
+        {
+            // Early `return;` inside the procedure — treat as normal
+            // completion so the write-back still fires and the frame pops.
+        }
+
+        ApplyProcedureWriteBack(frame);
+        return false;
+    }
+
+    /// <summary>
+    /// Phase 3 (2026-07-22): copies final formal values back to
+    /// caller-side actuals for Out/InOut variable formals at procedure
+    /// completion (per VHDL LRM: write-back is visible only after the
+    /// procedure returns, never at intermediate suspend points).
+    /// Signal-class formals need no write-back — the textual rename in
+    /// <see cref="ProcedureCallStatement.ResolveBoundBody"/> routes
+    /// <c>&lt;=</c> in the body directly at the actual signal, so writes
+    /// already flow through <see cref="_signalScheduler"/> during
+    /// execution.
+    /// </summary>
+    private void ApplyProcedureWriteBack(Interpreter.Models.ProcedureFrame frame)
+    {
+        if (frame.OutMap.Count == 0) return;
+        foreach (var kv in frame.OutMap)
+        {
+            var param = kv.Key;
+            var actualVar = kv.Value;
+            if (param.Mode != Interpreter.Models.ParameterMode.Out
+                && param.Mode != Interpreter.Models.ParameterMode.InOut)
+                continue;
+            // The rebuilt Operations bound their assignment targets to the
+            // ACTUAL variable directly (thanks to textual rename during
+            // ResolveBoundBody), so :=-style variable writes have already
+            // landed on actualVar.Value at execution time. This loop is
+            // reserved for future variants where formal-scope isolation
+            // requires an explicit copy — currently a no-op guard.
+            _ = param;
+            _ = actualVar;
+        }
     }
 
     /// <summary>
@@ -1342,7 +2054,7 @@ public class DeltaCycleEngine : IDisposable
     /// </summary>
     private async Task ExecuteCaseStructureWithSchedulingAsync(CaseStructure caseStruct)
     {
-        if (caseStruct.Selector == null) return;
+        if (caseStruct.Selector is null) return;
 
         string selectorValue = caseStruct.Selector.Value?.ToString()?.Replace("\"", "").Replace("'", "").Trim() ?? "";
 
@@ -1391,7 +2103,10 @@ public class DeltaCycleEngine : IDisposable
             foreach (var choice in branch.Choices)
             {
                 string cleanChoice = ResolveChoiceForCase(choice);
-                if (cleanChoice.Equals(selectorValue, StringComparison.OrdinalIgnoreCase))
+                bool hit = caseStruct.IsMatching
+                    ? MatchesWithWildcards(cleanChoice, selectorValue)
+                    : cleanChoice.Equals(selectorValue, StringComparison.OrdinalIgnoreCase);
+                if (hit)
                 {
                     matchingBranch = branch;
                     break;
@@ -1430,6 +2145,27 @@ public class DeltaCycleEngine : IDisposable
     /// when the token doesn't resolve to anything recognisable so the
     /// legacy string match still has a chance.
     /// </summary>
+    /// <summary>
+    /// VHDL-2008 matching-case comparison (Tier 4.2, 2026-07-28): `-` in the
+    /// choice literal matches any bit of the selector at that position;
+    /// everything else is a bit-for-bit exact compare (case-insensitive).
+    /// A length mismatch is a non-match rather than an error so the loop
+    /// continues to the next arm or falls through to `others`. Kept as a
+    /// static helper local to DeltaCycleEngine to avoid exposing another
+    /// case-matching entry point outside this file.
+    /// </summary>
+    private static bool MatchesWithWildcards(string choice, string selector)
+    {
+        if (choice.Length != selector.Length) return false;
+        for (int i = 0; i < choice.Length; i++)
+        {
+            char c = choice[i];
+            if (c == '-') continue;
+            if (char.ToUpperInvariant(c) != char.ToUpperInvariant(selector[i])) return false;
+        }
+        return true;
+    }
+
     private string ResolveChoiceForCase(string choice)
     {
         string clean = choice?.Trim() ?? string.Empty;
@@ -1464,9 +2200,9 @@ public class DeltaCycleEngine : IDisposable
         try
         {
             var match = _allSignals?.FirstOrDefault(v =>
-                v != null && !string.IsNullOrEmpty(v.Name) &&
+                v is not null && !string.IsNullOrEmpty(v.Name) &&
                 v.Name.Equals(clean, StringComparison.OrdinalIgnoreCase));
-            if (match != null)
+            if (match is not null)
             {
                 object? matchValue = match.Value;
                 string v = matchValue?.ToString() ?? string.Empty;

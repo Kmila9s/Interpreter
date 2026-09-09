@@ -57,6 +57,14 @@ public class ScheduledOperation
                 var result = deferredFunc.Evaluate();
                 variables.Push(result);
             }
+            // Tier 4.1 close-out: twin of Operation.cs:256 — clocked writes
+            // of `sig'event`/`'last_value`/`'stable[(T)]` need the same
+            // dispatch here or the RHS item is silently skipped and the
+            // stack-count guard aborts at first fire (bench 149).
+            else if (item is Models.DeferredAttribute deferredAttr)
+            {
+                variables.Push(deferredAttr.Evaluate());
+            }
             // 2026-07-20: user-defined function whose body is registered.
             // Same shape as Operation.Execute — the schedular's loop is a
             // twin dispatch, both need the DeferredUserFunction branch or

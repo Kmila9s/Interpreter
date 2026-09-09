@@ -4,6 +4,7 @@ using Interpreter.Models;
 using Interpreter.Repositories;
 using Parser.Models;
 using Parser.Repositories;
+using Parser.Services;
 
 namespace Interpreter.Services;
 
@@ -167,9 +168,9 @@ public class Operation : IOperation {
                 var foundVar = this.Variables.Where(p => !ReferenceEquals(p, null)).FirstOrDefault(p =>
                     !string.IsNullOrEmpty(p.Name) &&
                     p.Name.Equals(baseName, StringComparison.OrdinalIgnoreCase));
-                if (foundVar != null) ResultBitIndex = bitIndex;
+                if (foundVar is not null) ResultBitIndex = bitIndex;
 
-                if (ReferenceEquals(foundVar, null))
+                if (foundVar is null)
                 {
                     if (isSignalAssignment)
                     {
@@ -246,6 +247,14 @@ public class Operation : IOperation {
             else if(item is Models.DeferredFunction deferredFunc){
                 var result = deferredFunc.Evaluate();
                 variables.Push(result);
+            }
+            // Tier 4.1 (2026-07-28): DeferredAttribute — `sig'event`,
+            // `'last_value`, `'stable[(T)]` re-evaluate against the live
+            // SignalAttributeHandler state each execute, mirroring the
+            // DeferredFunction path. Fixes the frozen-at-synth-time bug that
+            // made raw `clk'event and clk='1'` inside a wait-until unusable.
+            else if(item is Models.DeferredAttribute deferredAttr){
+                variables.Push(deferredAttr.Evaluate());
             }
             // 2026-07-20: user-defined function whose body is registered.
             // Evaluate re-parses each arg expression against the live scope
@@ -454,12 +463,13 @@ public class Operation : IOperation {
                 continue;
             }
 
-            // Check for signal attributes (e.g., clk'event)
+            // Check for signal attributes (e.g., clk'event). Tier 4.1: dynamic
+            // attributes now come back as DeferredAttribute so Execute() re-
+            // evaluates against live handler state; static ones stay Variable.
             var attributeResult = TryParseSignalAttribute(currentItem);
             if (attributeResult.isAttribute)
             {
-                item = attributeResult.variable;
-                items.Add(item);
+                items.Add(attributeResult.result);
                 _currentSyntetizeIndex++;
                 continue;
             }
@@ -598,24 +608,20 @@ public class Operation : IOperation {
 
     /// <summary>
     /// Attempts to parse a signal attribute expression like "clk'event".
+    /// Tier 4.1 (2026-07-28): dynamic attributes (`event`, `last_value`,
+    /// `stable`, `active`) return a <see cref="Models.DeferredAttribute"/>
+    /// so Execute() re-evaluates against live SignalAttributeHandler state;
+    /// static integer-class attributes (`length`/`high`/`low`/`left`/`right`)
+    /// still inline-evaluate to a plain Variable since their value is fixed
+    /// at declaration time.
     /// </summary>
     /// <param name="token">The token to parse.</param>
-    /// <returns>Tuple indicating if it's an attribute and the resulting variable.</returns>
-    private (bool isAttribute, Variable variable) TryParseSignalAttribute(string token)
+    /// <returns>Tuple of (isAttribute, result) where result is either a Variable (static attrs) or DeferredAttribute (dynamic).</returns>
+    private (bool isAttribute, object result) TryParseSignalAttribute(string token)
     {
-        // Check if token contains apostrophe (attribute indicator)
-        if (!token.Contains("'"))
-        {
-            return (false, null!);
-        }
-
+        if (!token.Contains("'")) return (false, null!);
         int apostropheIndex = token.IndexOf("'");
-
-        // Skip if starts with apostrophe (character literal)
-        if (apostropheIndex == 0)
-        {
-            return (false, null!);
-        }
+        if (apostropheIndex == 0) return (false, null!);
 
         string signalName = token[..apostropheIndex].Trim();
         string attributeName = token[(apostropheIndex + 1)..].Trim().ToLower();
@@ -626,58 +632,107 @@ public class Operation : IOperation {
         // tokens corrupted the surrounding function-call arg list and the
         // parser ran past `end architecture;` consuming tokens until EOF.
         string[] validAttributes = ["event", "last_value", "stable", "active", "length", "high", "low", "left", "right"];
+        if (!validAttributes.Contains(attributeName)) return (false, null!);
 
-        if (!validAttributes.Contains(attributeName))
-        {
-            return (false, null!);
-        }
-
-        // Find the signal
         var signal = Variables.FirstOrDefault(v => v.Name.Equals(signalName, StringComparison.OrdinalIgnoreCase));
-        if (signal == null)
+        if (signal is null) return (false, null!);
+
+        // Dynamic attributes: wrap in DeferredAttribute so Execute() re-evaluates.
+        if (attributeName is "event" or "last_value" or "stable" or "active")
         {
-            return (false, null!);
+            Constants.DATATYPES resultType = attributeName == "last_value"
+                ? signal.Type
+                : Constants.DATATYPES.BOOLEAN;
+
+            // Peek ahead for `'stable(T)` argument. VECTORS_ATTRIBUTES tokens
+            // glue as `sig'stable`; the (T) part arrives as separate tokens.
+            long? timeArg = null;
+            if (attributeName == "stable")
+                timeArg = TryConsumeStableTimeArg();
+
+            return (true, new Models.DeferredAttribute(signal, attributeName, resultType, timeArg));
         }
 
-        // Evaluate the attribute
-        var handler = SignalAttributeHandler.Instance;
+        // Static integer-class attributes — inline-evaluate a plain Variable.
         object attributeValue = attributeName switch
         {
-            "event"      => handler.GetEvent(signal),
-            "last_value" => handler.GetLastValue(signal),
-            "stable"     => handler.GetStable(signal),
-            "active"     => handler.GetActive(signal),
-            // Array / vector attributes return an integer derived from the
-            // signal's declared range. Static at runtime — VHDL forbids
-            // dynamic resizing.
-            "length"     => signal.Size,
-            "high"       => Math.Max(0, signal.Size - 1),
-            "low"        => 0,
-            "left"       => Math.Max(0, signal.Size - 1),
-            "right"      => 0,
-            _ => false
+            "length" => signal.Size,
+            "high"   => Math.Max(0, signal.Size - 1),
+            "low"    => 0,
+            "left"   => Math.Max(0, signal.Size - 1),
+            "right"  => 0,
+            _        => 0
         };
-
-        // Create a variable representing the attribute result. The boolean
-        // edge / stability attributes stay BOOLEAN; the integer-class ones
-        // promote to INTEGER so callers like `to_unsigned(N, x'length)`
-        // see them as a width literal.
-        Constants.DATATYPES resultType;
-        if (attributeName == "last_value")
-            resultType = signal.Type;
-        else if (attributeName is "length" or "high" or "low" or "left" or "right")
-            resultType = Constants.DATATYPES.INTEGER;
-        else
-            resultType = Constants.DATATYPES.BOOLEAN;
-
         var resultVar = new Variable(
             $"Attribute-{signalName}'{attributeName}",
-            attributeValue.ToString() ?? "false",
-            resultType
-        );
-        resultVar.PortType = Constants.PortType.OUT; // Allow in comparisons
-
+            attributeValue.ToString() ?? "0",
+            Constants.DATATYPES.INTEGER);
+        resultVar.PortType = Constants.PortType.OUT;
         return (true, resultVar);
+    }
+
+    /// <summary>
+    /// Tier 4.1: peek at tokens following a `'stable` attribute and consume
+    /// `(T)` if present, returning T as raw ns. The scale conversion into
+    /// the tick*1000+delta units used by <see cref="SignalHistory"/> and
+    /// <see cref="SignalAttributeHandler.OnDeltaCommit"/> happens inside
+    /// <c>SignalAttributeHandler.GetStable(sig, ns)</c> using the engine's
+    /// currently-registered <c>TickResolutionNs</c> (Tier 4.1 close-out —
+    /// non-1 ns bench resolutions were previously off by that factor).
+    /// </summary>
+    private long? TryConsumeStableTimeArg()
+    {
+        // Tokens after `sig'stable`: might be `(`, `10`, `ns`, `)` or none.
+        int nextIdx = _currentSyntetizeIndex + 1;
+        if (nextIdx >= _data.Length || _data[nextIdx] != "(") return null;
+
+        // Find the matching `)`.
+        int close = nextIdx + 1;
+        int depth = 1;
+        while (close < _data.Length && depth > 0)
+        {
+            if (_data[close] == "(") depth++;
+            else if (_data[close] == ")") depth--;
+            if (depth == 0) break;
+            close++;
+        }
+        if (close >= _data.Length) return null;
+
+        // Body between paren: expect `<number>` `<unit>` (2 tokens) or a
+        // single integer token. Anything else — abort and don't consume.
+        int bodyLen = close - nextIdx - 1;
+        long ns;
+        if (bodyLen == 2 &&
+            long.TryParse(_data[nextIdx + 1], out var qty))
+        {
+            string unit = _data[nextIdx + 2].ToLower();
+            ns = unit switch
+            {
+                "fs"  => qty / 1_000_000,
+                "ps"  => qty / 1_000,
+                "ns"  => qty,
+                "us"  => qty * 1_000,
+                "ms"  => qty * 1_000_000,
+                "sec" => qty * 1_000_000_000,
+                _     => qty
+            };
+        }
+        else if (bodyLen == 1 && long.TryParse(_data[nextIdx + 1], out var raw))
+        {
+            ns = raw;  // bare integer — treated as ns
+        }
+        else
+        {
+            return null;
+        }
+
+        // Advance past the (T) — the outer loop already does one ++ for the
+        // attribute token itself, so we need to skip (bodyLen + 2) more.
+        _currentSyntetizeIndex += bodyLen + 2;
+
+        // Return raw ns; scale to tick*1000+delta happens inside
+        // SignalAttributeHandler.GetStable using the engine's tick resolution.
+        return ns;
     }
 
     /// <summary>
@@ -718,7 +773,7 @@ public class Operation : IOperation {
                 string trimmedArg = arg.Trim();
                 // Try to find variable
                 var variable = Variables.FirstOrDefault(v => v.Name.Equals(trimmedArg, StringComparison.OrdinalIgnoreCase));
-                if (variable != null)
+                if (variable is not null)
                 {
                     args.Add(variable);
                 }
@@ -1279,9 +1334,9 @@ public class Operation : IOperation {
                     // index is a single identifier referring to an INTEGER
                     // variable in scope (typically a for-loop counter).
                     var candidate = Variables.FirstOrDefault(v =>
-                        v != null && !string.IsNullOrEmpty(v.Name) &&
+                        v is not null && !string.IsNullOrEmpty(v.Name) &&
                         v.Name.Equals(expr, StringComparison.OrdinalIgnoreCase));
-                    if (candidate != null && candidate.Type == Constants.DATATYPES.INTEGER)
+                    if (candidate is not null && candidate.Type == Constants.DATATYPES.INTEGER)
                     {
                         _pendingDynamicIndexSource = variable;
                         _pendingDynamicIndexVar = candidate;
