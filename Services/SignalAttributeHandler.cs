@@ -29,8 +29,9 @@ public class SignalAttributeHandler
     private readonly Dictionary<string, Variable> _byName = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>Signals that had a value change since the last tick-boundary reset (tick-scoped).</summary>
     private readonly Dictionary<Variable, bool> _activeFlags = new();
-    /// <summary>Timestamp (tick*1000+delta) of each signal's most recent transition, for `'stable(T)`.</summary>
-    private readonly Dictionary<Variable, int> _lastChangeMoments = new();
+    /// <summary>Timestamp (tick*1000+delta) of each signal's most recent transition, for `'stable(T)`.
+    /// <c>long</c> so it survives runs past ~21 ms (tick*1000 overflows int at tick ≈ 2.147M).</summary>
+    private readonly Dictionary<Variable, long> _lastChangeMoments = new();
     /// <summary>
     /// Tier 4.1 close-out: number of value transitions the signal has undergone in the
     /// current delta only. Populated by <see cref="OnDeltaCommit"/> and cleared at the
@@ -41,8 +42,9 @@ public class SignalAttributeHandler
     /// <c>rising_edge</c> depend on the flag surviving the whole tick.
     /// </summary>
     private readonly Dictionary<Variable, int> _deltaTransitionCount = new();
-    /// <summary>Current commit timestamp, updated by <see cref="OnDeltaCommit"/>. Used by GetStable(T).</summary>
-    private int _currentTimeMoment;
+    /// <summary>Current commit timestamp, updated by <see cref="OnDeltaCommit"/>. Used by GetStable(T).
+    /// <c>long</c> to match <see cref="_lastChangeMoments"/> — see the overflow note there.</summary>
+    private long _currentTimeMoment;
     /// <summary>Shadow of each signal's last-known value — updated in OnValueChange so we can
     /// recover the pre-transition value even for stimulus writes that bypass SignalScheduler.</summary>
     private readonly Dictionary<Variable, object> _shadowValues = new();
@@ -113,8 +115,8 @@ public class SignalAttributeHandler
     /// results. Does NOT touch <c>_activeFlags</c> — that's the OnValueChange path.
     /// </summary>
     /// <param name="oldValues">signal → value-immediately-before-this-delta.</param>
-    /// <param name="timeMoment">tick*1000+delta; same units as SignalHistory.</param>
-    public void OnDeltaCommit(IReadOnlyDictionary<Variable, object?> oldValues, int timeMoment)
+    /// <param name="timeMoment">tick*1000+delta (<c>long</c>, overflow-safe); same units as SignalHistory.</param>
+    public void OnDeltaCommit(IReadOnlyDictionary<Variable, object?> oldValues, long timeMoment)
     {
         _currentTimeMoment = timeMoment;
         foreach (var (sig, oldVal) in oldValues)
@@ -150,7 +152,7 @@ public class SignalAttributeHandler
     /// <c>DeltaCycleEngine.RunTimeStepAsync</c> once per tick, after
     /// <c>AdvanceTime</c>, with the set of stimulus-changed signals.
     /// </summary>
-    public void StampStimulusChanges(IEnumerable<Variable> signals, int timeMoment)
+    public void StampStimulusChanges(IEnumerable<Variable> signals, long timeMoment)
     {
         _currentTimeMoment = timeMoment;
         foreach (var sig in signals)
@@ -216,7 +218,7 @@ public class SignalAttributeHandler
     /// </summary>
     public bool GetStable(Variable signal, long elapsedNs)
     {
-        int last = _lastChangeMoments.GetValueOrDefault(signal, 0);
+        long last = _lastChangeMoments.GetValueOrDefault(signal, 0L);
         long elapsedRawUnits = (elapsedNs * 1000L) / Math.Max(1, _tickResolutionNs);
         return (_currentTimeMoment - last) >= elapsedRawUnits;
     }

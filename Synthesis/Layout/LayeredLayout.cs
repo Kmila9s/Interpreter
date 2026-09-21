@@ -76,8 +76,19 @@ public static class LayeredLayout
     // when staggering wire trunks. 8 covers the worst case in any
     // reasonable teaching example before the gap visibly fills up.
     private const int TrunkStaggerLanes = 8;
+    // Vertical gap between swimlane bands (one band per VHDL statement /
+    // process, keyed by Cell.SourceLine) in group-aware layout. Wide
+    // enough that adjacent group tint boxes never touch, so their labels
+    // stay legible.
+    private const double BandGap = 70;
 
-    public static LaidOutNetlist Layout(Netlist netlist)
+    /// <param name="groupAware">
+    /// When true (default) cells sharing a <c>Cell.SourceLine</c> are kept
+    /// in one contiguous horizontal band so the viewer's translucent group
+    /// tints stay compact and non-overlapping. When false, falls back to
+    /// the legacy per-column-centered placement.
+    /// </param>
+    public static LaidOutNetlist Layout(Netlist netlist, bool groupAware = true)
     {
         // 1. Build cell-to-cell adjacency from net producer/consumer maps.
         var producerOf = new Dictionary<string, string>(StringComparer.Ordinal); // netId → cellId producing it
@@ -156,32 +167,91 @@ public static class LayeredLayout
 
         // 4. Compute coordinates with left-to-right port placement:
         //    [LeftPortStrip] EdgePad [col0 ColGap col1 ...] EdgePad [RightPortStrip]
-        int rowsTall = columns.Count == 0 ? 0 : columns.Max(c => c.Count);
-        double bodyH = Math.Max(GateH, rowsTall * (GateH + RowGap));
+        //
+        //    Cells always keep their dataflow column (rank) for X. The two
+        //    branches below differ only in how Y is assigned:
+        //      - group-aware: one horizontal swimlane per Cell.SourceLine,
+        //        stacked in source-declaration order, so the viewer's group
+        //        tints are compact and never overlap.
+        //      - legacy: each column centered vertically on its own.
 
         // Port strips need enough vertical room to space ports out so
         // their labels don't collide. Each port gets a generous slot.
         var inPorts = netlist.Ports.Where(p => p.Direction is PortDir.In or PortDir.InOut).ToList();
         var outPorts = netlist.Ports.Where(p => p.Direction is PortDir.Out or PortDir.Buffer).ToList();
         double portMinH = Math.Max(inPorts.Count, outPorts.Count) * 50;
-        double interiorH = Math.Max(bodyH, portMinH);
 
+        double ColX(int col) => PortStripW + EdgePad + col * (GateW + ColGap);
         double canvasW = PortStripW + EdgePad + Math.Max(1, columns.Count) * GateW
             + Math.Max(0, columns.Count - 1) * ColGap + EdgePad + PortStripW;
-        double canvasH = TopPad + interiorH + BotPad;
 
         var cellBounds = new Dictionary<string, Rect>(StringComparer.Ordinal);
-        for (int col = 0; col < columns.Count; col++)
+        double interiorH;
+
+        if (groupAware && columns.Count > 0)
         {
-            int rows = columns[col].Count;
-            double colHeight = rows * (GateH + RowGap);
-            double y0 = TopPad + (interiorH - colHeight) / 2.0;
-            double colX = PortStripW + EdgePad + col * (GateW + ColGap);
-            for (int row = 0; row < rows; row++)
+            // Bands ordered by first appearance in declaration order so the
+            // diagram reads roughly top-to-bottom like the source VHDL.
+            var bandOrder = new List<string>();
+            var seenBand = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var c in netlist.Cells)
             {
-                cellBounds[columns[col][row]] = new Rect(colX, y0 + row * (GateH + RowGap), GateW, GateH);
+                var key = c.SourceLine ?? "";
+                if (seenBand.Add(key)) bandOrder.Add(key);
+            }
+
+            double slot = GateH + RowGap;
+            double y = TopPad;
+            foreach (var band in bandOrder)
+            {
+                // Per-column cell lists for this band, each ordered by the
+                // global barycenter row index from step 3 so intra-band
+                // crossings stay low.
+                var perCol = new List<string>[columns.Count];
+                int bandRows = 0;
+                for (int col = 0; col < columns.Count; col++)
+                {
+                    var list = columns[col]
+                        .Where(id => (byCellId[id].SourceLine ?? "") == band)
+                        .OrderBy(id => rowIndex[id])
+                        .ToList();
+                    perCol[col] = list;
+                    bandRows = Math.Max(bandRows, list.Count);
+                }
+                if (bandRows == 0) continue;
+
+                double bandH = bandRows * GateH + Math.Max(0, bandRows - 1) * RowGap;
+                for (int col = 0; col < columns.Count; col++)
+                {
+                    var list = perCol[col];
+                    // Center this column's cells within the band's rows so a
+                    // single-cell column lines up with taller neighbours.
+                    double off = (bandRows - list.Count) / 2.0 * slot;
+                    for (int r = 0; r < list.Count; r++)
+                        cellBounds[list[r]] = new Rect(ColX(col), y + off + r * slot, GateW, GateH);
+                }
+                y += bandH + BandGap;
+            }
+            // Drop the trailing BandGap added after the last band.
+            double bodyH = Math.Max(GateH, y - TopPad - BandGap);
+            interiorH = Math.Max(bodyH, portMinH);
+        }
+        else
+        {
+            int rowsTall = columns.Count == 0 ? 0 : columns.Max(c => c.Count);
+            double bodyH = Math.Max(GateH, rowsTall * (GateH + RowGap));
+            interiorH = Math.Max(bodyH, portMinH);
+            for (int col = 0; col < columns.Count; col++)
+            {
+                int rows = columns[col].Count;
+                double colHeight = rows * (GateH + RowGap);
+                double y0 = TopPad + (interiorH - colHeight) / 2.0;
+                for (int row = 0; row < rows; row++)
+                    cellBounds[columns[col][row]] = new Rect(ColX(col), y0 + row * (GateH + RowGap), GateW, GateH);
             }
         }
+
+        double canvasH = TopPad + interiorH + BotPad;
 
         // 5. Pin positions: inputs distributed along the cell's left edge,
         //    output(s) along the right.
@@ -239,6 +309,10 @@ public static class LayeredLayout
             // Pick the trunk x: the midpoint between the source and the
             // sink whose x is closest to the source. Then stagger by net
             // ordinal in this gap so adjacent nets get different lanes.
+            // (Empirically the midpoint beats trunk-near-source and
+            // trunk-near-sink on both wire length and crossings for the
+            // swimlane layout — moving the trunk to either side pushes the
+            // long horizontal onto occupied cell rows.)
             double avgSinkX = sinks.Average(s => s.X);
             double rawTrunk = (sx + avgSinkX) / 2.0;
             int gapKey = (int)Math.Round(rawTrunk / 5); // bucket into 5-px columns

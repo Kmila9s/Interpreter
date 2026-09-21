@@ -12,8 +12,17 @@ public class SignalHistory
     /// The raw signal history data.
     /// Key: Variable (signal)
     /// Value: List of (timeMoment, value) tuples
+    ///
+    /// timeMoment is <c>long</c> (widened from <c>int</c>, 2026-09-13): the
+    /// engine encodes it as <c>tick*1000 + delta</c>, which overflows a 32-bit
+    /// int past tick ~2.1M (~21 ms at 10 ns/tick), corrupting waveform/VCD
+    /// timestamps on long (seconds-scale) runs. This is a storage/observability
+    /// width change only — it does NOT touch simulation semantics: the
+    /// SignalAttributeHandler path (<c>'stable(T)</c>, <c>'last_value</c>) keeps
+    /// its own int timestamp untouched, so on short runs (no overflow) every
+    /// exported value and timestamp is byte-identical to before.
     /// </summary>
-    private readonly Dictionary<Variable, List<Tuple<int, object>>> _history = new();
+    private readonly Dictionary<Variable, List<Tuple<long, object>>> _history = new();
 
     /// <summary>
     /// Phase B+ Deep AST (2026-05-19): parallel list of 1-based source
@@ -45,7 +54,7 @@ public class SignalHistory
     /// previous version cloned the entire map (multi-MB on long sims) on
     /// every property read.
     /// </summary>
-    public IReadOnlyDictionary<Variable, List<Tuple<int, object>>> RawHistory
+    public IReadOnlyDictionary<Variable, List<Tuple<long, object>>> RawHistory
     {
         get
         {
@@ -62,13 +71,13 @@ public class SignalHistory
     /// <param name="signal">The signal to track.</param>
     /// <param name="initialTime">The initial time moment (default 0).</param>
     /// <param name="recordInitial">Whether to record the initial value.</param>
-    public void RegisterSignal(Variable signal, int initialTime = 0, bool recordInitial = true)
+    public void RegisterSignal(Variable signal, long initialTime = 0, bool recordInitial = true)
     {
         lock (_lock)
         {
             if (!_history.ContainsKey(signal))
             {
-                _history[signal] = new List<Tuple<int, object>>();
+                _history[signal] = new List<Tuple<long, object>>();
                 _sourceLines[signal] = new List<int>();
 
                 if (recordInitial)
@@ -86,7 +95,7 @@ public class SignalHistory
     /// <param name="signals">The signals to track.</param>
     /// <param name="initialTime">The initial time moment.</param>
     /// <param name="recordInitial">Whether to record initial values.</param>
-    public void RegisterSignals(IEnumerable<Variable> signals, int initialTime = 0, bool recordInitial = true)
+    public void RegisterSignals(IEnumerable<Variable> signals, long initialTime = 0, bool recordInitial = true)
     {
         foreach (var signal in signals)
         {
@@ -100,7 +109,7 @@ public class SignalHistory
     /// <param name="signal">The signal that changed.</param>
     /// <param name="timeMoment">The time moment (tick * 1000 + delta, or custom scheme).</param>
     /// <param name="value">The new value.</param>
-    public void RecordChange(Variable signal, int timeMoment, object value)
+    public void RecordChange(Variable signal, long timeMoment, object value)
     {
         RecordChange(signal, timeMoment, value, sourceLine: 0);
     }
@@ -110,7 +119,7 @@ public class SignalHistory
     /// 1-based source line of the operation that produced it. <c>sourceLine
     /// = 0</c> means unknown; the back-compat overload above forwards 0.
     /// </summary>
-    public void RecordChange(Variable signal, int timeMoment, object value, int sourceLine)
+    public void RecordChange(Variable signal, long timeMoment, object value, int sourceLine)
     {
         if (!IsRecording) return;
 
@@ -118,7 +127,7 @@ public class SignalHistory
         {
             if (!_history.ContainsKey(signal))
             {
-                _history[signal] = new List<Tuple<int, object>>();
+                _history[signal] = new List<Tuple<long, object>>();
                 _sourceLines[signal] = new List<int>();
             }
 
@@ -132,7 +141,7 @@ public class SignalHistory
     /// </summary>
     /// <param name="signal">The signal to record.</param>
     /// <param name="timeMoment">The time moment.</param>
-    public void RecordCurrentValue(Variable signal, int timeMoment)
+    public void RecordCurrentValue(Variable signal, long timeMoment)
     {
         RecordChange(signal, timeMoment, signal.Value);
     }
@@ -142,7 +151,7 @@ public class SignalHistory
     /// </summary>
     /// <param name="signals">The signals that changed.</param>
     /// <param name="timeMoment">The time moment.</param>
-    public void RecordChanges(IEnumerable<Variable> signals, int timeMoment)
+    public void RecordChanges(IEnumerable<Variable> signals, long timeMoment)
     {
         foreach (var signal in signals)
         {
@@ -157,7 +166,7 @@ public class SignalHistory
     /// dictionary value. Used by <see cref="DeltaCycleEngine"/> after each
     /// delta when it knows which operation produced each change.
     /// </summary>
-    public void RecordChangesWithLines(IReadOnlyDictionary<Variable, int> signalsWithLines, int timeMoment)
+    public void RecordChangesWithLines(IReadOnlyDictionary<Variable, int> signalsWithLines, long timeMoment)
     {
         // F-G-08 pass 2 (2026-07-16): hoist the per-entry IsRecording check
         // out of the loop. Pass 1's KMILA_SIM_NO_HISTORY=1 opt-out flipped
@@ -177,13 +186,13 @@ public class SignalHistory
     /// extended with the source-line column. Returns an empty list when the
     /// signal isn't tracked.
     /// </summary>
-    public List<(int TimeMoment, object Value, int SourceLine)> GetSignalHistoryDetailed(Variable signal)
+    public List<(long TimeMoment, object Value, int SourceLine)> GetSignalHistoryDetailed(Variable signal)
     {
         lock (_lock)
         {
             if (!_history.TryGetValue(signal, out var hist)) return new();
             _sourceLines.TryGetValue(signal, out var lines);
-            var result = new List<(int, object, int)>(hist.Count);
+            var result = new List<(long, object, int)>(hist.Count);
             for (int i = 0; i < hist.Count; i++)
             {
                 int line = (lines != null && i < lines.Count) ? lines[i] : 0;
@@ -198,15 +207,15 @@ public class SignalHistory
     /// </summary>
     /// <param name="signal">The signal to query.</param>
     /// <returns>List of (time, value) tuples, or empty list if not tracked.</returns>
-    public List<Tuple<int, object>> GetSignalHistory(Variable signal)
+    public List<Tuple<long, object>> GetSignalHistory(Variable signal)
     {
         lock (_lock)
         {
             if (_history.TryGetValue(signal, out var history))
             {
-                return new List<Tuple<int, object>>(history);
+                return new List<Tuple<long, object>>(history);
             }
-            return new List<Tuple<int, object>>();
+            return new List<Tuple<long, object>>();
         }
     }
 
@@ -217,7 +226,7 @@ public class SignalHistory
     /// Returns the new high-water index (i.e. the current Count) so the
     /// caller can pass it back next time.
     /// </summary>
-    public int ReadSince(Variable signal, int fromIndex, Action<int, object> onEntry)
+    public int ReadSince(Variable signal, int fromIndex, Action<long, object> onEntry)
     {
         lock (_lock)
         {
@@ -238,7 +247,7 @@ public class SignalHistory
     /// </summary>
     /// <param name="signalName">The signal name.</param>
     /// <returns>List of (time, value) tuples, or empty list if not found.</returns>
-    public List<Tuple<int, object>> GetSignalHistoryByName(string signalName)
+    public List<Tuple<long, object>> GetSignalHistoryByName(string signalName)
     {
         lock (_lock)
         {
@@ -247,9 +256,9 @@ public class SignalHistory
 
             if (signal is not null)
             {
-                return new List<Tuple<int, object>>(_history[signal]);
+                return new List<Tuple<long, object>>(_history[signal]);
             }
-            return new List<Tuple<int, object>>();
+            return new List<Tuple<long, object>>();
         }
     }
 
@@ -260,7 +269,7 @@ public class SignalHistory
     /// <param name="signal">The signal to query.</param>
     /// <param name="timeMoment">The time moment.</param>
     /// <returns>The value at that time, or null if not found.</returns>
-    public object? GetValueAtTime(Variable signal, int timeMoment)
+    public object? GetValueAtTime(Variable signal, long timeMoment)
     {
         lock (_lock)
         {
@@ -268,7 +277,7 @@ public class SignalHistory
                 return null;
 
             // Find the most recent value at or before the specified time
-            Tuple<int, object>? result = null;
+            Tuple<long, object>? result = null;
             foreach (var entry in history)
             {
                 if (entry.Item1 <= timeMoment)
@@ -313,12 +322,12 @@ public class SignalHistory
     /// Gets the time range of recorded data.
     /// </summary>
     /// <returns>Tuple of (minTime, maxTime), or (0, 0) if no data.</returns>
-    public (int minTime, int maxTime) GetTimeRange()
+    public (long minTime, long maxTime) GetTimeRange()
     {
         lock (_lock)
         {
-            int minTime = int.MaxValue;
-            int maxTime = int.MinValue;
+            long minTime = long.MaxValue;
+            long maxTime = long.MinValue;
 
             foreach (var history in _history.Values)
             {
@@ -329,7 +338,7 @@ public class SignalHistory
                 }
             }
 
-            if (minTime == int.MaxValue)
+            if (minTime == long.MaxValue)
                 return (0, 0);
 
             return (minTime, maxTime);

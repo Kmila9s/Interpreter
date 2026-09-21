@@ -52,7 +52,9 @@ This specific module, the **VHDL Interpreter**, is the execution engine of the s
 *   **Custom types:** `TypeDefinition` + `TypeRegistry` cover enumerations, arrays, records, and subtypes. `TypeRegistry` is consulted by `VariableSyntetizer`, `Operation`, `FunctionExecutor`, and `Resources`.
 *   **FPGA resource estimation:** `Resources` produces flip-flop, LUT, DSP, BRAM, I/O, and clock-domain estimates per entity; consumed by the FPGA fit chip in the Editor's status bar.
 *   **Progress / cancellation:** `ProgressReporter` (singleton, event-based) drives Editor build-status UI; `CancellationToken` is threaded through the synthesis and run pipeline.
-*   **Test status:** A historic 80 % (16/20) pass rate is documented below in the changelog. The current pass rate has not been re-measured as part of this documentation pass and may have shifted as new features landed — re-run `Program.cs` against the `test*.vhdl` corpus to confirm.
+*   **Test status:** Two independent test surfaces exist today (see §7):
+    1.  The historic console corpus driven by `Program.cs` — now **54 `test*.vhdl` fixtures** (numbered through `test41`, plus named variants) — of which the old *80 % (16/20)* figure quoted in the changelog is a **v0.15.0 snapshot over the first 20 fixtures only** and has **not** been re-measured since; re-run `Program.cs` against the corpus to obtain a current number.
+    2.  A first-class **xUnit suite under `Interpreter/Tests/`** (`DeltaCycleEngineTests`, `SynthesisTests`, `NestedIEEECallTests`, `IEEEPrimitivesTests`, `IEEELibraryLoaderTests`, `IEEELoweringEndToEndTests`, `LibraryCompilerTests`, `PortStrictnessTests`, `PracticeExerciseTests`, `VcdComparison`) run via `dotnet test`. This is the authoritative regression surface; the console corpus is a smoke/exploration harness.
 
 ### Core Responsibilities
 *   **Expression Evaluation:** Calculating results of arithmetic, logical, and relational operations using the Shunting-yard algorithm with proper operator precedence
@@ -157,7 +159,16 @@ Models
 ├── FunctionDefinition      - User-defined function signature and body
 ├── ProcedureDefinition     - User-defined procedure signature and body
 ├── ParameterDefinition     - Function/procedure parameter metadata
-├── DeferredFunction        - Runtime-evaluated function call
+├── DeferredFunction        - Runtime-evaluated IEEE/known function call
+├── DeferredUserFunction    - Runtime-evaluated *user-defined* function call
+├── DeferredExpression      - Sub-expression whose evaluation is deferred to run time
+├── DeferredAttribute       - Signal/array attribute resolved at run time (Tier 4.1)
+├── DeferredIndex           - Deferred array/vector index resolution
+├── DynamicIndex            - Run-time-computed index into an array/vector
+├── IProcessFrame           - Interface for the sequential-execution frame stack
+├── BranchFrame             - Frame for an in-flight if/elsif/case branch
+├── LoopFrame               - Frame for an in-flight for/while/loop iteration
+├── ProcedureFrame          - Frame for an in-flight procedure call
 ├── ControlExceptions       - ExitException, NextException, ReturnException
 ├── SimulationConfig        - Entity + ticks + clocks + stimuli (input to SimulationRunner)
 ├── ClockConfig             - Auto-toggling clock spec (signal + half-period + initial state)
@@ -182,9 +193,18 @@ Synthesis Namespace (Interpreter.Synthesis) - behavioral → structural lowering
 └── Layout/LayeredLayout         - Sugiyama-style placement → LaidOutNetlist (rects + wire paths)
 
 Façade
-└── SimulationRunner             - Public IDisposable runner: RunAsync(SimulationConfig),
-                                   Pause / Resume / Stop, events
-                                   (OnProgressChanged, OnSimulationEnded, OnError)
+├── ISimulationRunner            - Shared surface of the two interchangeable run drivers
+│                                  (Engine, IsRunning/IsPaused, Pause/Resume/Stop, the
+│                                  OnProgressChanged/OnSimulationEnded/OnError/OnEngineReady/
+│                                  OnReport events). Lets callers (e.g. ProgramBuilder) pick a
+│                                  runner at run time without branching on the concrete type.
+├── SimulationRunner             - "Visual/Slow mode" IDisposable runner: visits every tick
+│                                  0..totalTicks. RunAsync(SimulationConfig), Pause/Resume/Stop.
+└── FastSimulationRunner         - "Fast mode" sibling: drives the SAME DeltaCycleEngine but
+                                   jumps straight to the next tick where something can happen
+                                   (clock edge / stimulus / scheduled update / process wake),
+                                   skipping idle ticks. Same public surface as SimulationRunner;
+                                   verified byte-identical to it by VCD diff across a corpus.
 
 Placeholder
 └── Services/DataStructure       - Reserved for future complex data-structure ops
@@ -231,7 +251,7 @@ Placeholder
 *   **`DeltaCycleEngine.cs`**: Coordinates VHDL delta cycle simulation with process scheduling, signal updates, and time advancement. Live-replay hooks: `OnFrameEmitted(FrameEmittedArgs)` (per-delta changed signals + their source lines), `Pause()`/`Resume()`/`StepOneDelta()`, `History`, and — 2026-05-27 — `OnConditionEvaluated(int line)` which fires when an `if`/`elsif` branch is taken or a `case` arm matches, so breakpoints can pause on a condition line that has no signal assignment.
 *   **`SignalScheduler.cs`**: Manages signal update scheduling for current and future delta cycles (`after` clause support)
 *   **`ProcessScheduler.cs`**: Manages process execution scheduling based on sensitivity lists
-*   **`SignalHistory.cs`**: Records signal value changes over time for waveform export (VCD, CSV, Text)
+*   **`SignalHistory.cs`**: Records signal value changes over time for waveform export (VCD, CSV, Text). Timestamps are `long` (`tick*1000+delta`); widened from `int` on 2026-09-13 so seconds-scale runs no longer overflow at ~21 ms. Storage-only — the `SignalAttributeHandler` semantics path keeps its own `int` timestamp, so short-run output is byte-identical.
 
 **Services and Registries:**
 *   **`StandardFunctions.cs`**: Implements IEEE standard library functions (edge detection, type conversions, vector operations)
@@ -1030,9 +1050,31 @@ foreach (var entity in entities)
 
 ## 7. Testing
 
-### Test Suite Overview
+There are **two test surfaces** today:
 
-The interpreter includes 20 comprehensive VHDL test files:
+#### 7.1. xUnit regression suite (`Interpreter/Tests/`) — authoritative
+
+Run with `dotnet test`. This is the surface to trust for regressions:
+
+| Test file | Focus |
+|-----------|-------|
+| `DeltaCycleEngineTests` | Delta-cycle scheduling, signal updates, time advancement |
+| `SynthesisTests` | Behavioral → structural lowering (netlist correctness) |
+| `NestedIEEECallTests` | Nested IEEE function calls (e.g. `to_integer(unsigned(...))`) |
+| `IEEEPrimitivesTests` | IEEE-function → primitive-cell lowering table |
+| `IEEELibraryLoaderTests` / `IEEELoweringEndToEndTests` | IEEE library load + end-to-end lowering |
+| `LibraryCompilerTests` | Cross-module LibraryCompiler resolution/build |
+| `PortStrictnessTests` | Port direction / connectivity strictness |
+| `PracticeExerciseTests` | Practice-grader integration cases |
+| `VcdComparison` | VCD golden comparison (waveform equivalence) |
+
+> The `FastSimulationRunner` ↔ `SimulationRunner` byte-for-byte equivalence is covered by VCD-diff / equivalence tests (see the `Fast mode` notes in §2).
+
+#### 7.2. Console corpus (`test*.vhdl`, driven by `Program.cs`) — smoke/exploration
+
+The corpus has grown to **54 `test*.vhdl` fixtures** (numbered through `test41`, plus named variants). It is a smoke/exploration harness, not a pass/fail gate. Rough coverage of the first fixtures:
+
+> **Repository hygiene:** the module root also carries leftover scratch artifacts that are **not part of the build or either test surface** — `Program.cs.1` (a stale copy of `Program.cs`), `run_delta_tests.cs`, and several loose golden/scratch VCDs (`counter_sim.vcd`, `reference_*.vcd`, `test_*.vcd`). They can be ignored/removed during cleanup; the authoritative VCD goldens used by tests live under `Interpreter/Tests/`.
 
 | Tests | Coverage |
 |-------|----------|
@@ -1042,11 +1084,14 @@ The interpreter includes 20 comprehensive VHDL test files:
 | **test12-test15** | Functions, procedures, signal attributes |
 | **test16** | Port expressions with generic parameters |
 | **test17-test20** | Advanced features (components, buses, GPIO controllers) |
+| **test21-test41 + variants** | Later fixtures added alongside engine/synthesis work (not individually catalogued here) |
 
-### Current Test Results (v0.15.0)
+##### Historic snapshot (v0.15.0) — NOT re-measured since
+
+The figures below are a **v0.15.0 snapshot over the first 20 fixtures only** and have **not** been re-measured; treat them as historical, not current. Re-run `Program.cs` to obtain a fresh number.
 
 ```
-✓ Passing: 16/20 tests (80%)
+✓ Passing: 16/20 tests (80%)  [v0.15.0, first-20 corpus, historical]
 ✗ Failing: 4/20 tests (20%)
 
 Passing tests: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 15, 17, 18, 19

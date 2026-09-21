@@ -7,7 +7,7 @@ namespace Interpreter.Services;
 /// Drives DeltaCycleEngine at full CPU speed for cycle-accurate simulation.
 /// Bypasses TimeMachine's 10ms-per-tick delay for fast batch simulation.
 /// </summary>
-public class SimulationRunner : IDisposable
+public class SimulationRunner : IDisposable, ISimulationRunner
 {
     private DeltaCycleEngine? _engine;
     private CancellationTokenSource _cts = new();
@@ -255,7 +255,8 @@ public class SimulationRunner : IDisposable
 
                 if (directlyChanged.Count > 0)
                 {
-                    _engine.History.RecordChanges(directlyChanged, (int)(tick * 1000));
+                    // long: tick*1000 overflows int past ~21 ms (tick ≈ 2.147M).
+                    _engine.History.RecordChanges(directlyChanged, (long)tick * 1000);
                 }
 
                 // Advance time and run delta cycles
@@ -287,7 +288,7 @@ public class SimulationRunner : IDisposable
             // the full run duration as the student expects.
             if (totalTicks > 0 && _engine?.History != null)
             {
-                _engine.History.RecordChanges(allSignals, (int)((totalTicks - 1) * 1000));
+                _engine.History.RecordChanges(allSignals, (long)(totalTicks - 1) * 1000);
             }
 
             OnProgressChanged?.Invoke(100.0);

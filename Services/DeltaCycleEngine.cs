@@ -145,6 +145,17 @@ public class DeltaCycleEngine : IDisposable
     }
 
     /// <summary>
+    /// Read-only: the earliest tick at which a wait-driven process is queued to
+    /// wake, or <c>null</c> when none are pending. Mirrors
+    /// <see cref="SignalScheduler.NextScheduledTick"/> so an event-driven driver
+    /// (e.g. the fast runner) can jump straight to the next interesting tick
+    /// without skipping a <c>wait for</c>. Pure accessor — advances nothing and
+    /// changes no simulation state, so engine behaviour/output is unaffected.
+    /// </summary>
+    public ulong? NextProcessWakeTick =>
+        _pendingProcessWakes.Count > 0 ? _pendingProcessWakes.Keys.First() : (ulong?)null;
+
+    /// <summary>
     /// F-G-13b: register a condition-blocked process under each signal in
     /// the wait's sensitivity set.
     /// </summary>
@@ -626,7 +637,7 @@ public class DeltaCycleEngine : IDisposable
                 // signals (clocks, external ports) bypass that path but flip
                 // `_activeFlags` via OnValueChange. Attribute the change to
                 // the tick just entered (delta 0).
-                int stimulusTimeMoment = (int)(_currentTick * 1000);
+                long stimulusTimeMoment = (long)_currentTick * 1000;
                 handler.StampStimulusChanges(changedSignals, stimulusTimeMoment);
             }
 
@@ -815,8 +826,15 @@ public class DeltaCycleEngine : IDisposable
         var changedSignals = new HashSet<Variable>(changedWithLines.Keys);
 
         // 5. Record signal changes in history with source-line metadata.
-        // Time moment = tick * 1000 + delta (allows for up to 1000 delta cycles per tick)
-        int timeMoment = (int)(_currentTick * 1000) + _currentDelta;
+        // Time moment = tick * 1000 + delta (allows for up to 1000 delta cycles per tick).
+        //
+        // Both the history AND the attribute path use a `long` timestamp: on
+        // seconds-scale runs `tick*1000` overflows a 32-bit int (~21 ms at
+        // 10 ns/tick). History was widened 2026-09-13; the attribute path is
+        // widened now (2026-09-13 follow-up) so `'stable(T)` / `'last_value` /
+        // `'event` timing stays correct past 21 ms instead of aliasing on the
+        // wrapped int. Runs under 21 ms are unaffected (identical values).
+        long timeMoment = (long)_currentTick * 1000 + _currentDelta;
         _signalHistory.RecordChangesWithLines(changedWithLines, timeMoment);
 
         // 5b. Tier 4.1: refresh signal-attribute state at delta granularity.
