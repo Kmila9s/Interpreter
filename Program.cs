@@ -117,6 +117,7 @@ class Program
         if (testFiles.Length == 0)
         {
             Console.WriteLine("No test*.vhdl files found in: " + currentDir);
+            Environment.ExitCode = 1;
             return;
         }
 
