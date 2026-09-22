@@ -1,6 +1,7 @@
 obj/
 bin/
-*.vhdl
 .vscode/
 launch.json
 task.json
+*.cs.*
+.codeviz/
