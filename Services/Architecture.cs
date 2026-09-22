@@ -75,6 +75,14 @@ public class Architecture : ISControl, IControl
     private DeltaCycleEngine? _deltaEngine;
 
     /// <summary>
+    /// Guard contexts for the enclosing <c>block</c> statements currently being
+    /// synthesized, innermost on top. A <c>guarded</c> concurrent assignment is
+    /// gated on the guard of the innermost enclosing guarded block (see
+    /// <see cref="SyntetizeAssingationsInner"/>). Empty outside any block.
+    /// </summary>
+    private readonly Stack<BlockStatement> _blockStack = new();
+
+    /// <summary>
     /// Initializes a new instance of the <see cref="Architecture"/> class.
     /// </summary>
     /// <param name="Ports">The ports of the entity.</param>
@@ -325,6 +333,25 @@ public class Architecture : ISControl, IControl
                 throw new InvalidOperationException($"Architecture parsing exceeded {MAX_ITERATIONS} iterations - possible infinite loop");
             }
 
+            SyntetizeOneStatement(cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Synthesizes exactly one concurrent statement at the current stream position
+    /// and appends it to <see cref="Tasks"/>. Shared by <see cref="SyntetizeBehaviour"/>
+    /// (the architecture body) and <see cref="HandleBlockStatement"/> (a block body),
+    /// so both parse the same set of constructs identically — including nested blocks.
+    /// The active scope is <see cref="_assignmentVariables"/> (== <c>comparators</c>,
+    /// the shared backing set), which block-local signals are merged into so nested
+    /// constructs see them.
+    /// </summary>
+    private void SyntetizeOneStatement(CancellationToken cancellationToken)
+    {
+        // Scope for every sub-construct. Set by SyntetizeBehaviour before the loop;
+        // block-local signals are added to this same backing set as blocks open.
+        HashSet<Variable> comparators = _assignmentVariables ?? [.. _ports, .. _generics, .. _signals];
+        {
             // Check for labeled statements (label : process/for/if/etc or component instantiation)
             if (_streamer.Current?.Type == IDENTIFIERS)
             {
@@ -345,7 +372,11 @@ public class Architecture : ISControl, IControl
                                 Process process = new(comparators, _streamer);
                                 process.Syntetize(cancellationToken);
                                 Tasks.Add(process);
-                                continue;
+                                return;
+                            case "block":
+                                // VHDL block statement (guarded or plain, possibly nested).
+                                HandleBlockStatement(label, cancellationToken);
+                                return;
                             case "for":
                                 // For-generate. Nested or feature-rich generate blocks
                                 // (multi-level nesting, embedded processes, with/select
@@ -363,7 +394,7 @@ public class Architecture : ISControl, IControl
                                 {
                                     SkipGenerateBody(label);
                                 }
-                                continue;
+                                return;
                             case "if":
                                 // If-generate — same skip-on-failure policy as for-generate.
                                 try
@@ -376,7 +407,7 @@ public class Architecture : ISControl, IControl
                                 {
                                     SkipGenerateBody(label);
                                 }
-                                continue;
+                                return;
                             case "entity":
                                 // Direct-entity instantiation with the VHDL-2008 form:
                                 //   label : entity <lib>.<name>[(<arch>)] [generic map (...)] port map (...);
@@ -399,10 +430,10 @@ public class Architecture : ISControl, IControl
                                 {
                                     SkipToSemicolon();
                                 }
-                                continue;
+                                return;
                             default:
                                 _streamer.MoveNext();
-                                continue;
+                                return;
                         }
                     }
                     else if (_streamer.Current?.Type == IDENTIFIERS)
@@ -423,7 +454,7 @@ public class Architecture : ISControl, IControl
                         {
                             SkipToSemicolon();
                         }
-                        continue;
+                        return;
                     }
                 }
                 else
@@ -468,6 +499,191 @@ public class Architecture : ISControl, IControl
                 SyntetizeAssingations();
             }
         }
+    }
+
+    /// <summary>
+    /// Synthesizes a VHDL <c>block</c> statement at the current stream position
+    /// (the cursor sits on the <c>block</c> keyword). The block is <em>flattened</em>
+    /// into the enclosing architecture: its local signals are hoisted into the shared
+    /// scope and its concurrent statements are appended to <see cref="Tasks"/>. A guard
+    /// expression, if present, is captured and used to gate guarded assignments inside
+    /// the block (see <see cref="SyntetizeAssingationsInner"/> and
+    /// <see cref="BlockStatement.BuildGuardedRhs"/>). Nested blocks are handled by
+    /// recursion through <see cref="SyntetizeOneStatement"/>.
+    /// </summary>
+    /// <remarks>
+    /// On any failure the whole block body is skipped via <see cref="SkipBlockBody"/>
+    /// so a block shape we can't fully synthesize degrades gracefully instead of
+    /// aborting the architecture — mirroring the for/if-generate skip-on-failure policy.
+    /// </remarks>
+    private void HandleBlockStatement(string label, CancellationToken cancellationToken)
+    {
+        bool pushed = false;
+        try
+        {
+            HashSet<Variable> scope = _assignmentVariables ?? [.. _ports, .. _generics, .. _signals];
+
+            _streamer.Expect(KEYWORDS); // consume 'block'
+
+            var block = new BlockStatement(label);
+
+            // Optional guard expression: block (guard_expression)
+            if (_streamer.Current?.Value == "(")
+                block.GuardExpression = CaptureGuardExpression();
+
+            // Local declarative part (signals/constants) before 'begin'. The
+            // VariableSyntetizer stops at its default "begin" breaker. Hoist the
+            // parsed signals into the architecture's signal set and the live scope
+            // so the block body — and any nested constructs — resolve them.
+            if (_streamer.Current != null && _streamer.Current.Value.ToLower() != "begin")
+            {
+                VariableSyntetizer blockSignals = new(_streamer, scope, IsSignal: true, TypeRegistry: CustomTypes);
+                blockSignals.Syntetize(cancellationToken);
+                foreach (var v in blockSignals.Variables)
+                {
+                    if (_signals.Add(v))
+                        block.LocalSignals.Add(v);
+                    scope.Add(v);
+                }
+                foreach (var typeDef in blockSignals.ParsedTypes.Types.Values)
+                    CustomTypes.TryRegister(typeDef);
+            }
+
+            _streamer.Expect(KEYWORDS); // consume 'begin'
+
+            _blockStack.Push(block);
+            pushed = true;
+
+            // Body: parse concurrent statements until the block's own 'end'.
+            // Each sub-parser consumes its own 'end process/if/generate/block', so
+            // the only bare 'end' left at this level is this block's 'end block'.
+            int iterations = 0;
+            const int MAX_ITERATIONS = 100000;
+            while (_streamer.Current != null && _streamer.Current.Value.ToLower() != "end")
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (++iterations > MAX_ITERATIONS)
+                    throw new InvalidOperationException($"Block '{label}' parsing exceeded {MAX_ITERATIONS} iterations - possible infinite loop");
+                SyntetizeOneStatement(cancellationToken);
+            }
+
+            _blockStack.Pop();
+            pushed = false;
+
+            ConsumeEndBlock(label);
+        }
+        catch (OperationCanceledException)
+        {
+            if (pushed) _blockStack.Pop();
+            throw;
+        }
+        catch
+        {
+            if (pushed) _blockStack.Pop();
+            SkipBlockBody(label);
+        }
+    }
+
+    /// <summary>
+    /// Captures a parenthesized guard expression (cursor on the opening <c>(</c>),
+    /// returning the inner expression text and consuming through the matching
+    /// <c>)</c>. Handles nested parentheses.
+    /// </summary>
+    private string CaptureGuardExpression()
+    {
+        var sb = new StringBuilder();
+        int depth = 0;
+        while (_streamer.Current != null)
+        {
+            string val = _streamer.Current.Value;
+            if (val == "(")
+            {
+                depth++;
+                _streamer.MoveNext();
+                if (depth == 1) continue; // drop the outer '('
+            }
+            else if (val == ")")
+            {
+                depth--;
+                _streamer.MoveNext();
+                if (depth == 0) break;    // drop the outer ')'
+                sb.Append(')').Append(' ');
+                continue;
+            }
+            else
+            {
+                _streamer.MoveNext();
+            }
+            sb.Append(val).Append(' ');
+        }
+        return sb.ToString().Trim();
+    }
+
+    /// <summary>
+    /// Consumes <c>end block [label] ;</c> after a block body.
+    /// </summary>
+    private void ConsumeEndBlock(string label)
+    {
+        if (_streamer.Current?.Value.ToLower() == "end")
+            _streamer.MoveNext();               // 'end'
+        if (_streamer.Current?.Value.ToLower() == "block")
+            _streamer.MoveNext();               // 'block'
+        if (_streamer.Current?.Type == IDENTIFIERS && _streamer.Current?.Value == label)
+            _streamer.MoveNext();               // optional trailing label
+        if (_streamer.Current?.Value == ";")
+            _streamer.MoveNext();               // ';'
+    }
+
+    /// <summary>
+    /// Skips the body of a block whose synthesis failed, advancing the streamer past
+    /// the matching <c>end block [label] ;</c>. Tracks nesting so a containing block
+    /// isn't terminated by an inner block's end. Cursor may be anywhere inside the
+    /// block header/body when this is called.
+    /// </summary>
+    private void SkipBlockBody(string label)
+    {
+        int depth = 1;
+        while (_streamer.Current != null && depth > 0)
+        {
+            string val = _streamer.Current.Value.ToLower();
+            // A nested `<id> : block ...` opens another block. Detect the `block`
+            // keyword itself (its own `end block` will balance it below).
+            if (val == "block" && _streamer.Previous?.Value?.ToLower() != "end")
+            {
+                depth++;
+                _streamer.MoveNext();
+                continue;
+            }
+            if (val == "end")
+            {
+                _streamer.MoveNext();
+                if (_streamer.Current?.Value.ToLower() == "block")
+                {
+                    _streamer.MoveNext(); // 'block'
+                    if (_streamer.Current?.Type == IDENTIFIERS)
+                        _streamer.MoveNext(); // optional label
+                    if (_streamer.Current?.Value == ";")
+                        _streamer.MoveNext();
+                    depth--;
+                }
+                continue;
+            }
+            _streamer.MoveNext();
+        }
+    }
+
+    /// <summary>
+    /// Returns the value a guarded driver drives while its guard is false
+    /// (driver disconnected): <c>( others =&gt; 'Z' )</c> for a vector target,
+    /// <c>'Z'</c> for a scalar. The target is looked up in the current scope by name.
+    /// </summary>
+    private string GuardedDisconnectValue(string targetName)
+    {
+        var target = (_assignmentVariables ?? (IEnumerable<Variable>)[.. _ports, .. _generics, .. _signals])
+            .FirstOrDefault(v => v.Name.Equals(targetName, StringComparison.OrdinalIgnoreCase));
+        bool isVector = target != null &&
+                        (target.Type == Constants.DATATYPES.STD_LOGIC_VECTOR || target.Size > 1);
+        return isVector ? "( others => 'Z' )" : "'Z'";
     }
 
     /// <summary>
@@ -937,10 +1153,25 @@ public class Architecture : ISControl, IControl
             return;
         }
 
-        // Assignment — append the operator and slurp the RHS until `;`.
-        rawDataBuilder.Append(sep.Value).Append(' ');
+        // Assignment. Snapshot the LHS (target + any index) before the operator so a
+        // guarded RHS can be rewritten independently below. For non-guarded
+        // assignments this reproduces the previous `"<lhs> <op> <rhs>"` string exactly.
+        string lhs = rawDataBuilder.ToString().Trim();
+        string assignOp = sep.Value; // "<=" or ":="
         _streamer.MoveNext();
 
+        // VHDL guarded assignment: `target <= guarded <waveform>;`. The `guarded`
+        // qualifier means the driver is active only while the enclosing guarded
+        // block's guard is true. Strip the keyword here; the waveform is gated below.
+        bool isGuarded = false;
+        if (_streamer.Current?.Type == KEYWORDS &&
+            _streamer.Current.Value.Equals("guarded", StringComparison.OrdinalIgnoreCase))
+        {
+            isGuarded = true;
+            _streamer.MoveNext();
+        }
+
+        var rhsBuilder = new StringBuilder();
         while (_streamer.Current?.Value != ";")
         {
             if (_streamer.Current == null)
@@ -954,10 +1185,22 @@ public class Architecture : ISControl, IControl
                 throw new ParserException(
                     $"Unexpected token '{_streamer.Current.Value}' inside concurrent statement — not a valid VHDL identifier, keyword, operator, or literal",
                     _streamer.Current);
-            rawDataBuilder.Append(_streamer.Current.Value).Append(' ');
+            rhsBuilder.Append(_streamer.Current.Value).Append(' ');
             _streamer.MoveNext();
         }
-        string operation = rawDataBuilder.ToString().Trim();
+        string rhs = rhsBuilder.ToString().Trim();
+
+        // Gate a guarded assignment on its enclosing block's guard — genuine dynamic
+        // guard simulation: the resulting conditional assignment re-evaluates the
+        // guard on every delta cycle and disconnects the driver while it is false.
+        if (isGuarded && assignOp == "<=" && _blockStack.Count > 0)
+        {
+            var guardCtx = _blockStack.Peek();
+            if (guardCtx.IsGuarded)
+                rhs = guardCtx.BuildGuardedRhs(rhs, GuardedDisconnectValue(first.Value));
+        }
+
+        string operation = $"{lhs} {assignOp} {rhs}".Trim();
         _streamer.MoveNext(); // ;
         var type = _detector.GetOperationType(operation);
         switch (type)

@@ -285,6 +285,7 @@ class Program
         failures += Tests.NestedIEEECallTests.RunAllTests();
         failures += Tests.PracticeExerciseTests.RunAllTests();
         failures += Tests.PortStrictnessTests.RunAllTests();
+        failures += await Tests.BlockStatementTests.RunAllTests();
         Environment.ExitCode = failures;
     }
 
