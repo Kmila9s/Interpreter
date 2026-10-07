@@ -19,6 +19,7 @@ namespace Interpreter.Models;
 /// </summary>
 public class DeferredIndex
 {
+    /// <summary>The vector signal whose value is indexed at evaluation time.</summary>
     public Variable Source { get; }
 
     /// <summary>Single-bit index, or the high bound of a downto/to slice.</summary>
@@ -30,6 +31,11 @@ public class DeferredIndex
     /// <summary>True for `(H downto L)`; otherwise single-bit when High == Low.</summary>
     public bool IsSlice { get; }
 
+    /// <summary>Creates a deferred index/slice over <paramref name="source"/>.</summary>
+    /// <param name="source">The vector signal to index at evaluation time.</param>
+    /// <param name="high">The single-bit index, or the high bound of the slice.</param>
+    /// <param name="low">The low bound of the slice, or equal to <paramref name="high"/> for a single bit.</param>
+    /// <param name="isSlice">True when this represents a slice; false for a single-bit read.</param>
     public DeferredIndex(Variable source, int high, int low, bool isSlice)
     {
         Source = source;
@@ -77,8 +83,9 @@ public class DeferredIndex
 
         if (IsSlice)
         {
-            int width = High - Low + 1;
-            int startPos = vec.Length - 1 - High; // MSB-first storage
+            // Range-aware: honour the source's declared to/downto direction and
+            // bounds. Falls back to MSB-first (len-1-index) when no range recorded.
+            var (startPos, width) = Source.SliceToSpan(High, Low, vec.Length);
             string slice = (startPos >= 0 && startPos + width <= vec.Length)
                 ? vec.Substring(startPos, width)
                 : new string('U', width);
@@ -86,7 +93,7 @@ public class DeferredIndex
         }
         else
         {
-            int pos = vec.Length - 1 - High;
+            int pos = Source.IndexToOffset(High, vec.Length);
             string bit = (pos >= 0 && pos < vec.Length) ? vec[pos].ToString() : "U";
             return new Variable($"{Source.Name}_idx_{High}", bit, Constants.DATATYPES.STD_LOGIC);
         }

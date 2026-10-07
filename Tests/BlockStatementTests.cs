@@ -15,6 +15,8 @@ namespace Interpreter.Tests;
 /// </summary>
 public static class BlockStatementTests
 {
+    /// <summary>Runs all block statement tests and returns the number that failed.</summary>
+    /// <returns>The count of failed tests.</returns>
     public static async Task<int> RunAllTests()
     {
         int failed = 0;

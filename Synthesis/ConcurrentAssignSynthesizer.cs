@@ -822,7 +822,7 @@ internal static class ConcurrentAssignSynthesizer
                 switch (body[i])
                 {
                     case Operation prefixOp:
-                        if (prefixOp.Result == null || string.IsNullOrEmpty(prefixOp.Result.Name)) return null;
+                        if (prefixOp.Result is null || string.IsNullOrEmpty(prefixOp.Result.Name)) return null;
                         if (!localsByName.ContainsKey(prefixOp.Result.Name)) return null;
                         break;
                     case Interpreter.Repositories.ProcedureCallStatement _:
@@ -1124,7 +1124,7 @@ internal static class ConcurrentAssignSynthesizer
     /// <see cref="ConditionalAssignSynthesizer"/>). Requires:
     /// <list type="bullet">
     /// <item>Last branch is <c>else</c>, all preceding branches have non-null Condition.</item>
-    /// <item>Every branch holds exactly one <see cref="ReturnStatement"/> with a non-empty expression.</item>
+    /// <item>Every branch holds exactly one <see cref="Interpreter.Repositories.ReturnStatement"/> with a non-empty expression.</item>
     /// </list>
     /// Anything else (multi-task branches, missing else, non-return tasks) falls
     /// back — the caller then emits the opaque-constant + diagnostic.
@@ -1157,7 +1157,7 @@ internal static class ConcurrentAssignSynthesizer
             for (int k = 0; k < br.Tasks.Count - 1; k++)
             {
                 if (br.Tasks[k] is not Operation prefixOp) return null;
-                if (prefixOp.Result == null || string.IsNullOrEmpty(prefixOp.Result.Name)) return null;
+                if (prefixOp.Result is null || string.IsNullOrEmpty(prefixOp.Result.Name)) return null;
                 if (localsByName == null || !localsByName.ContainsKey(prefixOp.Result.Name)) return null;
             }
         }
@@ -1263,7 +1263,7 @@ internal static class ConcurrentAssignSynthesizer
         string? sourceLine,
         IReadOnlyDictionary<string, Variable>? localsByName = null)
     {
-        if (cs.Selector == null || cs.Branches.Count < 2) return null;
+        if (cs.Selector is null || cs.Branches.Count < 2) return null;
         var othersBranch = cs.Branches.LastOrDefault(b => b.IsOthers);
         if (othersBranch == null) return null;
         // Pass 21 (2026-07-30): arm tasks are now `[Operation*, ReturnStatement]`
@@ -1278,7 +1278,7 @@ internal static class ConcurrentAssignSynthesizer
             for (int k = 0; k < br.Tasks.Count - 1; k++)
             {
                 if (br.Tasks[k] is not Operation prefixOp) return null;
-                if (prefixOp.Result == null || string.IsNullOrEmpty(prefixOp.Result.Name)) return null;
+                if (prefixOp.Result is null || string.IsNullOrEmpty(prefixOp.Result.Name)) return null;
                 if (localsByName == null || !localsByName.ContainsKey(prefixOp.Result.Name)) return null;
             }
         }

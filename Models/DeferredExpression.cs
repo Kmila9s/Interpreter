@@ -41,6 +41,8 @@ public class DeferredExpression
 {
     private readonly List<object> _items;
 
+    /// <summary>Creates a deferred expression buffering the given RPN items.</summary>
+    /// <param name="items">The buffered expression items to defer.</param>
     public DeferredExpression(List<object> items)
     {
         _items = items;

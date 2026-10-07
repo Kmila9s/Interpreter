@@ -22,6 +22,8 @@ namespace Interpreter.Tests;
 /// </summary>
 public static class NestedIEEECallTests
 {
+    /// <summary>Runs all nested IEEE call tests and returns the number that failed.</summary>
+    /// <returns>The count of failed tests.</returns>
     public static int RunAllTests()
     {
         int failed = 0;

@@ -40,6 +40,11 @@ public sealed class ReportStatement : ISControl
     /// <summary>Individual tokens of the expression, for best-effort evaluation at <see cref="ExecuteAsync"/> time.</summary>
     private readonly List<string> _tokens = new();
 
+    /// <summary>
+    /// Initializes a new instance of the <see cref="ReportStatement"/> class.
+    /// </summary>
+    /// <param name="variables">The variables in scope for the report expression.</param>
+    /// <param name="streamer">The token stream positioned at the report statement.</param>
     public ReportStatement(HashSet<Variable> variables, TokenStream streamer)
     {
         _variables = variables;
@@ -113,6 +118,6 @@ public sealed class ReportStatement : ISControl
         return Task.CompletedTask;
     }
 
-    /// <summary>Not used — see <see cref="Syntetize"/>.</summary>
+    /// <summary>Not used — see <see cref="Syntetize()"/>.</summary>
     public void Syntetize(string[] data) => throw new NotImplementedException();
 }

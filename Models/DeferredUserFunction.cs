@@ -68,6 +68,14 @@ public class DeferredUserFunction
     /// <c>DeltaCycleEngine</c> between re-fires.</summary>
     public HashSet<Variable> Variables { get; }
 
+    /// <summary>
+    /// Initializes a new instance of the <see cref="DeferredUserFunction"/> class.
+    /// </summary>
+    /// <param name="functionName">The name of the user-declared VHDL function.</param>
+    /// <param name="argExpressions">The raw argument expressions, re-parsed against the live scope on each evaluation.</param>
+    /// <param name="returnType">The function's declared return data type.</param>
+    /// <param name="returnTypeSize">The return-type bit width for vector returns; zero for scalars.</param>
+    /// <param name="variables">The live scope the argument expressions resolve against.</param>
     public DeferredUserFunction(
         string functionName,
         IReadOnlyList<string> argExpressions,

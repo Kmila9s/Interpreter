@@ -9,12 +9,60 @@ namespace Interpreter.Synthesis;
 /// is the fallback when a process body is too tangled to decompose.
 /// </summary>
 public enum CellKind {
-    AND, NAND, OR, NOR, XOR, XNOR, NOT, BUF,
-    CONST, MUX,
+    /// <summary>Logical AND gate.</summary>
+    AND,
+    /// <summary>Logical NAND (NOT-AND) gate.</summary>
+    NAND,
+    /// <summary>Logical OR gate.</summary>
+    OR,
+    /// <summary>Logical NOR (NOT-OR) gate.</summary>
+    NOR,
+    /// <summary>Logical XOR (exclusive-OR) gate.</summary>
+    XOR,
+    /// <summary>Logical XNOR (exclusive-NOR) gate.</summary>
+    XNOR,
+    /// <summary>Logical NOT (inverter) gate.</summary>
+    NOT,
+    /// <summary>Buffer (non-inverting pass-through) gate.</summary>
+    BUF,
+    /// <summary>Constant-value driver.</summary>
+    CONST,
+    /// <summary>Multiplexer (data selector).</summary>
+    MUX,
+    /// <summary>D-type flip-flop (edge-triggered register).</summary>
     DFF,
-    ADD, SUB, MUL, DIV, MOD, POW,
-    SHL, SHR, ROL, ROR,
-    EQ, NEQ, LT, LTE, GT, GTE,
+    /// <summary>Arithmetic addition.</summary>
+    ADD,
+    /// <summary>Arithmetic subtraction.</summary>
+    SUB,
+    /// <summary>Arithmetic multiplication.</summary>
+    MUL,
+    /// <summary>Arithmetic division.</summary>
+    DIV,
+    /// <summary>Arithmetic modulo (remainder).</summary>
+    MOD,
+    /// <summary>Arithmetic exponentiation (power).</summary>
+    POW,
+    /// <summary>Logical/arithmetic shift left.</summary>
+    SHL,
+    /// <summary>Logical/arithmetic shift right.</summary>
+    SHR,
+    /// <summary>Rotate left.</summary>
+    ROL,
+    /// <summary>Rotate right.</summary>
+    ROR,
+    /// <summary>Equality comparison (=).</summary>
+    EQ,
+    /// <summary>Inequality comparison (/=).</summary>
+    NEQ,
+    /// <summary>Less-than comparison (&lt;).</summary>
+    LT,
+    /// <summary>Less-than-or-equal comparison (&lt;=).</summary>
+    LTE,
+    /// <summary>Greater-than comparison (&gt;).</summary>
+    GT,
+    /// <summary>Greater-than-or-equal comparison (&gt;=).</summary>
+    GTE,
     // IEEE primitive cells emitted by Interpreter.Synthesis.IEEEPrimitives.
     // The lookup table maps `to_integer`, `to_unsigned`, `resize`, etc. to
     // these kinds so the netlist reflects real hardware shapes instead of
@@ -70,6 +118,8 @@ public enum CellKind {
     /// Operation.ConditionResult placeholders — the RAM's write side
     /// was invisible on the schematic.</summary>
     RAM_WRITE,
+    /// <summary>Fallback cell for a process body too tangled to decompose into
+    /// discrete gates; rendered as an opaque labeled box.</summary>
     BLACKBOX_PROCESS,
     /// <summary>Opaque module for a component instantiation. Rendered as a
     /// rectangle with one pin per port-map binding; the label carries the
@@ -82,20 +132,50 @@ public enum CellKind {
 /// Where a net came from in the source. Drives the renderer's labelling and
 /// terminal placement (top/bottom strip).
 /// </summary>
-public enum NetOrigin { PortIn, PortOut, PortInOut, Signal, Internal, Constant }
+public enum NetOrigin
+{
+    /// <summary>Net driven by an input port.</summary>
+    PortIn,
+    /// <summary>Net driving an output port.</summary>
+    PortOut,
+    /// <summary>Net tied to a bidirectional (inout) port.</summary>
+    PortInOut,
+    /// <summary>Net corresponding to a declared internal signal.</summary>
+    Signal,
+    /// <summary>Synthesizer-created internal net (no source-level name).</summary>
+    Internal,
+    /// <summary>Net carrying a constant value.</summary>
+    Constant
+}
 
 /// <summary>
 /// Whether a net is a single-bit wire or a multi-bit bus. Drives stroke
 /// thickness in the renderer (buses draw thicker) and the bit-width chip on
 /// the schematic info panel.
 /// </summary>
-public enum NetKind { Wire, Bus }
+public enum NetKind
+{
+    /// <summary>Single-bit net.</summary>
+    Wire,
+    /// <summary>Multi-bit net (vector).</summary>
+    Bus
+}
 
 /// <summary>
 /// Direction of a port pin. Mirrors the upstream Variable.PortType but kept
 /// separate so the netlist data model has zero dependency on Parser.Models.
 /// </summary>
-public enum PortDir { In, Out, InOut, Buffer }
+public enum PortDir
+{
+    /// <summary>Input port.</summary>
+    In,
+    /// <summary>Output port.</summary>
+    Out,
+    /// <summary>Bidirectional port.</summary>
+    InOut,
+    /// <summary>Buffer port (readable output).</summary>
+    Buffer
+}
 
 /// <summary>
 /// A wire (1-bit) or bus (N-bit). Buses carry the bit width so the renderer
@@ -141,7 +221,7 @@ public sealed record PortPin(string Name, PortDir Direction, int Width, string N
 
 /// <summary>
 /// The full synthesised circuit. One per entity. Pure data — no behaviour,
-/// no layout, no UI. Layout adds <see cref="LaidOutNetlist"/> on top.
+/// no layout, no UI. Layout adds <c>LaidOutNetlist</c> on top.
 /// </summary>
 public sealed record Netlist(
     string EntityName,
@@ -158,7 +238,15 @@ public sealed record Netlist(
 /// inlined yet); Warning surfaces the traditional black-box fall-back;
 /// Error is reserved for structurally broken inputs.
 /// </summary>
-public enum DiagnosticSeverity { Info, Warning, Error }
+public enum DiagnosticSeverity
+{
+    /// <summary>Informational message.</summary>
+    Info,
+    /// <summary>Warning that does not prevent synthesis.</summary>
+    Warning,
+    /// <summary>Error that prevents successful synthesis.</summary>
+    Error
+}
 
 /// <summary>
 /// Synthesis-time message surfaced to the UI (e.g. "process body fell back

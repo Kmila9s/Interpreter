@@ -47,12 +47,16 @@ public sealed class AssertStatement : ISControl
     /// <summary>VHDL severity level (default <c>error</c> per LRM).</summary>
     public string Severity { get; private set; } = "error";
 
+    /// <summary>Creates an assert statement bound to the given variable scope and token stream.</summary>
+    /// <param name="variables">The variable scope used to evaluate the condition.</param>
+    /// <param name="streamer">The token stream positioned at the assert statement.</param>
     public AssertStatement(HashSet<Variable> variables, TokenStream streamer)
     {
         _variables = variables;
         _streamer  = streamer;
     }
 
+    /// <summary>Parses the assert statement (condition, optional report message and severity) from the token stream.</summary>
     public void Syntetize()
     {
         if (_streamer == null) return;
@@ -115,6 +119,8 @@ public sealed class AssertStatement : ISControl
         if (_streamer.Current?.Value == ";") _streamer.MoveNext();
     }
 
+    /// <summary>Evaluates the condition and emits an assertion violation report when it does not hold.</summary>
+    /// <returns>A completed task.</returns>
     public Task ExecuteAsync()
     {
         bool conditionHolds;
@@ -164,5 +170,7 @@ public sealed class AssertStatement : ISControl
         return false;
     }
 
+    /// <summary>Not supported for assert statements.</summary>
+    /// <param name="data">Unused.</param>
     public void Syntetize(string[] data) => throw new NotImplementedException();
 }

@@ -37,6 +37,13 @@ public class DeferredAttribute
     /// </summary>
     public long? TimeArgNs { get; }
 
+    /// <summary>
+    /// Initializes a new instance of the <see cref="DeferredAttribute"/> class.
+    /// </summary>
+    /// <param name="signal">The signal the attribute is evaluated against.</param>
+    /// <param name="attributeName">The attribute name (e.g. event, last_value, stable).</param>
+    /// <param name="resultType">The data type of the attribute result.</param>
+    /// <param name="timeArgNs">Optional time argument for 'stable(T), in raw ns; null for no-arg forms.</param>
     public DeferredAttribute(Variable signal, string attributeName, DATATYPES resultType, long? timeArgNs = null)
     {
         Signal = signal;

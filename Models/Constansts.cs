@@ -100,6 +100,8 @@ public class OperationsRegex {
     // silently dropping RAM-shaped statements.
     // Group name `lhsP` is unique to reduce collision with caller groups;
     // callers must avoid using `lhsP` for their own captures.
+    /// <summary>Optional balanced-parenthesis index/slice suffix for an LHS target
+    /// (e.g. <c>(0)</c> or nested <c>(to_integer(unsigned(addr)))</c>).</summary>
     public const string BalancedIndexSuffix =
         @"(?:\s*\((?>[^()]+|\((?<lhsP>)|\)(?<-lhsP>))*(?(lhsP)(?!))\))?";
 
@@ -109,10 +111,12 @@ public class OperationsRegex {
     // this fragment (parallel to `lhsP` for BalancedIndexSuffix); callers
     // must avoid `expP` for their own captures. Non-empty (`+` outer)
     // so callers don't have to add explicit ".+" guards.
+    /// <summary>Matches one balanced-parenthesis-containing expression (accepting
+    /// nested calls) inside a slice or edge-detect argument.</summary>
     public const string BalancedExpression =
         @"(?:[^()]+|\((?>[^()]+|\((?<expP>)|\)(?<-expP>))*(?(expP)(?!))\))+";
 
-    /// <summary>Regex to detect a VHDL signal assignment (<=) or variable assignment (:=).</summary>
+    /// <summary>Regex to detect a VHDL signal assignment (&lt;=) or variable assignment (:=).</summary>
     /// <remarks>v0.16.1: Added support for := variable assignments used in processes and procedures.
     /// 2026-06-03 (bench bug #5): Also accept an indexed/sliced target like `output(0) &lt;= …` —
     /// the previous regex's single `\s?` couldn't span `name ( 0 ) ` so per-bit assignments

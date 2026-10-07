@@ -69,13 +69,13 @@ public class VariableSyntetizer : ISControl
     /// Executes the variable synthesizer asynchronously.
     /// </summary>
     /// <returns>A task representing the asynchronous operation.</returns>
-    public async Task ExecuteAsync() => throw new NotImplementedException();
+    public async Task ExecuteAsync() { await Task.CompletedTask; throw new NotImplementedException(); }
 
     /// <summary>
     /// Synthesizes the variables from a token stream.
     /// </summary>
     /// <param name="strings">The token stream.</param>
-    public void Syntetize(string[] strings) => ExecuteAsync();
+    public void Syntetize(string[] strings) => _ = ExecuteAsync();
 
     /// <summary>
     /// Synthesizes the variables from a token stream.
@@ -397,6 +397,14 @@ public class VariableSyntetizer : ISControl
             }
             int VectorSize = 0;
 
+            // Declared vector range (VHDL 'left/'right/direction), captured here
+            // and applied to the created Variable below so index/slice/attribute
+            // resolution honours to/downto and non-zero low bounds. Null => no
+            // range recorded => conventional (Size-1 downto 0) fallback.
+            int? declLeft = null;
+            int? declRight = null;
+            bool declIsDownto = true;
+
             // Set default size for single-bit types
             if (dataType == Constants.DATATYPES.STD_LOGIC || dataType == Constants.DATATYPES.BIT)
             {
@@ -419,7 +427,6 @@ public class VariableSyntetizer : ISControl
                     {
                         _streamer.SetRollBack();
                         // Peek ahead to see if expression contains operators, nested parens, or function calls
-                        int checkDepth = 0;
                         bool prevWasIdentifier = false;
                         while (_streamer.Current != null && _streamer.Current.Value != ")")
                         {
@@ -517,6 +524,11 @@ public class VariableSyntetizer : ISControl
                             int lo = loEval.Value;
                             int width = dirTok == "downto" ? hi - lo + 1 : lo - hi + 1;
                             VectorSize = width > 0 ? width : 8;
+                            // hiEval is the bound written left of to/downto, loEval
+                            // the one to its right: that IS 'left/'right as written.
+                            declLeft = hi;
+                            declRight = lo;
+                            declIsDownto = dirTok == "downto";
 #if DEBUG
                             Console.WriteLine($"[VariableSyntetizer] F-G-01 folded range: {hi} {dirTok} {lo} → width {VectorSize}");
 #endif
@@ -540,6 +552,11 @@ public class VariableSyntetizer : ISControl
                         int end = Convert.ToInt32(varValue);
                         _streamer.Expect(PARENTHESIS); // consume ')'
                         VectorSize = vecType.ToLower() == "downto" ? initial - end + 1 : end - initial + 1;
+                        // `initial` is the bound left of to/downto, `end` the one
+                        // to its right: 'left/'right exactly as written.
+                        declLeft = initial;
+                        declRight = end;
+                        declIsDownto = vecType.ToLower() == "downto";
 #if DEBUG
                         Console.WriteLine($"[VariableSyntetizer] Simple vector range: {initial} {vecType} {end} = Size {VectorSize}");
 #endif
@@ -603,6 +620,15 @@ public class VariableSyntetizer : ISControl
                 else if (customTypeDef.Kind == TypeKind.Subtype)
                 {
                     dataType = customTypeDef.BaseType;
+                    // Inherit the subtype's declared range so signals of a
+                    // subtype like `byte is std_logic_vector(7 downto 0)` index
+                    // correctly. SubtypeRange is stored (High=max, Low=min).
+                    if (customTypeDef.BaseType == Constants.DATATYPES.STD_LOGIC_VECTOR)
+                    {
+                        declLeft = customTypeDef.IsDownto ? customTypeDef.SubtypeRange.High : customTypeDef.SubtypeRange.Low;
+                        declRight = customTypeDef.IsDownto ? customTypeDef.SubtypeRange.Low : customTypeDef.SubtypeRange.High;
+                        declIsDownto = customTypeDef.IsDownto;
+                    }
                 }
                 // For records, use STD_LOGIC_VECTOR as storage type
                 else if (customTypeDef.Kind == TypeKind.Record)
@@ -700,6 +726,15 @@ public class VariableSyntetizer : ISControl
                     Size = VectorSize,  // Set Size BEFORE Value to avoid Size setter issues
                     Value = !_isPort ? initValue : null!,
                 };
+
+                // Record the declared range (to/downto + bounds) so index/slice/
+                // attribute resolution is range-aware. Only when an explicit range
+                // was parsed; otherwise the Variable keeps the (Size-1 downto 0)
+                // fallback and behaves exactly as before.
+                if (declLeft.HasValue && declRight.HasValue)
+                {
+                    newVar.SetDeclaredRange(declLeft.Value, declRight.Value, declIsDownto);
+                }
 
                 // Bench bug #19: when the variable is typed by a user-defined
                 // array (e.g. `rom_t = array(0 to 7) of std_logic_vector(7 downto 0)`),
@@ -2650,7 +2685,7 @@ public class VariableSyntetizer : ISControl
                 if (_streamer.Current.Value == ")") { depth--; if (depth == 0) { _streamer.MoveNext(); return; } }
                 var lower = _streamer.Current.Value?.ToLowerInvariant();
                 if (lower == "signal") isSignal = true;
-                if (_streamer.Current.Type == IDENTIFIERS) names.Add(_streamer.Current.Value);
+                if (_streamer.Current.Type == IDENTIFIERS) names.Add(_streamer.Current.Value!);
                 _streamer.MoveNext();
             }
             if (_streamer.Current?.Value != ":") return;

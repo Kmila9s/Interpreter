@@ -78,6 +78,9 @@ public sealed class WaitForStatement : ISControl
     /// </summary>
     public HashSet<Variable> Sensitivity { get; } = new();
 
+    /// <summary>Creates a wait statement bound to the given token stream and optional variable scope.</summary>
+    /// <param name="streamer">The token stream positioned at the wait statement.</param>
+    /// <param name="variables">The variable scope used to evaluate any wait condition.</param>
     public WaitForStatement(TokenStream streamer, HashSet<Variable>? variables = null)
     {
         _streamer = streamer;
@@ -234,7 +237,11 @@ public sealed class WaitForStatement : ISControl
         return result?.Value is bool b && b;
     }
 
+    /// <summary>No-op; wait timing is handled specially by the engine.</summary>
+    /// <returns>A completed task.</returns>
     public Task ExecuteAsync() => Task.CompletedTask; // Handled by the engine specially.
 
+    /// <summary>Not supported for wait statements.</summary>
+    /// <param name="data">Unused.</param>
     public void Syntetize(string[] data) => throw new NotImplementedException();
 }

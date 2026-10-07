@@ -82,6 +82,10 @@ public static class LayeredLayout
     // stay legible.
     private const double BandGap = 70;
 
+    /// <summary>
+    /// Computes deterministic layered coordinates for every cell and net in the netlist.
+    /// </summary>
+    /// <param name="netlist">The synthesized netlist to lay out.</param>
     /// <param name="groupAware">
     /// When true (default) cells sharing a <c>Cell.SourceLine</c> are kept
     /// in one contiguous horizontal band so the viewer's translucent group

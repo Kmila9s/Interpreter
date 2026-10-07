@@ -29,7 +29,9 @@ namespace Interpreter.Models;
 /// </remarks>
 public class DynamicIndex
 {
+    /// <summary>The vector/array signal being indexed.</summary>
     public Variable Source { get; }
+    /// <summary>The variable supplying the index value in identifier mode; null in expression mode.</summary>
     public Variable? IndexSource { get; }
 
     /// <summary>
@@ -49,6 +51,9 @@ public class DynamicIndex
     /// </summary>
     public HashSet<Variable>? ExpressionScope { get; }
 
+    /// <summary>Creates an identifier-mode dynamic index over <paramref name="source"/> using <paramref name="indexSource"/>.</summary>
+    /// <param name="source">The vector/array signal being indexed.</param>
+    /// <param name="indexSource">The variable whose current value is the index.</param>
     public DynamicIndex(Variable source, Variable indexSource)
     {
         Source = source;
@@ -57,6 +62,10 @@ public class DynamicIndex
         ExpressionScope = null;
     }
 
+    /// <summary>Creates an expression-mode dynamic index over <paramref name="source"/> evaluated against <paramref name="scope"/>.</summary>
+    /// <param name="source">The vector/array signal being indexed.</param>
+    /// <param name="indexExpression">The raw token-joined text of the index expression.</param>
+    /// <param name="scope">The variables the index expression may reference.</param>
     public DynamicIndex(Variable source, string indexExpression, HashSet<Variable> scope)
     {
         Source = source;
@@ -73,6 +82,8 @@ public class DynamicIndex
     // so the cached parse is safe.
     private Services.Operation? _cachedOperation;
 
+    /// <summary>Resolves the index at runtime and returns the selected element as a Variable.</summary>
+    /// <returns>The indexed element, or an unresolved ('U') value when the index cannot be resolved.</returns>
     public Variable Evaluate()
     {
         // Defensive null-guards: an expression like `mem(to_integer(unsigned(addr)))`
@@ -136,7 +147,9 @@ public class DynamicIndex
             return new Variable($"{srcName}_dyn_{dynIdx}", slot, Constants.DATATYPES.STD_LOGIC_VECTOR);
         }
 
-        int pos = vec.Length - 1 - dynIdx;
+        // Range-aware single-bit read: honour the source's declared range when
+        // present, else fall back to MSB-first (len-1-index).
+        int pos = Source is not null ? Source.IndexToOffset(dynIdx, vec.Length) : vec.Length - 1 - dynIdx;
         string bit = (pos >= 0 && pos < vec.Length) ? vec[pos].ToString() : "U";
         return new Variable($"{srcName}_dyn_{dynIdx}", bit, Constants.DATATYPES.STD_LOGIC);
     }

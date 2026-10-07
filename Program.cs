@@ -822,7 +822,7 @@ class Program
                             {
                                 // Try to resolve as constant
                                 var refConst = registry.GetConstant(argTrim);
-                                if (refConst != null && refConst.Value != null)
+                                if (refConst is not null && refConst.Value != null)
                                     args.Add(refConst.Value);
                                 else
                                     args.Add(argTrim);
@@ -840,7 +840,7 @@ class Program
                 {
                     // Check if it's a reference to another constant
                     var refConst = registry.GetConstant(valueStr);
-                    if (refConst != null && refConst.Value != null)
+                    if (refConst is not null && refConst.Value != null)
                         value = refConst.Value;
                     else
                         value = valueStr;

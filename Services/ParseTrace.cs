@@ -295,9 +295,13 @@ public static class ParseTrace
         int size = raw.Length;
         int high = dir == "downto" ? hi : lo;
         int low  = dir == "downto" ? lo : hi;
-        if (high < low || high >= size || low < 0) return false;
-        int startChar = size - 1 - high;
-        int lengthChars = high - low + 1;
+        if (high < low) return false;
+        // Range-aware slice: honour v's declared to/downto direction and bounds
+        // (falls back to size-1-high for the conventional downto-0 form). The
+        // span's own bounds check replaces the old 0-based high>=size guard, so
+        // offset ranges like (15 downto 8) resolve instead of bailing.
+        var (startChar, lengthChars) = v.SliceToSpan(high, low, size);
+        if (startChar < 0 || lengthChars <= 0 || startChar + lengthChars > size) return false;
         string sliceBits = raw.Substring(startChar, lengthChars);
 
         result = FormatVariable(v, wholeBitstring: sliceBits, caller);
