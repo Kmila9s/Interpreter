@@ -120,7 +120,7 @@ public class DeltaCycleEngine : IDisposable
     /// process is dequeued and rescheduled for the current tick via
     /// <see cref="ScheduleProcessWake"/>.
     ///
-    /// The tuple carries the WaitForStatement so <see cref="EvaluateCondition"/>
+    /// The tuple carries the WaitForStatement so <c>EvaluateCondition</c>
     /// can be called back to the actual condition, and so removal on wake
     /// removes only entries for THIS wait (not other waits by the same
     /// process, which don't co-exist).
@@ -1653,8 +1653,8 @@ public class DeltaCycleEngine : IDisposable
         {
             int hi = caseStruct.SelectorSliceHigh;
             int lo = caseStruct.SelectorSliceLow;
-            int width = hi - lo + 1;
-            int startPos = selectorValue.Length - 1 - hi;
+            // Range-aware selector slice: honour the selector's declared range.
+            var (startPos, width) = caseStruct.Selector.SliceToSpan(hi, lo, selectorValue.Length);
             if (startPos >= 0 && width > 0 && startPos + width <= selectorValue.Length)
             {
                 selectorValue = selectorValue.Substring(startPos, width);
@@ -2085,8 +2085,8 @@ public class DeltaCycleEngine : IDisposable
         {
             int hi = caseStruct.SelectorSliceHigh;
             int lo = caseStruct.SelectorSliceLow;
-            int width = hi - lo + 1;
-            int startPos = selectorValue.Length - 1 - hi;
+            // Range-aware selector slice: honour the selector's declared range.
+            var (startPos, width) = caseStruct.Selector.SliceToSpan(hi, lo, selectorValue.Length);
             if (startPos >= 0 && width > 0 && startPos + width <= selectorValue.Length)
             {
                 selectorValue = selectorValue.Substring(startPos, width);
@@ -2569,8 +2569,11 @@ public class DeltaCycleEngine : IDisposable
 /// </summary>
 public sealed class FrameEmittedArgs
 {
+    /// <summary>Simulation tick this frame was emitted at.</summary>
     public ulong Tick { get; }
+    /// <summary>Delta-cycle index within the tick.</summary>
     public int Delta { get; }
+    /// <summary>Signals that changed during this delta cycle (defensive copy).</summary>
     public IReadOnlyList<Variable> ChangedSignals { get; }
 
     /// <summary>
@@ -2583,6 +2586,13 @@ public sealed class FrameEmittedArgs
     /// </summary>
     public IReadOnlyDictionary<Variable, int> SourceLines { get; }
 
+    /// <summary>
+    /// Initializes a new instance of the <see cref="FrameEmittedArgs"/> class.
+    /// </summary>
+    /// <param name="tick">Simulation tick this frame was emitted at.</param>
+    /// <param name="delta">Delta-cycle index within the tick.</param>
+    /// <param name="changed">Signals that changed during this delta cycle.</param>
+    /// <param name="sourceLines">Optional per-signal source lines; empty when omitted.</param>
     public FrameEmittedArgs(ulong tick, int delta, IReadOnlyList<Variable> changed,
         IReadOnlyDictionary<Variable, int>? sourceLines = null)
     {

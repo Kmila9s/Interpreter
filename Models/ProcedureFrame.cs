@@ -19,7 +19,7 @@ namespace Interpreter.Models;
 /// (Option C in the plan): <see cref="ProcedureCallStatement.ResolveBoundBody"/>
 /// textually renames formal identifiers to actual identifiers in the
 /// procedure's <c>BodyRaw</c> and re-parses through
-/// <see cref="FunctionExecutor.ParseFunctionBodyStatic"/>. The resulting
+/// <see cref="Interpreter.Services.FunctionExecutor.ParseFunctionBodyStatic"/>. The resulting
 /// <see cref="Tasks"/> hold <c>Operation</c>s whose RPN items reference
 /// caller-side <c>Variable</c>s directly, so signal writes route through
 /// <c>_signalScheduler</c> without any per-execute remap, and

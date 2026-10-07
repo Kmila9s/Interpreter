@@ -188,7 +188,7 @@ public class Architecture : ISControl, IControl
     /// <summary>
     /// Synthesizes the architecture from raw data.
     /// </summary>
-    /// <param name="RawArchitecture">The raw data of the architecture.</param>
+    /// <param name="RawArchitectureWithLines">The raw architecture lines paired with their 1-based source-file line numbers.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <summary>
     /// Synthesizes the architecture using lines that carry their original
@@ -236,6 +236,11 @@ public class Architecture : ISControl, IControl
         progress.ReportPhase(1f, $"Architecture complete ({Tasks.Count} tasks)", ProcessingPhase.ParsingArchitecture, Name);
     }
 
+    /// <summary>
+    /// Synthesizes the architecture from raw data lines, honoring cancellation.
+    /// </summary>
+    /// <param name="RawArchitecture">The raw data lines of the architecture.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
     public void Syntetize(string[] RawArchitecture, CancellationToken cancellationToken)
     {
         var progress = ProgressReporter.Instance;
@@ -339,7 +344,7 @@ public class Architecture : ISControl, IControl
 
     /// <summary>
     /// Synthesizes exactly one concurrent statement at the current stream position
-    /// and appends it to <see cref="Tasks"/>. Shared by <see cref="SyntetizeBehaviour"/>
+    /// and appends it to <see cref="Tasks"/>. Shared by <see cref="SyntetizeBehaviour()"/>
     /// (the architecture body) and <see cref="HandleBlockStatement"/> (a block body),
     /// so both parse the same set of constructs identically — including nested blocks.
     /// The active scope is <see cref="_assignmentVariables"/> (== <c>comparators</c>,
@@ -681,7 +686,7 @@ public class Architecture : ISControl, IControl
     {
         var target = (_assignmentVariables ?? (IEnumerable<Variable>)[.. _ports, .. _generics, .. _signals])
             .FirstOrDefault(v => v.Name.Equals(targetName, StringComparison.OrdinalIgnoreCase));
-        bool isVector = target != null &&
+        bool isVector = target is not null &&
                         (target.Type == Constants.DATATYPES.STD_LOGIC_VECTOR || target.Size > 1);
         return isVector ? "( others => 'Z' )" : "'Z'";
     }

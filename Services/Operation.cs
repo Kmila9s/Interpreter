@@ -13,17 +13,22 @@ namespace Interpreter.Services;
 /// </summary>
 public enum SignalAttributeType
 {
+    /// <summary>No signal attribute.</summary>
     None,
+    /// <summary>'event attribute: true when the signal changed in the current delta cycle.</summary>
     Event,
+    /// <summary>'last_value attribute: the signal's value before its most recent transition.</summary>
     LastValue,
+    /// <summary>'stable attribute: true when the signal has not changed.</summary>
     Stable,
+    /// <summary>'active attribute: true when a transaction occurred on the signal.</summary>
     Active
 }
 
 /// <summary>
 /// Represents an operation — the runtime evaluator for a single VHDL expression
 /// or assignment. Tokenizes → synthesises via <see cref="Syntetize"/> into an
-/// <see cref="Items"/> array of operands + operators, then <see cref="Execute"/>
+/// <see cref="Items"/> array of operands + operators, then <see cref="Execute()"/>
 /// walks Items with a Shunting-Yard-style stack.
 /// </summary>
 /// <remarks>
@@ -34,7 +39,7 @@ public enum SignalAttributeType
 /// (rising_edge, to_unsigned, resize, …) evaluated at execute time.</item>
 /// <item><see cref="Models.DeferredUserFunction"/> — user-declared VHDL
 /// function whose body is registered. Args re-parse against the live scope
-/// on every <see cref="Execute"/>. Introduced 2026-07-20 to close the
+/// on every <see cref="Execute()"/>. Introduced 2026-07-20 to close the
 /// user-fn reactivity gap (rgb_rainbow-style LFSR-through-function froze
 /// at first-eval pre-fix).</item>
 /// <item><see cref="Models.DeferredIndex"/> — indexed signal read
@@ -104,7 +109,7 @@ public class Operation : IOperation {
     public int? ResultBitIndex { get; set; }
 
     /// <summary>
-    /// Nanosecond inertial-delay captured from `after N <unit>` clauses on
+    /// Nanosecond inertial-delay captured from `after N &lt;unit&gt;` clauses on
     /// the RHS of a signal assignment. 0 means "no delay" (the default).
     /// `ScheduledOperation.Execute` routes through
     /// `SignalScheduler.ScheduleAfter` when this is set. Bench bug #8.
@@ -117,7 +122,7 @@ public class Operation : IOperation {
     /// next statement (within the same delta cycle), unlike signal
     /// assignments (<c>&lt;=</c>) which are scheduled to a later delta.
     /// `ScheduledOperation.Execute` writes the result directly to
-    /// <see cref="Result.Value"/> when this is true rather than queuing
+    /// <c>Result.Value</c> when this is true rather than queuing
     /// through `SignalScheduler.Schedule`. Bug #14 follow-up.
     /// </summary>
     public bool IsVariableAssignment { get; private set; }
@@ -373,7 +378,6 @@ public class Operation : IOperation {
             if (currentItem.ToLower() == "after")
             {
                 _currentSyntetizeIndex++; // skip 'after'
-                long delayNs = 0;
                 if (_currentSyntetizeIndex < _data.Length &&
                     long.TryParse(_data[_currentSyntetizeIndex], out long value))
                 {
@@ -631,7 +635,7 @@ public class Operation : IOperation {
         // as an integer). Without it, `to_unsigned(N, slot_cnt'length)`
         // tokens corrupted the surrounding function-call arg list and the
         // parser ran past `end architecture;` consuming tokens until EOF.
-        string[] validAttributes = ["event", "last_value", "stable", "active", "length", "high", "low", "left", "right"];
+        string[] validAttributes = ["event", "last_value", "stable", "active", "length", "high", "low", "left", "right", "ascending"];
         if (!validAttributes.Contains(attributeName)) return (false, null!);
 
         var signal = Variables.FirstOrDefault(v => v.Name.Equals(signalName, StringComparison.OrdinalIgnoreCase));
@@ -653,14 +657,31 @@ public class Operation : IOperation {
             return (true, new Models.DeferredAttribute(signal, attributeName, resultType, timeArg));
         }
 
-        // Static integer-class attributes — inline-evaluate a plain Variable.
+        // Range-aware static attributes. Derive 'left/'right/'high/'low/'ascending
+        // from the declared range when present; otherwise fall back to the
+        // conventional (Size-1 downto 0) form (identical to the legacy values).
+        int effLeft  = signal.HasDeclaredRange ? signal.LeftBound!.Value  : Math.Max(0, signal.Size - 1);
+        int effRight = signal.HasDeclaredRange ? signal.RightBound!.Value : 0;
+        bool effDownto = !signal.HasDeclaredRange || signal.IsDownto;
+
+        // 'ascending is a BOOLEAN attribute — type the result accordingly.
+        if (attributeName == "ascending")
+        {
+            var ascVar = new Variable(
+                $"Attribute-{signalName}'ascending",
+                effDownto ? "false" : "true",
+                Constants.DATATYPES.BOOLEAN);
+            ascVar.PortType = Constants.PortType.OUT;
+            return (true, ascVar);
+        }
+
         object attributeValue = attributeName switch
         {
             "length" => signal.Size,
-            "high"   => Math.Max(0, signal.Size - 1),
-            "low"    => 0,
-            "left"   => Math.Max(0, signal.Size - 1),
-            "right"  => 0,
+            "high"   => Math.Max(effLeft, effRight),
+            "low"    => Math.Min(effLeft, effRight),
+            "left"   => effLeft,
+            "right"  => effRight,
             _        => 0
         };
         var resultVar = new Variable(
@@ -1037,6 +1058,12 @@ public class Operation : IOperation {
     // items using the same rules as the parse-time fold. Kept as a
     // static helper because DeferredExpression is a Model / lightweight
     // wrapper and shouldn't drag in Operation instance state.
+    /// <summary>
+    /// Resolves a buffered expression item to a <see cref="Variable"/> using the
+    /// same rules as the parse-time fold. Exposed for <c>Models.DeferredExpression</c>.
+    /// </summary>
+    /// <param name="item">The buffered item to resolve.</param>
+    /// <returns>The resolved <see cref="Variable"/>.</returns>
     public static Variable ToArgVariablePublic(object item) => ToArgVariable(item);
 
     private static Variable ToArgVariable(object item)

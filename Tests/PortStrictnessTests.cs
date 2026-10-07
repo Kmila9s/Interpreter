@@ -13,6 +13,10 @@ namespace Interpreter.Tests;
 /// </summary>
 public static class PortStrictnessTests
 {
+    /// <summary>
+    /// Runs every port-strictness test in sequence, printing pass/fail for each.
+    /// </summary>
+    /// <returns>The number of tests that failed.</returns>
     public static int RunAllTests()
     {
         int failed = 0;

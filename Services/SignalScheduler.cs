@@ -8,6 +8,7 @@ namespace Interpreter.Services;
 /// <param name="Target">The target signal/variable to update.</param>
 /// <param name="NewValue">The new value to assign.</param>
 /// <param name="Delay">Optional delay for "after X ns" syntax.</param>
+/// <param name="SourceLine">Source line number that produced this update.</param>
 public record SignalUpdate(
     Variable Target,
     object NewValue,
@@ -46,6 +47,10 @@ public class SignalScheduler
     private ulong _currentTick = 0;
     private int _tickResolutionNs = 10;
 
+    /// <summary>
+    /// Tick resolution in nanoseconds used to convert delays into future ticks
+    /// (minimum 1 ns).
+    /// </summary>
     public int TickResolutionNs
     {
         get { lock (_lock) return _tickResolutionNs; }
@@ -79,6 +84,7 @@ public class SignalScheduler
     /// </summary>
     /// <param name="target">The target signal to update.</param>
     /// <param name="newValue">The new value to assign.</param>
+    /// <param name="sourceLine">Source line number that produced this update.</param>
     public void Schedule(Variable target, object newValue, int sourceLine = 0)
     {
         lock (_lock)
@@ -129,7 +135,7 @@ public class SignalScheduler
 
     /// <summary>
     /// Schedules a signal update for a future time.
-    /// Used for "signal <= value after X ns" syntax.
+    /// Used for "signal &lt;= value after X ns" syntax.
     /// </summary>
     /// <param name="target">The target signal to update.</param>
     /// <param name="newValue">The new value to assign.</param>
@@ -262,7 +268,10 @@ public class SignalScheduler
                 int lastLine = 0;
                 foreach (var (idx, val) in bits)
                 {
-                    int pos = width - 1 - idx;        // VHDL idx 0 = rightmost
+                    // Range-aware write: map the VHDL bit index to a storage
+                    // position via the target's declared range (falls back to
+                    // width-1-idx for the conventional downto-0 form).
+                    int pos = target.IndexToOffset(idx, width);
                     if (pos < 0 || pos >= chars.Length) continue;
                     chars[pos] = val.bit;
                     lastLine = val.sourceLine != 0 ? val.sourceLine : lastLine;

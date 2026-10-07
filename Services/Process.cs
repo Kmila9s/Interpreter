@@ -51,7 +51,7 @@ public class Process : ISControl, IControl
     /// <summary>
     /// F-G-13 MVP: true when this process's body contains any
     /// <see cref="Interpreter.Repositories.WaitForStatement"/>. Set during
-    /// <see cref="SyntetizeBehaviour"/>. The engine uses this to decide
+    /// <see cref="SyntetizeBehaviour()"/>. The engine uses this to decide
     /// whether the process is time-driven (F-G-13 path) or
     /// sensitivity-driven (legacy path via
     /// <see cref="ProcessScheduler"/>).

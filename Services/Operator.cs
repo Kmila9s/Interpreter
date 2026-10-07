@@ -429,7 +429,7 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// stale uninitialised signal can't crash a comparison.
     /// </summary>
     /// <summary>
-    /// VHDL & (concatenation) implementation. Joins two operands as
+    /// VHDL &amp; (concatenation) implementation. Joins two operands as
     /// MSB-first bit strings and returns the combined string. The result
     /// length is always (left bits + right bits) so chained patterns like
     /// <c>'0' &amp; unsigned(a) &amp; '1'</c> grow predictably; the caller

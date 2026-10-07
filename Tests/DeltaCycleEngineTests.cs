@@ -314,6 +314,7 @@ public class DeltaCycleEngineTests
     /// </summary>
     public static async Task<bool> TestSignalHistoryMultipleSteps()
     {
+        await Task.CompletedTask;
         Console.WriteLine("\n=== Test: Signal History Multiple Steps ===");
 
         // Create a counter-like signal
@@ -522,6 +523,7 @@ public class DeltaCycleEngineTests
     /// </summary>
     public static async Task<bool> TestGhdlReferenceComparison()
     {
+        await Task.CompletedTask;
         Console.WriteLine("\n=== Test: GHDL Reference Comparison ===");
 
         try

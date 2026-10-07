@@ -153,7 +153,7 @@ public static class PracticeExerciseTests
         var allSignals = new HashSet<Variable>(entity.Ports.Concat(entity.Architecture!.Signals));
         foreach (var s in allSignals)
         {
-            if (s == null) continue;
+            if (s is null) continue;
             string defaultVal = s.Size > 1 ? new string('0', s.Size) : "0";
             if (s.PortType == Constants.PortType.IN)
             {

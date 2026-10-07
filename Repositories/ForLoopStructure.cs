@@ -62,7 +62,7 @@ public class ForLoopStructure : ISControl
 
     /// <summary>
     /// The single Variable instance representing the loop iterator. Created
-    /// at <see cref="Syntetize"/> time and re-used by <see cref="ExecuteAsync"/>
+    /// at <see cref="Syntetize()"/> time and re-used by <see cref="ExecuteAsync"/>
     /// so DeferredIndex/expression-stack references stay live across
     /// iterations. Bench Phase F bug #14 fix (2026-06-06).
     /// </summary>
@@ -234,11 +234,22 @@ public class ForLoopStructure : ISControl
             int width = sig?.Size ?? 0;
             if (width <= 0) width = 1;
 
-            // We don't preserve the original `to` vs `downto` direction on
-            // a Variable today, so we assume the conventional downto form
-            // (size-1 downto 0). 'reverse_range flips it.
-            if (reverse) { RangeStart = 0; RangeEnd = width - 1; IsAscending = true;  }
-            else         { RangeStart = width - 1; RangeEnd = 0; IsAscending = false; }
+            // Range-aware: honour the signal's declared range (to/downto +
+            // bounds). Falls back to the conventional (size-1 downto 0) form
+            // when no range was recorded — identical to the legacy behaviour.
+            int effLeft, effRight; bool effDownto;
+            if (sig != null && sig.HasDeclaredRange)
+            {
+                effLeft = sig.LeftBound!.Value; effRight = sig.RightBound!.Value; effDownto = sig.IsDownto;
+            }
+            else
+            {
+                effLeft = width - 1; effRight = 0; effDownto = true;
+            }
+            // 'range walks left→right in the declared direction; 'reverse_range
+            // walks right→left with the flipped direction.
+            if (reverse) { RangeStart = effRight; RangeEnd = effLeft; IsAscending = effDownto; }
+            else         { RangeStart = effLeft;  RangeEnd = effRight; IsAscending = !effDownto; }
 
             if (_streamer.Current?.Value.ToLower() == "loop")
             {

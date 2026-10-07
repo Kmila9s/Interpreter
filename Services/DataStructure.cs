@@ -20,10 +20,10 @@ namespace Interpreter.Services;
 /// <para>
 /// Current status: Not implemented. All data structure operations are currently
 /// handled by <see cref="VariableSyntetizer"/>, <see cref="TypeRegistry"/>,
-/// and <see cref="TypeDefinition"/> classes.
+/// and <see cref="Interpreter.Models.TypeDefinition"/> classes.
 /// </para>
 /// </remarks>
-/// <seealso cref="TypeDefinition"/>
+/// <seealso cref="Interpreter.Models.TypeDefinition"/>
 /// <seealso cref="TypeRegistry"/>
 /// <seealso cref="VariableSyntetizer"/>
 public class DataStructure

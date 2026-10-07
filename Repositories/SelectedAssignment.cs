@@ -290,7 +290,9 @@ public class SelectedAssignment : ISControl
                     int width = Math.Max(Target.Size, current.Length);
                     if (width == 0) width = bitIdx + 1;
                     if (current.Length < width) current = current.PadLeft(width, '0');
-                    int pos = width - 1 - bitIdx;
+                    // Range-aware per-bit write (after-delay path): honour the
+                    // target's declared range, else fall back to width-1-bitIdx.
+                    int pos = Target.IndexToOffset(bitIdx, width);
                     if (pos >= 0 && pos < current.Length)
                     {
                         var chars = current.ToCharArray();

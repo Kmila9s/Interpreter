@@ -79,23 +79,41 @@ public readonly struct ProgressUpdate
 /// </summary>
 public enum ProcessingPhase
 {
+    /// <summary>No phase has been established yet.</summary>
     Unknown,
+    /// <summary>Interpreter setup and state preparation.</summary>
     Initializing,
+    /// <summary>Breaking the source text into tokens.</summary>
     Tokenizing,
+    /// <summary>Parsing the entity declaration.</summary>
     ParsingEntity,
+    /// <summary>Parsing entity port declarations.</summary>
     ParsingPorts,
+    /// <summary>Parsing entity generic declarations.</summary>
     ParsingGenerics,
+    /// <summary>Parsing the architecture body.</summary>
     ParsingArchitecture,
+    /// <summary>Parsing signal declarations.</summary>
     ParsingSignals,
+    /// <summary>Parsing type declarations.</summary>
     ParsingTypes,
+    /// <summary>Synthesizing behavioral logic.</summary>
     SynthesizingBehavior,
+    /// <summary>Parsing a process statement.</summary>
     ParsingProcess,
+    /// <summary>Parsing an if structure.</summary>
     ParsingIfStructure,
+    /// <summary>Parsing a case structure.</summary>
     ParsingCaseStructure,
+    /// <summary>Parsing a loop structure.</summary>
     ParsingLoop,
+    /// <summary>Evaluating an expression.</summary>
     EvaluatingExpression,
+    /// <summary>Calculating resource usage.</summary>
     CalculatingResources,
+    /// <summary>Processing has completed successfully.</summary>
     Completed,
+    /// <summary>Processing stopped due to an error.</summary>
     Error
 }
 
@@ -109,7 +127,7 @@ public class ProgressEventArgs : EventArgs
 
     /// <summary>
     /// Wraps a <see cref="ProgressUpdate"/> for delivery via the
-    /// <see cref="ProgressReporter.OnProgressChanged"/> event.
+    /// <see cref="ProgressReporter.ProgressChanged"/> event.
     /// </summary>
     /// <param name="update">The update to surface to subscribers.</param>
     public ProgressEventArgs(ProgressUpdate update)

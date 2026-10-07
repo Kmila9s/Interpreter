@@ -483,7 +483,7 @@ internal static class ProcessSynthesizer
     private static void HandleCase(CaseStructure cs, HashSet<Variable> scope,
         SynthesisContext ctx, Dictionary<string, Net> running, string sourceLine)
     {
-        if (cs.Selector == null) return;
+        if (cs.Selector is null) return;
 
         int selWidth = cs.Selector.Type == Constants.DATATYPES.STD_LOGIC_VECTOR
             ? Math.Max(1, cs.Selector.Size) : 1;

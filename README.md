@@ -10,6 +10,14 @@ This module is a core component of **Kmila-9s**, a project officially titled "Ap
 **Version:** 1.2.0 (branch `v1.2.0`)
 **Last Updated:** 2026-08-03
 
+> **Docs sync 2026-09-24** — no functional change to this module this cycle; the
+> 2026-09-23 feature batch (v1.27.0) is **app-only** (see `App/Kmila/README.md` §19).
+> Note: an older `v1.14.x` label appears in the *Current Status* section below — the
+> **Version / branch above is authoritative**. New app-side consumer: the module's
+> existing `SourceElaborator` + `Services/Api/HeadlessSimulator` path (previously used
+> only by the headless/bench flow) is now surfaced **interactively** through the app's
+> Workbench (VHDL testbench) mode — the engine itself is untouched.
+
 ---
 
 ## Table of Contents
@@ -1399,6 +1407,36 @@ while (_streamer.Current != null)
 ---
 
 ## 10. Changelog
+
+### Declared-range (to/downto + bounds) fix (2026-10-06, branch `v1.7.0`)
+
+Fixed a long-standing engine bug: index/slice/attribute resolution hard-coded the
+assumption that every vector is declared `(width-1 downto 0)`, so it mis-resolved
+**ascending** ranges (`std_logic_vector(0 to N)` read back bit-reversed) and
+**non-zero-low-bound** ranges (`(15 downto 8)`, `(7 downto 4)` off by the low bound).
+
+*   **Root cause:** the declared range was discarded at elaboration — only the vector
+    *width* survived onto `Variable`. Every offset computation used `Length-1-index`.
+*   **Fix:** `Parser.Models.Variable` now records the declared range (`LeftBound`,
+    `RightBound`, `IsDownto`) and exposes `IndexToOffset` / `SliceToSpan`. All index,
+    slice and per-bit **write** sites route through these: `DeferredIndex`,
+    `DynamicIndex`, `DeltaCycleEngine` (case-selector slices), `ParseTrace`
+    (`to_string`), `SignalScheduler` (bit-write splice), `SelectedAssignment`
+    (`with…select` delayed write). `VariableSyntetizer` populates the range for
+    signals/ports/constants and inherits it for subtype-typed signals.
+*   **Attributes:** `'high` / `'low` / `'left` / `'right` are now computed from the
+    declared range, `'ascending` is implemented, and `sig'range` / `'reverse_range`
+    loop bounds follow the declared direction (`Operation.cs`, `ForLoopStructure.cs`).
+*   **Invariant / non-regression:** internal storage is unchanged (MSB-first, declaration
+    order). When no range is recorded the helper falls back to `Length-1-index`, which is
+    byte-identical to the old behaviour — so every `(N-1 downto 0)` vector is unaffected.
+    Validated against GHDL 6.0.0: the full 148-case `SimulatorBench` corpus stays
+    148/148, and ascending / offset reads, writes and attributes now match GHDL.
+*   **Known remaining work:** declared-range population is not yet wired for function
+    parameters, function return types, subprogram locals, record fields, or aliases —
+    these fall back safely to the conventional form (no regression, but `to`/offset
+    ranges in those specific declaration spots are not yet corrected). Named aggregates
+    on `downto` arrays are intentionally left consistent with the array element-read path.
 
 ### Documentation re-sync (2026-08-03, branch `v1.2.0`)
 

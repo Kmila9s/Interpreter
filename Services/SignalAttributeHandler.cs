@@ -53,6 +53,8 @@ public class SignalAttributeHandler
     /// Set by <c>DeltaCycleEngine.SetContext</c>; defaults to 1 so unit-tests that don't
     /// touch a full engine still round-trip 1 ns per tick.</summary>
     private int _tickResolutionNs = 1;
+    /// <summary>Tick resolution (ns per tick) used to scale caller-supplied ns
+    /// durations into the internal tick scale. Clamped to a minimum of 1.</summary>
     public int TickResolutionNs
     {
         get => _tickResolutionNs;
@@ -60,6 +62,7 @@ public class SignalAttributeHandler
     }
 
     private static SignalAttributeHandler? _instance;
+    /// <summary>Lazily-created process-wide singleton instance.</summary>
     public static SignalAttributeHandler Instance => _instance ??= new SignalAttributeHandler();
 
     /// <summary>
@@ -202,6 +205,12 @@ public class SignalAttributeHandler
     public object GetLastValue(Variable signal) =>
         _previousValues.TryGetValue(signal, out var v) ? v : signal.Value!;
 
+    /// <summary>
+    /// signal'last_value looked up by signal name. Returns "U" when the name is
+    /// unknown or the signal has never transitioned.
+    /// </summary>
+    /// <param name="signalName">The name of the signal to query.</param>
+    /// <returns>The last value held before the most recent transition, or "U".</returns>
     public object GetLastValue(string signalName) =>
         _byName.TryGetValue(signalName, out var s) && _previousValues.TryGetValue(s, out var v) ? v : "U";
 

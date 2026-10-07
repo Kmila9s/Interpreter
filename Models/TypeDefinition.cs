@@ -87,7 +87,7 @@ public class TypeDefinition
     public bool IsDownto { get; set; } = false;
 
     /// <summary>
-    /// Gets or sets whether the array is unconstrained (uses "natural range <>").
+    /// Gets or sets whether the array is unconstrained (uses "natural range &lt;&gt;").
     /// </summary>
     public bool IsUnconstrained { get; set; } = false;
 

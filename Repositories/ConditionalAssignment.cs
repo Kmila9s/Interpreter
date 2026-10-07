@@ -135,6 +135,7 @@ public class ConditionalAssignment : ISControl
     /// Assigns a value to the target signal.
     /// </summary>
     /// <param name="valueExpression">The expression to evaluate and assign.</param>
+    /// <param name="scheduler">Optional signal scheduler used to queue the assignment; null for immediate.</param>
     private void AssignValue(string valueExpression, Services.SignalScheduler? scheduler = null)
     {
         if (Target is null)
@@ -306,7 +307,7 @@ public class ConditionalAssignment : ISControl
     /// <summary>
     /// Parses a conditional assignment from raw operation string.
     /// </summary>
-    /// <param name="operation">The raw operation string like "target <= val1 when cond1 else val2".</param>
+    /// <param name="operation">The raw operation string like "target &lt;= val1 when cond1 else val2".</param>
     /// <param name="variables">The variables in scope.</param>
     /// <returns>A new ConditionalAssignment instance, or null if not a conditional assignment.</returns>
     public static ConditionalAssignment? TryParse(string operation, HashSet<Variable> variables)

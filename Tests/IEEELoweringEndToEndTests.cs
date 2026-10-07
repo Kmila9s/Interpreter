@@ -8,7 +8,7 @@ namespace Interpreter.Tests;
 
 /// <summary>
 /// End-to-end coverage that goes from a real-shaped Operation tree (the
-/// kind <see cref="Operation.Synthesize"/> produces) through
+/// kind <c>Operation.Synthesize</c> produces) through
 /// <see cref="ConcurrentAssignSynthesizer.SynthesizeInto"/> and asserts
 /// the resulting netlist contains the IEEE primitive cells. Proves the
 /// v3.1 wiring (extended <see cref="DeferredFunction.ShouldDefer"/>) is

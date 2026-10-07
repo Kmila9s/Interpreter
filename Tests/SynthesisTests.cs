@@ -17,6 +17,10 @@ namespace Interpreter.Tests;
 /// </summary>
 public static class SynthesisTests
 {
+    /// <summary>
+    /// Runs every synthesis test in sequence, printing pass/fail for each.
+    /// </summary>
+    /// <returns>The number of tests that failed.</returns>
     public static async Task<int> RunAllTests()
     {
         int failed = 0;
@@ -62,7 +66,7 @@ public static class SynthesisTests
     }
 
     /// <summary>
-    /// `y <= a and b;` over std_logic ports produces exactly one AND
+    /// `y &lt;= a and b;` over std_logic ports produces exactly one AND
     /// cell whose output drives `y` through a BUF (the synthesizer's
     /// uniform LHS hookup).
     /// </summary>
@@ -84,7 +88,7 @@ public static class SynthesisTests
     }
 
     /// <summary>
-    /// `y <= (a and b) or c;` should emit one AND and one OR.
+    /// `y &lt;= (a and b) or c;` should emit one AND and one OR.
     /// </summary>
     private static bool TestAndOr()
     {
