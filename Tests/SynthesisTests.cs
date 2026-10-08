@@ -41,6 +41,8 @@ public static class SynthesisTests
             ("Probe: dip-adder resize/unsigned/+ chain",   TestDipAdderProbe),
             ("Async-reset (if reset then; elsif rising_edge) → DFF", TestAsyncResetDff),
             ("Component instantiation → BLACKBOX_COMPONENT cell",   TestComponentInstantiationBlackbox),
+            ("Block graph: coarsen + block layout",                 TestBlockGraphLayout),
+            ("Block graph: colliding source lines → unique ids",    TestBlockGraphUniqueIds),
         };
 
         foreach (var (name, run) in tests)
@@ -391,6 +393,84 @@ public static class SynthesisTests
     /// the two `unsigned` BUF-casts land. Passes iff at least one ADD cell is emitted
     /// (the presence-check is what the schematic export failure boils down to).
     /// </summary>
+    /// <summary>
+    /// Block-level pipeline smoke test: synthesize a small datapath (register
+    /// fed by an adder), coarsen it into functional blocks with
+    /// <see cref="BlockGraphBuilder"/>, and lay those out with the per-block
+    /// sizing. Asserts the coarsening produced fewer, labelled blocks and the
+    /// block layout placed every one with a non-degenerate canvas — the paths
+    /// the RTL / Nodos render styles depend on.
+    /// </summary>
+    private static bool TestBlockGraphLayout()
+    {
+        var (entity, scope) = BuildEntity("accum", new[] {
+            ("a",   PortType.IN,  DATATYPES.STD_LOGIC_VECTOR, 4),
+            ("b",   PortType.IN,  DATATYPES.STD_LOGIC_VECTOR, 4),
+            ("clk", PortType.IN,  DATATYPES.STD_LOGIC, 1),
+            ("sum", PortType.OUT, DATATYPES.STD_LOGIC_VECTOR, 5),
+        });
+        entity.Architecture.Tasks.Add(new Operation(
+            "sum <= std_logic_vector(resize(unsigned(a), 5) + resize(unsigned(b), 5))", scope));
+
+        var net = Synthesizer.Synthesize(entity);
+        var blocks = BlockGraphBuilder.Build(net);
+        Console.WriteLine($"  gate cells={net.Cells.Count}  blocks={blocks.Cells.Count}");
+
+        // Every block must carry the marker + a label, and reference only nets
+        // that survive in the block netlist.
+        var netIds = blocks.Nets.Select(n => n.Id).ToHashSet();
+        bool allLabelled = blocks.Cells.All(c =>
+            c.Attrs != null
+            && c.Attrs.ContainsKey(BlockGraphBuilder.BlockAttr)
+            && c.Attrs.TryGetValue(BlockGraphBuilder.LabelAttr, out var l) && !string.IsNullOrEmpty(l));
+        bool portsResolve = blocks.Cells.All(c =>
+            c.Inputs.All(p => netIds.Contains(p.NetId)) && c.Outputs.All(p => netIds.Contains(p.NetId)));
+
+        var layout = Interpreter.Synthesis.Layout.LayeredLayout.Layout(
+            blocks, groupAware: false, sizeOf: BlockGraphBuilder.BlockSize);
+        bool placedAll = blocks.Cells.All(c => layout.CellBounds.ContainsKey(c.Id));
+        bool saneCanvas = layout.CanvasWidth > 0 && layout.CanvasHeight > 0;
+
+        Console.WriteLine($"  labelled={allLabelled} portsResolve={portsResolve} placedAll={placedAll} canvas={layout.CanvasWidth}x{layout.CanvasHeight}");
+        return blocks.Cells.Count >= 1 && blocks.Cells.Count <= net.Cells.Count
+            && allLabelled && portsResolve && placedAll && saneCanvas;
+    }
+
+    /// <summary>
+    /// Regression: two statements whose source-line text sanitises to the same
+    /// id (e.g. <c>q &lt;= q + 1</c> and <c>q &lt;= q - 1</c>) must still produce
+    /// distinct block ids — a duplicate id used to throw ArgumentException when
+    /// the viewer built its per-id lookup dictionaries.
+    /// </summary>
+    private static bool TestBlockGraphUniqueIds()
+    {
+        var nets = new List<Net>
+        {
+            new("n_in",  "d",  NetKind.Wire, 1, NetOrigin.PortIn),
+            new("n_o1",  "q1", NetKind.Wire, 1, NetOrigin.PortOut),
+            new("n_o2",  "q2", NetKind.Wire, 1, NetOrigin.PortOut),
+        };
+        var cells = new List<Cell>
+        {
+            new("c1", CellKind.ADD, new[]{ new Pin("A","n_in") }, new[]{ new Pin("Y","n_o1") }, SourceLine: "q <= q + 1"),
+            new("c2", CellKind.SUB, new[]{ new Pin("A","n_in") }, new[]{ new Pin("Y","n_o2") }, SourceLine: "q <= q - 1"),
+        };
+        var ports = new List<PortPin>
+        {
+            new("d",  PortDir.In,  1, "n_in"),
+            new("q1", PortDir.Out, 1, "n_o1"),
+            new("q2", PortDir.Out, 1, "n_o2"),
+        };
+        var netlist = new Netlist("collide", ports, nets, cells,
+            new List<Interpreter.Synthesis.Diagnostic>());
+
+        var blocks = BlockGraphBuilder.Build(netlist);
+        var ids = blocks.Cells.Select(c => c.Id).ToList();
+        int distinct = ids.Distinct(StringComparer.Ordinal).Count();
+        Console.WriteLine($"  block ids: [{string.Join(", ", ids)}]  distinct={distinct}/{ids.Count}");
+        return ids.Count == 2 && distinct == 2;
+    }
+
     private static bool TestDipAdderProbe()
     {
         var (entity, scope) = BuildEntity("dip_adder", new[] {

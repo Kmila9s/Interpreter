@@ -92,8 +92,27 @@ public static class LayeredLayout
     /// tints stay compact and non-overlapping. When false, falls back to
     /// the legacy per-column-centered placement.
     /// </param>
-    public static LaidOutNetlist Layout(Netlist netlist, bool groupAware = true)
+    /// <param name="sizeOf">
+    /// Optional per-cell size override. Defaults to the uniform gate box
+    /// (<see cref="GateW"/>×<see cref="GateH"/>) used by the gate-level
+    /// styles, so the gate layout is unchanged bit-for-bit. Block-level
+    /// styles pass a function that sizes each block by its port count and
+    /// label; those run with <paramref name="groupAware"/> = false.
+    /// </param>
+    /// <param name="colGap">Horizontal gap between columns. Defaults to the
+    /// gate spacing; block styles pass a larger value so their bigger boxes
+    /// and feedback wires have room and overlap less.</param>
+    /// <param name="rowGap">Vertical gap between stacked nodes in a column.</param>
+    /// <param name="crossingSweeps">How many barycenter ordering passes to run.
+    /// 1 (default) is the single forward sweep the gate layout has always used,
+    /// so its coordinates are unchanged. Block layouts pass more to run extra
+    /// alternating passes that noticeably reduce wire crossings in dense graphs.</param>
+    public static LaidOutNetlist Layout(Netlist netlist, bool groupAware = true,
+        Func<Cell, (double Width, double Height)>? sizeOf = null,
+        double? colGap = null, double? rowGap = null, int crossingSweeps = 1)
     {
+        double colGapV = colGap ?? ColGap;
+        double rowGapV = rowGap ?? RowGap;
         // 1. Build cell-to-cell adjacency from net producer/consumer maps.
         var producerOf = new Dictionary<string, string>(StringComparer.Ordinal); // netId → cellId producing it
         foreach (var c in netlist.Cells)
@@ -169,6 +188,49 @@ public static class LayeredLayout
             for (int i = 0; i < scored.Count; i++) rowIndex[scored[i]] = i;
         }
 
+        // Extra alternating barycenter sweeps (block layouts only; gate layouts
+        // keep crossingSweeps=1 and skip this, so their geometry is unchanged).
+        // Reorders a column by the average row of its upstream producers or its
+        // downstream consumers; cells with no neighbour on that side keep their
+        // current row so isolated nodes don't all collapse to the top.
+        void ReorderColumn(int col, bool useDownstream)
+        {
+            var scored = columns[col]
+                .Select(id =>
+                {
+                    var cell = byCellId[id];
+                    double sum = 0; int n = 0;
+                    if (useDownstream)
+                    {
+                        foreach (var pin in cell.Outputs)
+                            if (consumersOf.TryGetValue(pin.NetId, out var cons))
+                                foreach (var cid in cons)
+                                    if (rowIndex.TryGetValue(cid, out var rr)) { sum += rr; n++; }
+                    }
+                    else
+                    {
+                        foreach (var pin in cell.Inputs)
+                            if (producerOf.TryGetValue(pin.NetId, out var upId)
+                                && rowIndex.TryGetValue(upId, out var up)) { sum += up; n++; }
+                    }
+                    double cur = rowIndex.TryGetValue(id, out var ci2) ? ci2 : 0;
+                    return (id, avg: n > 0 ? sum / n : cur);
+                })
+                .OrderBy(x => x.avg)
+                .Select(x => x.id)
+                .ToList();
+            columns[col] = scored;
+            for (int i = 0; i < scored.Count; i++) rowIndex[scored[i]] = i;
+        }
+
+        for (int s = 1; s < crossingSweeps; s++)
+        {
+            if (s % 2 == 1) // backward (right-to-left), order by downstream
+                for (int col = columns.Count - 2; col >= 1; col--) ReorderColumn(col, useDownstream: true);
+            else            // forward (left-to-right), order by upstream
+                for (int col = 1; col < columns.Count; col++) ReorderColumn(col, useDownstream: false);
+        }
+
         // 4. Compute coordinates with left-to-right port placement:
         //    [LeftPortStrip] EdgePad [col0 ColGap col1 ...] EdgePad [RightPortStrip]
         //
@@ -185,9 +247,29 @@ public static class LayeredLayout
         var outPorts = netlist.Ports.Where(p => p.Direction is PortDir.Out or PortDir.Buffer).ToList();
         double portMinH = Math.Max(inPorts.Count, outPorts.Count) * 50;
 
-        double ColX(int col) => PortStripW + EdgePad + col * (GateW + ColGap);
-        double canvasW = PortStripW + EdgePad + Math.Max(1, columns.Count) * GateW
-            + Math.Max(0, columns.Count - 1) * ColGap + EdgePad + PortStripW;
+        // Per-cell sizes. Default is the uniform gate box, which keeps the
+        // gate-level path's coordinates identical; block styles pass a sizeOf
+        // that returns a larger, port-count-driven box per block.
+        var sz = sizeOf ?? (_ => (GateW, GateH));
+        var cellSize = new Dictionary<string, (double W, double H)>(StringComparer.Ordinal);
+        foreach (var c in netlist.Cells) cellSize[c.Id] = sz(c);
+        double CellW(string id) => cellSize.TryGetValue(id, out var s) ? s.W : GateW;
+        double CellH(string id) => cellSize.TryGetValue(id, out var s) ? s.H : GateH;
+
+        // Per-column widths + cumulative column X. With the uniform default
+        // this reduces exactly to PortStripW+EdgePad+col*(GateW+ColGap).
+        int nCols = Math.Max(1, columns.Count);
+        var colW = new double[nCols];
+        for (int i = 0; i < nCols; i++)
+            colW[i] = (i < columns.Count && columns[i].Count > 0)
+                ? columns[i].Max(id => CellW(id)) : GateW;
+        var colXArr = new double[nCols];
+        {
+            double x = PortStripW + EdgePad;
+            for (int i = 0; i < nCols; i++) { colXArr[i] = x; x += colW[i] + colGapV; }
+        }
+        double ColX(int col) => colXArr[col];
+        double canvasW = colXArr[nCols - 1] + colW[nCols - 1] + EdgePad + PortStripW;
 
         var cellBounds = new Dictionary<string, Rect>(StringComparer.Ordinal);
         double interiorH;
@@ -204,7 +286,7 @@ public static class LayeredLayout
                 if (seenBand.Add(key)) bandOrder.Add(key);
             }
 
-            double slot = GateH + RowGap;
+            double slot = GateH + rowGapV;
             double y = TopPad;
             foreach (var band in bandOrder)
             {
@@ -224,7 +306,7 @@ public static class LayeredLayout
                 }
                 if (bandRows == 0) continue;
 
-                double bandH = bandRows * GateH + Math.Max(0, bandRows - 1) * RowGap;
+                double bandH = bandRows * GateH + Math.Max(0, bandRows - 1) * rowGapV;
                 for (int col = 0; col < columns.Count; col++)
                 {
                     var list = perCol[col];
@@ -242,16 +324,29 @@ public static class LayeredLayout
         }
         else
         {
-            int rowsTall = columns.Count == 0 ? 0 : columns.Max(c => c.Count);
-            double bodyH = Math.Max(GateH, rowsTall * (GateH + RowGap));
+            // Variable-height columns: stack each column's cells by their own
+            // height + RowGap, and vertically centre every column on the
+            // tallest one. Supports block styles whose nodes differ in size.
+            double ColHeight(int col)
+            {
+                var ids = columns[col];
+                double h = 0;
+                for (int r = 0; r < ids.Count; r++) h += CellH(ids[r]);
+                return h + Math.Max(0, ids.Count - 1) * rowGapV;
+            }
+            double maxColH = 0;
+            for (int col = 0; col < columns.Count; col++) maxColH = Math.Max(maxColH, ColHeight(col));
+            double bodyH = Math.Max(GateH, maxColH);
             interiorH = Math.Max(bodyH, portMinH);
             for (int col = 0; col < columns.Count; col++)
             {
-                int rows = columns[col].Count;
-                double colHeight = rows * (GateH + RowGap);
-                double y0 = TopPad + (interiorH - colHeight) / 2.0;
-                for (int row = 0; row < rows; row++)
-                    cellBounds[columns[col][row]] = new Rect(ColX(col), y0 + row * (GateH + RowGap), GateW, GateH);
+                var ids = columns[col];
+                double y = TopPad + (interiorH - ColHeight(col)) / 2.0;
+                for (int row = 0; row < ids.Count; row++)
+                {
+                    cellBounds[ids[row]] = new Rect(ColX(col), y, CellW(ids[row]), CellH(ids[row]));
+                    y += CellH(ids[row]) + rowGapV;
+                }
             }
         }
 
