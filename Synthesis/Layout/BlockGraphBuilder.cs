@@ -29,15 +29,56 @@ public static class BlockGraphBuilder
     /// <summary>Builds the block-level netlist from a (simplified) netlist.</summary>
     public static Netlist Build(Netlist src)
     {
-        // 1. Assign each non-constant cell a block key. Cells with a source
-        //    line group by statement; nameless synthetic cells get their own
-        //    block so they never silently vanish.
+        // 0. A single VHDL statement often synthesises into an anonymous
+        //    sub-expression that feeds the real statement — e.g. the
+        //    `step_q = "000" or step_q = "001" or …` condition (SourceLine
+        //    "_expr_<id>") that drives a `phase <= '1' when … else '0'` mux.
+        //    Grouping purely by SourceLine would split that one statement into a
+        //    comparator box wired across the canvas to a distant mux box (the
+        //    comparator's constant chips then look like they float). Fold each
+        //    anonymous sub-expression into the single downstream statement it
+        //    feeds so one statement renders as one block. A sub-expression that
+        //    fans out to several statements has no single home and stays on its
+        //    own key.
+        var consumersOfNet = new Dictionary<string, List<Cell>>(StringComparer.Ordinal);
+        foreach (var c in src.Cells)
+            if (c.Kind != CellKind.CONST)
+                foreach (var p in c.Inputs)
+                {
+                    if (!consumersOfNet.TryGetValue(p.NetId, out var cl))
+                        consumersOfNet[p.NetId] = cl = new();
+                    cl.Add(c);
+                }
+
+        var effKey = new Dictionary<string, string>(StringComparer.Ordinal);
+        string KeyOf(Cell c)
+        {
+            string Walk(Cell cell, HashSet<string> seen)
+            {
+                if (effKey.TryGetValue(cell.Id, out var cached)) return cached;
+                if (!IsAnon(cell)) return effKey[cell.Id] = "L:" + cell.SourceLine;
+                if (!seen.Add(cell.Id)) return "§:" + cell.Id; // cycle → stand alone
+                var targets = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var outPin in cell.Outputs)
+                    if (consumersOfNet.TryGetValue(outPin.NetId, out var cons))
+                        foreach (var cc in cons)
+                            if (cc.Id != cell.Id) targets.Add(Walk(cc, seen));
+                seen.Remove(cell.Id);
+                var key = targets.Count == 1 ? targets.First() : "§:" + cell.Id;
+                return effKey[cell.Id] = key;
+            }
+            return Walk(c, new HashSet<string>(StringComparer.Ordinal));
+        }
+
+        // 1. Assign each non-constant cell its (folded) block key. Cells with a
+        //    statement source line group by statement; nameless synthetic cells
+        //    get their own block so they never silently vanish.
         var members = new Dictionary<string, List<Cell>>(StringComparer.Ordinal);
         var keyOrder = new List<string>();
         foreach (var c in src.Cells)
         {
             if (c.Kind == CellKind.CONST) continue; // constants ride on wires, not blocks
-            var key = c.SourceLine is { Length: > 0 } sl ? "L:" + sl : "§:" + c.Id;
+            var key = KeyOf(c);
             if (!members.TryGetValue(key, out var list))
             {
                 members[key] = list = new();
@@ -137,7 +178,9 @@ public static class BlockGraphBuilder
                 Kind: kind,
                 Inputs: inputs,
                 Outputs: outputs,
-                SourceLine: group[0].SourceLine,
+                // Carry a real statement line (not an anonymous sub-expression)
+                // so source-line features key off the owning statement.
+                SourceLine: (group.FirstOrDefault(c => !IsAnon(c)) ?? group[0]).SourceLine,
                 Attrs: attrs));
         }
 
@@ -157,6 +200,13 @@ public static class BlockGraphBuilder
         double h = Math.Max(84, 40 + rows * 26);
         return (184, h);
     }
+
+    // An "anonymous" cell carries no owning statement: either no source line
+    // at all, or a synthesised sub-expression line ("_expr_<id>") the
+    // synthesiser emits for an operand group. These fold into the statement
+    // they feed rather than standing as their own block.
+    private static bool IsAnon(Cell c) =>
+        !(c.SourceLine is { Length: > 0 } s) || s.StartsWith("_expr", StringComparison.Ordinal);
 
     private static bool ConsumedOutside(string netId, Netlist src, HashSet<string> memberIds)
     {
