@@ -7,16 +7,18 @@ This module is a core component of **Kmila-9s**, a project officially titled "Ap
 **Author:** Ulrich Tamayo Daniel
 **Email:** dulricht1700@alumno.ipn.mx
 **Email 2:** danielulrichtamayo@gmail.com
-**Version:** 1.2.0 (branch `v1.2.0`)
-**Last Updated:** 2026-08-03
+**Version:** 1.9.0 (branch `v1.9.0`)
+**Last Updated:** 2026-10-08
 
-> **Docs sync 2026-09-24** — no functional change to this module this cycle; the
-> 2026-09-23 feature batch (v1.27.0) is **app-only** (see `App/Kmila/README.md` §19).
-> Note: an older `v1.14.x` label appears in the *Current Status* section below — the
-> **Version / branch above is authoritative**. New app-side consumer: the module's
-> existing `SourceElaborator` + `Services/Api/HeadlessSimulator` path (previously used
-> only by the headless/bench flow) is now surfaced **interactively** through the app's
-> Workbench (VHDL testbench) mode — the engine itself is untouched.
+> **Update 2026-10-08 (v1.9.0)** — schematic layout only; the simulation engine is
+> untouched. Added **obstacle-aware wire routing** for the block styles (RTL/Nodos):
+> `Synthesis/Layout/OrthogonalRouter.cs` routes every net through the empty column
+> corridors and a dedicated feedback lane so no wire crosses a block or overlaps a
+> self-loop. Opt-in via `LayeredLayout.Layout(obstacleRouting: true)` — the default
+> (gate styles) keeps the legacy midpoint elbow byte-for-byte, and block positions are
+> unchanged. New invariant test `TestBlockWiresAvoidBlocks` (run the synthesis suite
+> alone with `dotnet run -f net9.0 -- --test-synth`). The **Version / branch above is
+> authoritative** (an older `v1.14.x` label may appear in *Current Status* below).
 
 ---
 

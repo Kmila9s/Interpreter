@@ -107,9 +107,15 @@ public static class LayeredLayout
     /// 1 (default) is the single forward sweep the gate layout has always used,
     /// so its coordinates are unchanged. Block layouts pass more to run extra
     /// alternating passes that noticeably reduce wire crossings in dense graphs.</param>
+    /// <param name="obstacleRouting">When true, wires are routed by the
+    /// obstacle-aware <see cref="OrthogonalRouter"/> (threads through the empty
+    /// column corridors and a feedback lane so no wire crosses a block). Block
+    /// styles pass true; gate styles keep the legacy midpoint elbow so their
+    /// geometry is unchanged bit-for-bit.</param>
     public static LaidOutNetlist Layout(Netlist netlist, bool groupAware = true,
         Func<Cell, (double Width, double Height)>? sizeOf = null,
-        double? colGap = null, double? rowGap = null, int crossingSweeps = 1)
+        double? colGap = null, double? rowGap = null, int crossingSweeps = 1,
+        bool obstacleRouting = false)
     {
         double colGapV = colGap ?? ColGap;
         double rowGapV = rowGap ?? RowGap;
@@ -385,14 +391,44 @@ public static class LayeredLayout
             portPositions[outPorts[i].NetId] = (canvasW - PortStripW / 2.0, TopPad + frac * interiorH);
         }
 
-        // 7. Wire routing. Two-pass strategy:
+        // 7. Wire routing.
+        var wires = new List<WirePath>();
+
+        if (obstacleRouting)
+        {
+            // Obstacle-aware routing for the block styles: thread every wire
+            // through the empty column corridors and a feedback lane so none
+            // crosses a block. The router grows the canvas downward if it needs
+            // extra feedback lanes.
+            var router = new OrthogonalRouter(colXArr, colW, nCols, PortStripW, canvasW, canvasH, cellBounds.Values.ToList());
+            for (int netIdx = 0; netIdx < netlist.Nets.Count; netIdx++)
+            {
+                var net = netlist.Nets[netIdx];
+                var src = ResolveSource(net.Id, producerOf, pinPositions, portPositions, netlist);
+                if (src is not var (sx, sy, fromCellId)) continue;
+                var sinks = ResolveSinks(net.Id, consumersOf, pinPositions, portPositions, netlist).ToList();
+                if (sinks.Count == 0) continue;
+
+                foreach (var (tx, ty, toCellId) in sinks)
+                {
+                    wires.Add(new WirePath(
+                        net.Id,
+                        router.Route(net.Id, sx, sy, tx, ty),
+                        FromCellId: fromCellId,
+                        ToCellId: toCellId));
+                }
+            }
+            canvasH = router.CanvasHeight;
+            return new LaidOutNetlist(netlist, cellBounds, pinPositions, portPositions, wires, canvasW, canvasH);
+        }
+
+        // Legacy gate-style routing. Two-pass strategy:
         //    a) For each net, derive a single trunk-x sitting in the
         //       column gap between source and the closest sink. Every
         //       wire of the net shares that trunk so fan-outs visually
         //       collapse to a tree rather than N independent paths.
         //    b) Stagger trunk-x per net inside its gap so unrelated nets
         //       crossing the same gap don't draw on top of each other.
-        var wires = new List<WirePath>();
         // Per-gap counter: how many distinct nets we've already routed
         // through this gap. Drives the lane offset.
         var gapNetIndex = new Dictionary<int, int>();

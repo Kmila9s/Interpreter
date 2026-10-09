@@ -43,6 +43,8 @@ public static class SynthesisTests
             ("Component instantiation → BLACKBOX_COMPONENT cell",   TestComponentInstantiationBlackbox),
             ("Block graph: coarsen + block layout",                 TestBlockGraphLayout),
             ("Block graph: colliding source lines → unique ids",    TestBlockGraphUniqueIds),
+            ("Block graph: sub-expression folds into its statement", TestBlockGraphFoldsSubExpression),
+            ("Block routing: no wire crosses a block interior",       TestBlockWiresAvoidBlocks),
         };
 
         foreach (var (name, run) in tests)
@@ -469,6 +471,165 @@ public static class SynthesisTests
         int distinct = ids.Distinct(StringComparer.Ordinal).Count();
         Console.WriteLine($"  block ids: [{string.Join(", ", ids)}]  distinct={distinct}/{ids.Count}");
         return ids.Count == 2 && distinct == 2;
+    }
+
+    /// <summary>
+    /// Regression: a statement that synthesises an anonymous sub-expression
+    /// (SourceLine "_expr_…", e.g. the condition of a <c>when/else</c>) feeding
+    /// the real statement must fold into ONE block — not a comparator box wired
+    /// across the canvas to a distant mux box, which left the comparator's
+    /// constant chips looking like they floated in empty space.
+    /// </summary>
+    private static bool TestBlockGraphFoldsSubExpression()
+    {
+        var nets = new List<Net>
+        {
+            new("n_sel",  "sel",  NetKind.Wire, 2, NetOrigin.PortIn),
+            new("n_cond", "cond", NetKind.Wire, 1, NetOrigin.Signal),
+            new("n_y",    "y",    NetKind.Wire, 1, NetOrigin.PortOut),
+        };
+        var cells = new List<Cell>
+        {
+            // Anonymous condition sub-expression (sel = "01") on its own _expr line…
+            new("eq",  CellKind.EQ,  new[]{ new Pin("A","n_sel") },  new[]{ new Pin("Y","n_cond") },
+                SourceLine: "_expr_deadbeef"),
+            // …feeding the real when/else statement that selects y.
+            new("mux", CellKind.MUX, new[]{ new Pin("S","n_cond") }, new[]{ new Pin("Y","n_y") },
+                SourceLine: "y <= '1' when sel = \"01\" else '0'"),
+        };
+        var ports = new List<PortPin>
+        {
+            new("sel", PortDir.In,  2, "n_sel"),
+            new("y",   PortDir.Out, 1, "n_y"),
+        };
+        var netlist = new Netlist("whenelse", ports, nets, cells,
+            new List<Interpreter.Synthesis.Diagnostic>());
+
+        var blocks = BlockGraphBuilder.Build(netlist);
+        bool anyExprLine = blocks.Cells.Any(c =>
+            c.SourceLine != null && c.SourceLine.StartsWith("_expr", StringComparison.Ordinal));
+        Console.WriteLine($"  blocks={blocks.Cells.Count}  anyExprSourceLine={anyExprLine}");
+        // The two cells collapse to a single block carrying the real line, and
+        // no block is left keyed to the anonymous sub-expression.
+        return blocks.Cells.Count == 1 && !anyExprLine;
+    }
+
+    /// <summary>
+    /// Invariant for the obstacle-aware router (block styles): no wire segment
+    /// may cut through a block's interior. Exercises the two hard cases — a
+    /// self-feedback loop (output returning to its own input) and a forward net
+    /// spanning several columns — plus the collide fixture.
+    /// </summary>
+    private static bool TestBlockWiresAvoidBlocks()
+    {
+        bool ok = true;
+
+        // Fixture 1 — self-feedback: a block whose output drives its own input
+        // (and an output port). The return path must not overlap the block.
+        {
+            var nets = new List<Net>
+            {
+                new("n_en", "en", NetKind.Wire, 1, NetOrigin.PortIn),
+                new("n_q",  "q",  NetKind.Wire, 1, NetOrigin.PortOut),
+            };
+            var cells = new List<Cell>
+            {
+                new("acc", CellKind.ADD, new[]{ new Pin("A","n_q"), new Pin("B","n_en") },
+                    new[]{ new Pin("Y","n_q") }, SourceLine: "q <= q + en"),
+            };
+            var ports = new List<PortPin>
+            {
+                new("en", PortDir.In,  1, "n_en"),
+                new("q",  PortDir.Out, 1, "n_q"),
+            };
+            ok &= CheckWiresAvoidBlocks("self-feedback",
+                new Netlist("fb", ports, nets, cells, new List<Interpreter.Synthesis.Diagnostic>()));
+        }
+
+        // Fixture 2 — multi-column forward span: c1 feeds both c2 and the
+        // further-downstream c3, so c1→c3 skips a column.
+        {
+            var nets = new List<Net>
+            {
+                new("n_in", "d",  NetKind.Wire, 1, NetOrigin.PortIn),
+                new("n1",   "s1", NetKind.Wire, 1, NetOrigin.Signal),
+                new("n2",   "s2", NetKind.Wire, 1, NetOrigin.Signal),
+                new("n_o",  "o",  NetKind.Wire, 1, NetOrigin.PortOut),
+            };
+            var cells = new List<Cell>
+            {
+                new("c1", CellKind.BUF, new[]{ new Pin("A","n_in") }, new[]{ new Pin("Y","n1") }, SourceLine: "s1 <= d"),
+                new("c2", CellKind.BUF, new[]{ new Pin("A","n1") },   new[]{ new Pin("Y","n2") }, SourceLine: "s2 <= s1"),
+                new("c3", CellKind.ADD, new[]{ new Pin("A","n2"), new Pin("B","n1") }, new[]{ new Pin("Y","n_o") }, SourceLine: "o <= s2 + s1"),
+            };
+            var ports = new List<PortPin>
+            {
+                new("d", PortDir.In,  1, "n_in"),
+                new("o", PortDir.Out, 1, "n_o"),
+            };
+            ok &= CheckWiresAvoidBlocks("multi-span",
+                new Netlist("span", ports, nets, cells, new List<Interpreter.Synthesis.Diagnostic>()));
+        }
+
+        // Fixture 3 — the colliding-source-lines fixture (two parallel blocks).
+        {
+            var nets = new List<Net>
+            {
+                new("n_in",  "d",  NetKind.Wire, 1, NetOrigin.PortIn),
+                new("n_o1",  "q1", NetKind.Wire, 1, NetOrigin.PortOut),
+                new("n_o2",  "q2", NetKind.Wire, 1, NetOrigin.PortOut),
+            };
+            var cells = new List<Cell>
+            {
+                new("c1", CellKind.ADD, new[]{ new Pin("A","n_in") }, new[]{ new Pin("Y","n_o1") }, SourceLine: "q1 <= d + 1"),
+                new("c2", CellKind.SUB, new[]{ new Pin("A","n_in") }, new[]{ new Pin("Y","n_o2") }, SourceLine: "q2 <= d - 1"),
+            };
+            var ports = new List<PortPin>
+            {
+                new("d",  PortDir.In,  1, "n_in"),
+                new("q1", PortDir.Out, 1, "n_o1"),
+                new("q2", PortDir.Out, 1, "n_o2"),
+            };
+            ok &= CheckWiresAvoidBlocks("parallel",
+                new Netlist("collide", ports, nets, cells, new List<Interpreter.Synthesis.Diagnostic>()));
+        }
+
+        return ok;
+    }
+
+    /// <summary>Builds the block layout with obstacle routing on and asserts no
+    /// routed segment passes through a block interior (shrunk slightly so a pin
+    /// stub touching the edge isn't a false positive).</summary>
+    private static bool CheckWiresAvoidBlocks(string label, Netlist netlist)
+    {
+        const double inset = 2.0;
+        var blocks = BlockGraphBuilder.Build(netlist);
+        var layout = LayeredLayout.Layout(blocks, groupAware: false,
+            sizeOf: BlockGraphBuilder.BlockSize, colGap: 260, rowGap: 120,
+            crossingSweeps: 4, obstacleRouting: true);
+
+        int crossings = 0;
+        foreach (var wire in layout.Wires)
+        {
+            for (int i = 0; i + 1 < wire.Points.Count; i++)
+            {
+                var (x1, y1) = wire.Points[i];
+                var (x2, y2) = wire.Points[i + 1];
+                double loX = Math.Min(x1, x2), hiX = Math.Max(x1, x2);
+                double loY = Math.Min(y1, y2), hiY = Math.Max(y1, y2);
+                foreach (var b in layout.CellBounds.Values)
+                {
+                    double l = b.X + inset, r = b.X + b.Width - inset;
+                    double t = b.Y + inset, bot = b.Y + b.Height - inset;
+                    if (r <= l || bot <= t) continue;
+                    // Axis-aligned segment vs. shrunk rect overlap.
+                    bool overlap = hiX > l && loX < r && hiY > t && loY < bot;
+                    if (overlap) crossings++;
+                }
+            }
+        }
+        Console.WriteLine($"  [{label}] wires={layout.Wires.Count} blocks={layout.CellBounds.Count} interiorCrossings={crossings}");
+        return crossings == 0;
     }
 
     private static bool TestDipAdderProbe()

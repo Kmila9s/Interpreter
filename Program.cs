@@ -48,6 +48,14 @@ class Program
             return;
         }
 
+        // Check for synthesis-only test mode (layout/routing/block tests),
+        // so they can be exercised without the full delta-cycle suite.
+        if (args.Contains("--test-synth"))
+        {
+            Environment.ExitCode = Tests.SynthesisTests.RunAllTests().GetAwaiter().GetResult();
+            return;
+        }
+
         // Check for simulation mode with VCD export
         // Usage: --sim <file.vhdl> [--cycles N] [--vcd output.vcd]
         int simIndex = Array.FindIndex(args, a => a == "--sim" || a == "-s");
