@@ -89,6 +89,15 @@ public class CaseStructure : ISControl
     public Variable? Selector => _selector;
 
     /// <summary>
+    /// Gets the raw selector name/expression as written in the source
+    /// (e.g. <c>sel</c> in <c>case sel is</c>). Unlike <see cref="Selector"/>
+    /// this is a plain string that survives even when the selector could not be
+    /// resolved to a <see cref="Variable"/> in scope, so diagram/export walkers
+    /// can label the case without reflecting into the Variable object.
+    /// </summary>
+    public string SelectorName => _selectorName;
+
+    /// <summary>
     /// High bit of the slice the selector targets, or -1 if no slice was
     /// specified. Synthesizers that honor this should compare just the
     /// selector bits in <c>[<see cref="SelectorSliceLow"/>, <see cref="SelectorSliceHigh"/>]</c>.
