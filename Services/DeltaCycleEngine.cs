@@ -1643,21 +1643,34 @@ public class DeltaCycleEngine : IDisposable
 
     private async Task<bool> RunTopCaseFromEntryAsync(Process process, CaseStructure caseStruct)
     {
-        if (caseStruct.Selector is null) return false;
+        // Expression selector (e.g. `case to_integer(cnt_q) is`): no single
+        // signal resolves, so evaluate the expression at run time — mirrors the
+        // concurrent `with <expr> select` path. Plain/sliced-signal selectors
+        // keep their existing behaviour.
+        bool exprSelector = caseStruct.HasExpressionSelector;
+        if (!exprSelector && caseStruct.Selector is null) return false;
 
         // Mirror the selector-slice + choice-resolution logic from
         // ExecuteCaseStructureWithSchedulingAsync so behaviour is
         // identical on the non-wait path.
-        string selectorValue = caseStruct.Selector.Value?.ToString()?.Replace("\"", "").Replace("'", "").Trim() ?? "";
-        if (caseStruct.HasSelectorSlice && selectorValue.Length > 0)
+        string selectorValue;
+        if (exprSelector)
         {
-            int hi = caseStruct.SelectorSliceHigh;
-            int lo = caseStruct.SelectorSliceLow;
-            // Range-aware selector slice: honour the selector's declared range.
-            var (startPos, width) = caseStruct.Selector.SliceToSpan(hi, lo, selectorValue.Length);
-            if (startPos >= 0 && width > 0 && startPos + width <= selectorValue.Length)
+            selectorValue = caseStruct.EvaluateSelectorExpression();
+        }
+        else
+        {
+            selectorValue = caseStruct.Selector!.Value?.ToString()?.Replace("\"", "").Replace("'", "").Trim() ?? "";
+            if (caseStruct.HasSelectorSlice && selectorValue.Length > 0)
             {
-                selectorValue = selectorValue.Substring(startPos, width);
+                int hi = caseStruct.SelectorSliceHigh;
+                int lo = caseStruct.SelectorSliceLow;
+                // Range-aware selector slice: honour the selector's declared range.
+                var (startPos, width) = caseStruct.Selector.SliceToSpan(hi, lo, selectorValue.Length);
+                if (startPos >= 0 && width > 0 && startPos + width <= selectorValue.Length)
+                {
+                    selectorValue = selectorValue.Substring(startPos, width);
+                }
             }
         }
 
@@ -1672,7 +1685,9 @@ public class DeltaCycleEngine : IDisposable
                 string cleanChoice = ResolveChoiceForCase(choice);
                 bool hit = caseStruct.IsMatching
                     ? MatchesWithWildcards(cleanChoice, selectorValue)
-                    : cleanChoice.Equals(selectorValue, StringComparison.OrdinalIgnoreCase);
+                    : exprSelector
+                        ? CaseStructure.ChoiceMatchesNumeric(cleanChoice, selectorValue)
+                        : cleanChoice.Equals(selectorValue, StringComparison.OrdinalIgnoreCase);
                 if (hit)
                 {
                     matchIdx = i;
@@ -2072,21 +2087,27 @@ public class DeltaCycleEngine : IDisposable
     /// </summary>
     private async Task ExecuteCaseStructureWithSchedulingAsync(CaseStructure caseStruct)
     {
-        if (caseStruct.Selector is null) return;
+        // Expression selector (e.g. `case to_integer(cnt_q) is`): evaluate at run
+        // time, mirroring the concurrent `with <expr> select` path. Plain/sliced
+        // signal selectors keep their existing behaviour.
+        bool exprSelector = caseStruct.HasExpressionSelector;
+        if (!exprSelector && caseStruct.Selector is null) return;
 
-        string selectorValue = caseStruct.Selector.Value?.ToString()?.Replace("\"", "").Replace("'", "").Trim() ?? "";
+        string selectorValue = exprSelector
+            ? caseStruct.EvaluateSelectorExpression()
+            : (caseStruct.Selector!.Value?.ToString()?.Replace("\"", "").Replace("'", "").Trim() ?? "");
 
         // Bench bug #19 follow-up (P2A CPU dispatch): when the selector is
         // written as a slice (`case word(23 downto 16) is`), the engine was
         // reading the whole vector. Extract the slice bits so the choice
         // comparison sees the right value. Storage convention: MSB-first
         // (vector position 0 holds the high bit).
-        if (caseStruct.HasSelectorSlice && selectorValue.Length > 0)
+        if (!exprSelector && caseStruct.HasSelectorSlice && selectorValue.Length > 0)
         {
             int hi = caseStruct.SelectorSliceHigh;
             int lo = caseStruct.SelectorSliceLow;
             // Range-aware selector slice: honour the selector's declared range.
-            var (startPos, width) = caseStruct.Selector.SliceToSpan(hi, lo, selectorValue.Length);
+            var (startPos, width) = caseStruct.Selector!.SliceToSpan(hi, lo, selectorValue.Length);
             if (startPos >= 0 && width > 0 && startPos + width <= selectorValue.Length)
             {
                 selectorValue = selectorValue.Substring(startPos, width);
@@ -2123,7 +2144,9 @@ public class DeltaCycleEngine : IDisposable
                 string cleanChoice = ResolveChoiceForCase(choice);
                 bool hit = caseStruct.IsMatching
                     ? MatchesWithWildcards(cleanChoice, selectorValue)
-                    : cleanChoice.Equals(selectorValue, StringComparison.OrdinalIgnoreCase);
+                    : exprSelector
+                        ? CaseStructure.ChoiceMatchesNumeric(cleanChoice, selectorValue)
+                        : cleanChoice.Equals(selectorValue, StringComparison.OrdinalIgnoreCase);
                 if (hit)
                 {
                     matchingBranch = branch;

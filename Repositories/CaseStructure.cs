@@ -82,11 +82,87 @@ public class CaseStructure : ISControl
     private int _selectorSliceHigh = -1;
     /// <summary>Low bit of the selector slice; -1 if the whole signal is used.</summary>
     private int _selectorSliceLow  = -1;
+    /// <summary>
+    /// Full selector expression text as written in the source, e.g.
+    /// <c>to_integer(cnt_q)</c> or <c>to_integer(unsigned(code_r))</c>. Captured
+    /// for selectors that are NOT a plain (optionally sliced) signal — function
+    /// calls, type conversions, arithmetic — so the engine can evaluate the
+    /// expression at run time instead of failing to resolve a single
+    /// <see cref="Variable"/>. Empty when the selector is a simple signal.
+    /// </summary>
+    private string _selectorExpr = string.Empty;
 
     /// <summary>
     /// Gets the selector variable for the case statement.
     /// </summary>
     public Variable? Selector => _selector;
+
+    /// <summary>
+    /// The full selector expression text (see <see cref="_selectorExpr"/>).
+    /// </summary>
+    public string SelectorExpression => _selectorExpr;
+
+    /// <summary>
+    /// True when the selector is an expression (function call / type conversion
+    /// / arithmetic) rather than a plain signal — i.e. no <see cref="Selector"/>
+    /// variable resolved but a <see cref="SelectorExpression"/> is available.
+    /// Callers evaluate the expression via <see cref="EvaluateSelectorExpression"/>.
+    /// </summary>
+    public bool HasExpressionSelector => _selector is null && !string.IsNullOrEmpty(_selectorExpr);
+
+    /// <summary>
+    /// Evaluates the selector expression (e.g. <c>to_integer(cnt_q)</c>) against
+    /// the current scope and returns its cleaned string value. Mirrors the
+    /// selector handling in <see cref="SelectedAssignment"/> so a process
+    /// <c>case &lt;expr&gt; is</c> matches identically to a concurrent
+    /// <c>with &lt;expr&gt; select</c>. Returns an empty string when there is no
+    /// expression to evaluate.
+    /// </summary>
+    public string EvaluateSelectorExpression()
+    {
+        if (string.IsNullOrEmpty(_selectorExpr)) return string.Empty;
+        var op = new Operation(_selectorExpr, _variables);
+        var result = op.Execute();
+        string value = result is Variable vr ? (vr.Value?.ToString() ?? "") : (result?.ToString() ?? "");
+        return value.Replace("\"", "").Replace("'", "").Trim();
+    }
+
+    /// <summary>
+    /// Numeric-first choice match for expression selectors — identical in
+    /// spirit to <see cref="SelectedAssignment"/>'s matcher: when both sides
+    /// parse as integers (decimal, binary bit-string, or hex) they compare by
+    /// value, otherwise by case-insensitive string equality. Used only on the
+    /// expression-selector path so the plain-signal path stays byte-identical.
+    /// </summary>
+    internal static bool ChoiceMatchesNumeric(string choice, string selector)
+    {
+        string a = choice.Replace("\"", "").Replace("'", "").Trim();
+        string b = selector.Replace("\"", "").Replace("'", "").Trim();
+        if (TryParseChoiceInt(a, out long ai) && TryParseChoiceInt(b, out long bi))
+            return ai == bi;
+        return a.Equals(b, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Parse decimal, binary bit-string, or hex into a long; false when not numeric.</summary>
+    private static bool TryParseChoiceInt(string s, out long value)
+    {
+        value = 0;
+        if (string.IsNullOrEmpty(s)) return false;
+        if (s.All(c => c == '0' || c == '1'))
+        {
+            try { value = Convert.ToInt64(s, 2); return true; }
+            catch { /* fall through */ }
+        }
+        if (long.TryParse(s, System.Globalization.NumberStyles.Integer,
+                          System.Globalization.CultureInfo.InvariantCulture, out value))
+            return true;
+        string h = s;
+        if (h.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) h = h.Substring(2);
+        else if (h.StartsWith("x", StringComparison.OrdinalIgnoreCase)) h = h.Substring(1);
+        else return false;
+        return long.TryParse(h, System.Globalization.NumberStyles.HexNumber,
+                             System.Globalization.CultureInfo.InvariantCulture, out value);
+    }
 
     /// <summary>
     /// Gets the raw selector name/expression as written in the source
@@ -143,18 +219,23 @@ public class CaseStructure : ISControl
     /// </summary>
     public async Task ExecuteAsync()
     {
-        if (_selector is null) return;
+        // Expression selector (e.g. `case to_integer(cnt_q) is`) — evaluate the
+        // expression at run time; otherwise fall through on a resolved signal.
+        bool exprSelector = HasExpressionSelector;
+        if (!exprSelector && _selector is null) return;
 
-        string selectorValue = _selector.Value?.ToString() ?? "";
+        string selectorValue = exprSelector
+            ? EvaluateSelectorExpression()
+            : (_selector!.Value?.ToString() ?? "");
 
+        CaseWhenBranch? othersBranch = null;
         foreach (var branch in Branches)
         {
-            // Check if this is the 'others' branch
+            // Save 'others' as the fallback but keep scanning for an exact arm.
             if (branch.IsOthers)
             {
-                Executer executer = new(branch.Tasks);
-                await executer.ExecuteAsync();
-                return;
+                othersBranch ??= branch;
+                continue;
             }
 
             // Check if selector matches any of the choices
@@ -165,7 +246,9 @@ public class CaseStructure : ISControl
 
                 bool hit = IsMatching
                     ? MatchesWithWildcards(cleanChoice, cleanSelector)
-                    : cleanChoice.Equals(cleanSelector, StringComparison.OrdinalIgnoreCase);
+                    : exprSelector
+                        ? ChoiceMatchesNumeric(cleanChoice, cleanSelector)
+                        : cleanChoice.Equals(cleanSelector, StringComparison.OrdinalIgnoreCase);
                 if (hit)
                 {
                     Executer executer = new(branch.Tasks);
@@ -173,6 +256,13 @@ public class CaseStructure : ISControl
                     return;
                 }
             }
+        }
+
+        // No explicit arm matched — run 'others' if present.
+        if (othersBranch != null)
+        {
+            Executer executer = new(othersBranch.Tasks);
+            await executer.ExecuteAsync();
         }
     }
 
@@ -225,16 +315,30 @@ public class CaseStructure : ISControl
         _selector = _variables.FirstOrDefault(v => v.Name.Equals(_selectorName, StringComparison.OrdinalIgnoreCase));
         _streamer.MoveNext(); // consume selector
 
+        // Reconstruct the full selector expression text so a non-signal selector
+        // (function call / type conversion / arithmetic) can be evaluated at run
+        // time — e.g. `case to_integer(cnt_q) is`. For a plain signal this is
+        // just its name; for a sliced/parenthesised selector we append the group.
+        var selectorExprBuilder = new StringBuilder(_selectorName);
+
         // Slice/index after the selector identifier:
         //   case op(3 downto 0) is — slice
         //   case mem(idx) is        — single bit (also handled, slice = idx..idx)
         // Anything more complex (function calls, expressions) is consumed but
         // leaves the slice fields at -1 so the synthesizer falls back to the
-        // whole-vector comparison.
+        // whole-vector comparison — and the captured expression text is used
+        // instead (see _selectorExpr / EvaluateSelectorExpression).
         if (_streamer.Current?.Value == "(")
         {
-            ParseSelectorSlice();
+            var innerTokens = ParseSelectorSlice();
+            selectorExprBuilder.Append('(').Append(string.Join(" ", innerTokens)).Append(')');
         }
+
+        // Only keep the expression text when it isn't a plain resolvable signal;
+        // the plain-signal path (and sliced-signal path) is handled by _selector
+        // and the slice fields, byte-identical to before this change.
+        if (_selector is null)
+            _selectorExpr = selectorExprBuilder.ToString();
 
         // v0.16.1: Consume closing parenthesis if we had an opening one
         if (hasParens && _streamer.Current?.Value == ")")
@@ -286,7 +390,7 @@ public class CaseStructure : ISControl
     /// the <c>)</c> — they just don't populate the slice fields and the
     /// downstream synthesizer falls back to the whole-vector comparison.
     /// </remarks>
-    private void ParseSelectorSlice()
+    private List<string> ParseSelectorSlice()
     {
         _streamer.MoveNext(); // consume the leading '('
 
@@ -328,6 +432,8 @@ public class CaseStructure : ISControl
             _selectorSliceLow  = idx;
         }
         // Anything else: leave slice fields at -1, synth uses full vector.
+
+        return inner;
     }
 
     /// <summary>
