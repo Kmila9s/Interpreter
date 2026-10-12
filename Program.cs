@@ -56,6 +56,14 @@ class Program
             return;
         }
 
+        // Case-selector expression regression tests (2026-10-11). Standalone
+        // flag so they run independently of the full --test-delta battery.
+        if (args.Contains("--test-case-selector"))
+        {
+            Environment.ExitCode = Tests.CaseSelectorExpressionTests.RunAllTests().GetAwaiter().GetResult();
+            return;
+        }
+
         // Check for simulation mode with VCD export
         // Usage: --sim <file.vhdl> [--cycles N] [--vcd output.vcd]
         int simIndex = Array.FindIndex(args, a => a == "--sim" || a == "-s");
@@ -292,6 +300,7 @@ class Program
         failures += Tests.IEEELoweringEndToEndTests.RunAllTests();
         failures += Tests.NestedIEEECallTests.RunAllTests();
         failures += Tests.PracticeExerciseTests.RunAllTests();
+        failures += await Tests.CaseSelectorExpressionTests.RunAllTests();
         failures += Tests.PortStrictnessTests.RunAllTests();
         failures += await Tests.BlockStatementTests.RunAllTests();
         Environment.ExitCode = failures;
