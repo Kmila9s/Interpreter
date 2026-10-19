@@ -679,6 +679,7 @@ end case;
 - Nested control structures (if, case, loops) within branches
 - v0.13.0: Can be nested within if/elsif/else branches
 - 2026-05-27: each `CaseWhenBranch` records the 1-based source line of its `when` keyword (`ConditionLine`); the engine fires `OnConditionEvaluated(line)` when an arm matches so a breakpoint on a `when` arm pauses the live run (parallel to `IfBranch.ConditionLine`).
+- v1.11.0 (2026-10-12): the selector may be an **expression**, not just a named signal — e.g. `case to_integer(cnt_q) is`, `case to_integer(unsigned(code)) is`, or any arithmetic/conversion. When no signal matches the selector name, `CaseStructure` stores the full selector text (`SelectorExpression`), sets `HasExpressionSelector`, and evaluates it through `EvaluateSelectorExpression()` (Operation-based, numeric-aware choice matching), mirroring the `with <expr> select` path. Before this fix such selectors left `Selector` null and the whole case silently did nothing — not even `when others` — freezing e.g. 7-segment decoders while the counter advanced. The plain/sliced-signal selector path is byte-identical. `SelectorName` (v1.10.0) additionally exposes the raw selector identifier for flow-diagram case labels.
 
 ### 5.6. VariableSyntetizer - Declaration Parser
 
