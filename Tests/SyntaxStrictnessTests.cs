@@ -36,6 +36,7 @@ public static class SyntaxStrictnessTests
             ("C1: undeclared case choice is rejected",          Test_UndeclaredCaseChoice),
             ("C7: duplicate case choice is rejected",           Test_DuplicateCaseChoice),
             ("C6: non-exhaustive std_logic_vector case rejected", Test_NonExhaustiveCase),
+            ("C10: enum choice not in the type is rejected",    Test_EnumChoiceNotInType),
             ("Valid if/case/process still parses",              Test_ValidControlParses),
             ("Valid literal case (with others) still parses",   Test_ValidLiteralCaseParses),
         };
@@ -153,6 +154,23 @@ public static class SyntaxStrictnessTests
         "        case sel is",
         "            when \"00\" => y <= '0';",
         "            when \"01\" => y <= '1';",   // ERROR: "10"/"11" uncovered, no others
+        "        end case;",
+        "    end process;",
+        "end architecture rtl;",
+    });
+
+    private static bool Test_EnumChoiceNotInType() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "    type state_t is (IDLE, RUN, DONE);",
+        "    signal st : state_t := IDLE;",
+        "begin",
+        "    process(st)",
+        "    begin",
+        "        case st is",
+        "            when IDLE   => y <= '0';",
+        "            when STOP   => y <= '1';",   // ERROR: STOP is not a literal of state_t
+        "            when others => y <= '0';",
         "        end case;",
         "    end process;",
         "end architecture rtl;",
