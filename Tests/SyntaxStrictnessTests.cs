@@ -40,9 +40,11 @@ public static class SyntaxStrictnessTests
             ("C2: undeclared RHS signal is rejected",           Test_UndeclaredRhsSignal),
             ("C3: undeclared assignment target is rejected",    Test_UndeclaredLhsTarget),
             ("C9: undefined function call is rejected",         Test_UndefinedFunctionCall),
+            ("C8: assignment to an input port is rejected",     Test_AssignToInputPort),
             ("Valid if/case/process still parses",              Test_ValidControlParses),
             ("Valid literal case (with others) still parses",   Test_ValidLiteralCaseParses),
             ("Declared constant + signal still resolve",        Test_DeclaredConstantResolves),
+            ("Reading an input port on the RHS still parses",   Test_ReadInputPortParses),
         };
 
         foreach (var (name, run) in tests)
@@ -240,6 +242,24 @@ public static class SyntaxStrictnessTests
         "architecture rtl of dut is",
         "begin",
         "    y <= my_decode(a);",      // ERROR: my_decode defined nowhere
+        "end architecture rtl;",
+    });
+
+    private static bool Test_AssignToInputPort() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    a <= '0';",                // ERROR: `a` is mode `in`
+        "end architecture rtl;",
+    });
+
+    // Positive guard: reading an input port on the RHS (and driving an output)
+    // must still parse — the port-mode check must only reject in-port *targets*.
+    private static bool Test_ReadInputPortParses() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    y <= a and sel(0);",
         "end architecture rtl;",
     });
 

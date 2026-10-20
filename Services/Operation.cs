@@ -133,7 +133,7 @@ public class Operation : IOperation {
     /// <param name="RawData">The raw data of the operation.</param>
     /// <param name="Variables">The variables of the operation.</param>
     /// <param name="sourceLine">Optional 1-based source line; 0 = unknown.</param>
-    public Operation(string RawData, HashSet<Variable> Variables, int sourceLine = 0)
+    public Operation(string RawData, HashSet<Variable> Variables, int sourceLine = 0, bool isAssignmentStatement = false)
     {
         var _profileStopwatch = ParseProfile.Enabled ? System.Diagnostics.Stopwatch.StartNew() : null;
         SourceLine = sourceLine;
@@ -213,6 +213,18 @@ public class Operation : IOperation {
             Result = new Variable("ConditionResult", "false", Constants.DATATYPES.BOOLEAN);
             Result.PortType = Constants.PortType.OUT;
         }
+        // v1.18.0 (P4/C8): a signal assignment whose target is an input port is
+        // illegal — GHDL: `port "X" can't be assigned`. Gated on
+        // isAssignmentStatement (set only by the concurrent/process assignment
+        // statement parsers) because the ctor also splits a comparison like
+        // `if din <= x` on `<=`, and `din` may legitimately be an input port read.
+        if (isAssignmentStatement &&
+            Result is { IsPort: true, PortType: Constants.PortType.IN })
+        {
+            throw new Parser.Models.ParserException(
+                $"cannot assign to input port \"{Result.Name}\"", SourceLine, 0);
+        }
+
         _data = tokenizer.TokenizeLineReturn(RawData);
         var syntetized = Syntetize().ToList();
 #if DEBUG_OPERATION
