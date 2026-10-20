@@ -35,6 +35,7 @@ public static class SyntaxStrictnessTests
             ("S9: missing 'end if;' is rejected",               Test_MissingEndIf),
             ("C1: undeclared case choice is rejected",          Test_UndeclaredCaseChoice),
             ("C7: duplicate case choice is rejected",           Test_DuplicateCaseChoice),
+            ("C6: non-exhaustive std_logic_vector case rejected", Test_NonExhaustiveCase),
             ("Valid if/case/process still parses",              Test_ValidControlParses),
             ("Valid literal case (with others) still parses",   Test_ValidLiteralCaseParses),
         };
@@ -138,6 +139,20 @@ public static class SyntaxStrictnessTests
         "            when \"00\" => y <= '0';",
         "            when \"00\" => y <= '1';",   // ERROR: choice "00" already covered
         "            when others => y <= '0';",
+        "        end case;",
+        "    end process;",
+        "end architecture rtl;",
+    });
+
+    private static bool Test_NonExhaustiveCase() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    process(sel)",
+        "    begin",
+        "        case sel is",
+        "            when \"00\" => y <= '0';",
+        "            when \"01\" => y <= '1';",   // ERROR: "10"/"11" uncovered, no others
         "        end case;",
         "    end process;",
         "end architecture rtl;",
