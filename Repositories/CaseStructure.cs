@@ -371,6 +371,30 @@ public class CaseStructure : ISControl
         if (mainIterations >= maxMainIterations)
             throw new InvalidOperationException($"Case statement main loop exceeded maximum iterations. Last token: {_streamer.Current?.Value}");
 
+        // C7 (duplicate choice): VHDL forbids the same value appearing in two
+        // branches ("choice already covered"). Compare by value so `"00"` and a
+        // constant/decimal that resolve to the same number are caught too.
+        var seenChoices = new List<string>();
+        foreach (var br in Branches)
+        {
+            // Ranges (`a to b`) are currently stored as loose tokens
+            // ("a", "to", "b"), not as a single value — comparing those tokens
+            // would false-positive (e.g. two ranges both contribute a "to").
+            // Skip duplicate-checking any branch that contains a range.
+            bool hasRange = br.Choices.Any(c =>
+                c.Equals("to", StringComparison.OrdinalIgnoreCase) ||
+                c.Equals("downto", StringComparison.OrdinalIgnoreCase));
+            if (hasRange) continue;
+
+            foreach (var ch in br.Choices)
+            {
+                if (seenChoices.Any(prev => ChoiceMatchesNumeric(prev, ch)))
+                    throw new ParserException(
+                        $"duplicate case choice '{ch}'", _streamer.Current ?? _streamer.Previous);
+                seenChoices.Add(ch);
+            }
+        }
+
         // Populate Tasks with first branch for compatibility
         if (Branches.Count > 0)
         {
@@ -437,6 +461,30 @@ public class CaseStructure : ISControl
     }
 
     /// <summary>
+    /// True when the selector resolves to a built-in numeric/vector type, where
+    /// a case choice is always a literal or a constant — never an enum literal.
+    /// Enum/custom-typed selectors (CustomTypeName set) and unresolved selectors
+    /// return false so choice-identifier validation stays lenient for them.
+    /// </summary>
+    private bool SelectorIsNumericOrVector()
+    {
+        if (_selector is null || _selector.CustomTypeName != null) return false;
+        return _selector.Type is Constants.DATATYPES.STD_LOGIC
+            or Constants.DATATYPES.STD_LOGIC_VECTOR
+            or Constants.DATATYPES.BIT
+            or Constants.DATATYPES.INTEGER
+            or Constants.DATATYPES.NATURAL;
+    }
+
+    /// <summary>
+    /// True when an identifier case choice names a constant in the current scope
+    /// or a package-level constant (via <see cref="PackageRegistry"/>).
+    /// </summary>
+    private bool IsKnownChoiceConstant(string name)
+        => _variables.Any(v => v.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+           || PackageRegistry.Instance.ContainsConstant(name);
+
+    /// <summary>
     /// Synthesizes a single 'when' branch.
     /// </summary>
     private void SyntetizeWhenBranch()
@@ -479,6 +527,16 @@ public class CaseStructure : ISControl
             }
             else if (!string.IsNullOrWhiteSpace(currentValue))
             {
+                // C1 (undeclared case choice): on a numeric/vector selector a
+                // choice written as an identifier must name a declared or package
+                // constant — there are no enum literals to match. An unknown name
+                // (e.g. `when C =>`) is undeclared, not a silent fall-through.
+                // Enum/custom-typed and unresolved selectors are left lenient here.
+                if (_streamer.Current?.Type == IDENTIFIERS
+                    && SelectorIsNumericOrVector()
+                    && !IsKnownChoiceConstant(currentValue))
+                    throw new ParserException(
+                        $"no declaration for case choice '{currentValue}'", _streamer.Current);
                 branch.Choices.Add(currentValue);
                 _streamer.MoveNext();
             }
