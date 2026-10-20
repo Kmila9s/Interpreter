@@ -41,10 +41,14 @@ public static class SyntaxStrictnessTests
             ("C3: undeclared assignment target is rejected",    Test_UndeclaredLhsTarget),
             ("C9: undefined function call is rejected",         Test_UndefinedFunctionCall),
             ("C8: assignment to an input port is rejected",     Test_AssignToInputPort),
+            ("C4: scalar <= vector type mismatch is rejected",  Test_TypeMismatchScalarVector),
+            ("C5: literal width mismatch is rejected",          Test_WidthMismatchLiteral),
             ("Valid if/case/process still parses",              Test_ValidControlParses),
             ("Valid literal case (with others) still parses",   Test_ValidLiteralCaseParses),
             ("Declared constant + signal still resolve",        Test_DeclaredConstantResolves),
             ("Reading an input port on the RHS still parses",   Test_ReadInputPortParses),
+            ("Matching-width vector assignment still parses",   Test_MatchingWidthParses),
+            ("Expression RHS is not width-checked",             Test_ExpressionRhsNotWidthChecked),
         };
 
         foreach (var (name, run) in tests)
@@ -250,6 +254,44 @@ public static class SyntaxStrictnessTests
         "architecture rtl of dut is",
         "begin",
         "    a <= '0';",                // ERROR: `a` is mode `in`
+        "end architecture rtl;",
+    });
+
+    private static bool Test_TypeMismatchScalarVector() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    y <= sel;",                 // ERROR: std_logic <= std_logic_vector
+        "end architecture rtl;",
+    });
+
+    private static bool Test_WidthMismatchLiteral() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "    signal v3 : std_logic_vector(2 downto 0);",
+        "begin",
+        "    v3 <= \"1010\";",            // ERROR: 4-bit literal into a 3-bit signal
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a matching-width literal assignment must still parse.
+    private static bool Test_MatchingWidthParses() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "    signal v3 : std_logic_vector(2 downto 0);",
+        "begin",
+        "    v3 <= \"101\";",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: an expression RHS (concatenation) must be skipped by the
+    // single-atom type/width check, never width-rejected.
+    private static bool Test_ExpressionRhsNotWidthChecked() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "    signal v3 : std_logic_vector(2 downto 0);",
+        "begin",
+        "    v3 <= sel & a;",
         "end architecture rtl;",
     });
 

@@ -239,6 +239,12 @@ public class Operation : IOperation {
 #endif
         ShuntingYard shuntingYard = new(syntetized);
         Items = shuntingYard.Result.ToArray();
+
+        // v1.19.0 (P4/C4+C5): type/width validation for a single-atom assignment
+        // (gated like C8 so comparisons are never mistaken for assignments).
+        if (isAssignmentStatement)
+            ValidateAssignmentTypeWidth();
+
         if (_profileStopwatch != null)
         {
             _profileStopwatch.Stop();
@@ -1172,6 +1178,86 @@ public class Operation : IOperation {
     /// collapsing to the old 8-bit "00000000" stub. An already-typed constant
     /// is copied through unchanged.
     /// </summary>
+    /// <summary>
+    /// v1.19.0 (P4): reject a single-atom assignment whose RHS type or width
+    /// cannot match the LHS target — C4 (std_logic vs std_logic_vector) and C5
+    /// (vector width mismatch), matching GHDL. Deliberately conservative: it
+    /// fires only when the RHS is ONE lone literal or whole-signal reference,
+    /// because the type/width of a general RHS expression (concatenation,
+    /// conversions, <c>others =&gt;</c>, slices, function results) is not known
+    /// until evaluation, and those constructs are pervasive in valid designs.
+    /// </summary>
+    private void ValidateAssignmentTypeWidth()
+    {
+        // LHS must be a real, whole-signal declared target (not a stub, not the
+        // BOOLEAN ConditionResult a comparison/sliced-target resolves to, not an
+        // indexed single-bit target whose width is 1, not undetermined).
+        if (Result is null || Result.IsStub || ResultBitIndex is not null) return;
+        if (string.Equals(Result.Name, "ConditionResult", StringComparison.Ordinal)) return;
+        var lhsType = Result.Type;
+        if (lhsType == Constants.DATATYPES.UNKNOWN) return;
+
+        // RHS must be a single atom (one Variable; no operators / deferred items).
+        if (Items.Length != 1 || Items[0] is not Variable rhs) return;
+        if (rhs.IsStub || rhs.Type == Constants.DATATYPES.UNKNOWN) return;
+        string rhsVal = rhs.Value?.ToString() ?? string.Empty;
+        if (rhsVal.StartsWith("(others", StringComparison.OrdinalIgnoreCase)) return; // aggregate → width = LHS by construction
+
+        static bool IsScalar(Constants.DATATYPES t) =>
+            t == Constants.DATATYPES.STD_LOGIC || t == Constants.DATATYPES.BIT;
+        static bool IsVector(Constants.DATATYPES t) =>
+            t == Constants.DATATYPES.STD_LOGIC_VECTOR;
+
+        bool lhsScalar = IsScalar(lhsType), lhsVector = IsVector(lhsType);
+        bool rhsScalar = IsScalar(rhs.Type), rhsVector = IsVector(rhs.Type);
+
+        // Only compare within the std_logic / std_logic_vector family. INTEGER,
+        // NATURAL, BOOLEAN etc. coerce legitimately (to_integer/to_unsigned/…),
+        // so they are left alone.
+        if (!(lhsScalar || lhsVector) || !(rhsScalar || rhsVector)) return;
+
+        // C4 — scalar vs vector type mismatch.
+        if ((lhsScalar && rhsVector) || (lhsVector && rhsScalar))
+        {
+            string lhsClass = lhsScalar ? "std_logic" : "std_logic_vector";
+            string rhsClass = rhsScalar ? "std_logic" : "std_logic_vector";
+            throw new Parser.Models.ParserException(
+                $"type mismatch: cannot assign a {rhsClass} value to {lhsClass} signal \"{Result.Name}\"",
+                SourceLine, 0);
+        }
+
+        // C5 — width mismatch between two vectors. Only act on RELIABLE widths:
+        // Kmila defaults an unresolved generic/expression range (e.g.
+        // `std_logic_vector(WIDTH-1 downto 0)`) to Size 8, which would otherwise
+        // false-reject valid designs. A width is trusted only when it comes from
+        // a declared literal range (HasDeclaredRange) for a signal, or from a
+        // pure-binary literal's length. Hex/other literals and generic-sized
+        // signals are skipped.
+        if (lhsVector && rhsVector && Result.HasDeclaredRange && Result.Size > 0)
+        {
+            int lhsW = Result.Size;
+            int? rhsW = null;
+            if (rhs.Name.StartsWith("Literal-", StringComparison.Ordinal))
+            {
+                string bits = rhsVal.Replace("\"", string.Empty).Replace("'", string.Empty);
+                if (bits.Length > 0 &&
+                    bits.All(c => "01UXZWLH-".IndexOf(char.ToUpperInvariant(c)) >= 0))
+                    rhsW = bits.Length; // reliable: a binary/metavalue bit string
+            }
+            else if (rhs.HasDeclaredRange && rhs.Size > 0)
+            {
+                rhsW = rhs.Size; // reliable: a signal with a declared literal range
+            }
+
+            if (rhsW is int w && lhsW != w)
+            {
+                throw new Parser.Models.ParserException(
+                    $"width mismatch: {lhsW}-bit signal \"{Result.Name}\" assigned a {w}-bit value",
+                    SourceLine, 0);
+            }
+        }
+    }
+
     /// <summary>
     /// v1.17.0 (P3): VHDL predefined parameterless names that resolve to no
     /// user declaration yet are always in scope, so the undeclared-identifier
