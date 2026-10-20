@@ -392,20 +392,22 @@ public class IfStructure : ISControl
     /// <param name="keyword">The keyword expected after 'end' (e.g., "if", "loop", "case").</param>
     private void ConsumeEndKeyword(string keyword)
     {
-        if (_streamer.Current?.Value.ToLower() == "end")
-        {
-            _streamer.MoveNext(); // consume 'end'
-            if (_streamer.Current?.Value.ToLower() == keyword)
-            {
-                _streamer.MoveNext(); // consume keyword
-            }
-            // VHDL-2008 matching-case: `end case?;`
-            if (_streamer.Current?.Value == "?") _streamer.MoveNext();
-            if (_streamer.Current?.Value == ";")
-            {
-                _streamer.MoveNext(); // consume ';'
-            }
-        }
+        // `end <keyword> ;` is required by VHDL — a missing terminator is a
+        // syntax error, not something to tolerate silently.
+        if (_streamer.Current?.Value.ToLower() != "end")
+            throw new ParserException(
+                $"'end {keyword};' expected", _streamer.Current ?? _streamer.Previous);
+        _streamer.MoveNext(); // consume 'end'
+        if (_streamer.Current?.Value.ToLower() != keyword)
+            throw new ParserException(
+                $"'{keyword}' expected after 'end'", _streamer.Current ?? _streamer.Previous);
+        _streamer.MoveNext(); // consume keyword
+        // VHDL-2008 matching-case: `end case?;`
+        if (_streamer.Current?.Value == "?") _streamer.MoveNext();
+        if (_streamer.Current?.Value != ";")
+            throw new ParserException(
+                $"';' expected after 'end {keyword}'", _streamer.Current ?? _streamer.Previous);
+        _streamer.MoveNext(); // consume ';'
     }
 
     /// <summary>

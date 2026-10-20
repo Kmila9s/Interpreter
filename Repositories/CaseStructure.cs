@@ -455,6 +455,18 @@ public class CaseStructure : ISControl
         {
             iterations++;
             string currentValue = _streamer.Current?.Value ?? "";
+            string lowerValue = currentValue.ToLowerInvariant();
+
+            // A case choice may only contain literals, identifiers, 'others',
+            // '|', and range keywords (to/downto). Hitting ';', an assignment
+            // operator, or a block keyword before '=>' means the arrow is
+            // missing — stop so the post-loop check reports it.
+            if (currentValue == ";" || currentValue == "<=" || currentValue == ":=" ||
+                (_streamer.Current?.Type == KEYWORDS &&
+                 lowerValue != "others" && lowerValue != "to" && lowerValue != "downto"))
+            {
+                break;
+            }
 
             if (currentValue.ToLower() == "others")
             {
@@ -479,11 +491,11 @@ public class CaseStructure : ISControl
         if (iterations >= maxIterations)
             throw new InvalidOperationException("Case statement parsing exceeded maximum iterations - possible malformed input");
 
-        // Consume '=>' (single token)
-        if (_streamer.Current?.Value == "=>")
-        {
-            _streamer.MoveNext(); // consume '=>'
-        }
+        // Consume '=>' (single token) — required by VHDL after case choices.
+        if (_streamer.Current?.Value != "=>")
+            throw new ParserException(
+                "'=>' expected after case choice", _streamer.Current ?? _streamer.Previous);
+        _streamer.MoveNext(); // consume '=>'
 
         // Parse branch body until next 'when' or 'end'
         SyntetizeBranchBody(branch);

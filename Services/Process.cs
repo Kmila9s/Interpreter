@@ -470,16 +470,24 @@ public class Process : ISControl, IControl
             }
         }
 
-        // Consume 'end process ;'
+        // Consume 'end process ;' — the closing ';' is required by VHDL.
+        if (_streamer.Current?.Value.ToLower() != "end")
+            throw new ParserException(
+                "'end process;' expected to close the process", _streamer.Current ?? _streamer.Previous);
         _streamer.MoveNext(); // consume 'end'
         if (_streamer.Current?.Value.ToLower() == "process")
         {
             _streamer.MoveNext(); // consume 'process'
         }
-        if (_streamer.Current?.Value == ";")
+        // Optional process label after 'end process'
+        if (_streamer.Current?.Type == IDENTIFIERS)
         {
-            _streamer.MoveNext(); // consume ';'
+            _streamer.MoveNext();
         }
+        if (_streamer.Current?.Value != ";")
+            throw new ParserException(
+                "';' expected after 'end process'", _streamer.Current ?? _streamer.Previous);
+        _streamer.MoveNext(); // consume ';'
     }
 
     /// <summary>
@@ -518,21 +526,23 @@ public class Process : ISControl, IControl
     /// </summary>
     private void ConsumeEndKeyword(string keyword)
     {
-        if (_streamer.Current?.Value.ToLower() == "end")
-        {
-            _streamer.MoveNext(); // consume 'end'
-            if (_streamer.Current?.Value.ToLower() == keyword)
-            {
-                _streamer.MoveNext(); // consume keyword
-            }
-            // VHDL-2008 matching-case closes with `end case?;` — accept the
-            // optional trailing `?` between keyword and semicolon.
-            if (_streamer.Current?.Value == "?") _streamer.MoveNext();
-            if (_streamer.Current?.Value == ";")
-            {
-                _streamer.MoveNext(); // consume ';'
-            }
-        }
+        // `end <keyword> ;` is required by VHDL — a missing terminator is a
+        // syntax error, not something to tolerate silently.
+        if (_streamer.Current?.Value.ToLower() != "end")
+            throw new ParserException(
+                $"'end {keyword};' expected", _streamer.Current ?? _streamer.Previous);
+        _streamer.MoveNext(); // consume 'end'
+        if (_streamer.Current?.Value.ToLower() != keyword)
+            throw new ParserException(
+                $"'{keyword}' expected after 'end'", _streamer.Current ?? _streamer.Previous);
+        _streamer.MoveNext(); // consume keyword
+        // VHDL-2008 matching-case closes with `end case?;` — accept the
+        // optional trailing `?` between keyword and semicolon.
+        if (_streamer.Current?.Value == "?") _streamer.MoveNext();
+        if (_streamer.Current?.Value != ";")
+            throw new ParserException(
+                $"';' expected after 'end {keyword}'", _streamer.Current ?? _streamer.Previous);
+        _streamer.MoveNext(); // consume ';'
     }
 
     /// <summary>
