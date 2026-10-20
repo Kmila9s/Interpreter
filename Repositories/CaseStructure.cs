@@ -548,7 +548,9 @@ public class CaseStructure : ISControl
                 // choice written as an identifier must name a declared or package
                 // constant — there are no enum literals to match. An unknown name
                 // (e.g. `when C =>`) is undeclared, not a silent fall-through.
-                // Enum/custom-typed and unresolved selectors are left lenient here.
+                // Enum selectors type numerically here too, so `when STOP =>` on an
+                // enum signal is caught by this same check. Enum/custom-typed and
+                // unresolved selectors are otherwise left lenient.
                 if (_streamer.Current?.Type == IDENTIFIERS
                     && SelectorIsNumericOrVector()
                     && !IsKnownChoiceConstant(currentValue))
