@@ -533,21 +533,57 @@ public class Operation : IOperation {
                     }
                 }
 
-                // v0.13.0: Handle undeclared identifiers gracefully
-                // This allows tests with package/constant references to pass
+                // v1.17.0 (P3): resolve an undeclared identifier against the
+                // package-constant registry before giving up. A name that is a
+                // real constant materialises as a typed Variable (this also fixes
+                // the latent "package constant evaluates to 0" bug, where such a
+                // name used to fall through to the 8-bit stub). A name that is
+                // neither a signal/port/generic/alias nor a package constant is a
+                // genuine undeclared-identifier error — GHDL: `no declaration for
+                // "X"`. A token still followed by `(` is a function/array edge
+                // that slipped past the branches above (e.g. a standard-function
+                // parse that failed); keep the historical stub there rather than
+                // mis-reporting it as undeclared.
                 Variable variable;
                 if (!Variables.Contains(currentItem))
                 {
-#if DEBUG
-                    Console.WriteLine($"[Operation] Warning: Undeclared identifier '{currentItem}' in expression '{_rawData}'");
-#endif
-                    // Create stub variable for undeclared identifier
-                    // Assume STD_LOGIC_VECTOR with size 8 as default
-                    variable = new Variable(currentItem, "00000000", Constants.DATATYPES.STD_LOGIC_VECTOR)
+                    // NB: `GetConstant(...) is { }` — a true null test. Variable
+                    // overloads `operator !=`/`==`, so a plain `!= null` would
+                    // bind to those overloads and report a null reference as
+                    // non-null; the pattern bypasses them.
+                    if (PackageRegistry.Instance.GetConstant(currentItem) is { } pkgConst)
                     {
-                        Size = 8,
-                        IsStub = true
-                    };
+                        variable = MaterializeConstant(pkgConst);
+                    }
+                    else if (_currentSyntetizeIndex + 1 < _data.Length &&
+                             _data[_currentSyntetizeIndex + 1] == "(")
+                    {
+                        variable = new Variable(currentItem, "00000000", Constants.DATATYPES.STD_LOGIC_VECTOR)
+                        {
+                            Size = 8,
+                            IsStub = true
+                        };
+                    }
+                    else if (IsPredefinedName(currentItem) ||
+                             PackageRegistry.Instance.IsDeclaredName(currentItem))
+                    {
+                        // Either a VHDL predefined name always in scope (e.g. `now`)
+                        // or a name that IS declared somewhere in the source but that
+                        // Kmila's scope-builder did not evaluate into the live Variable
+                        // set (e.g. a local constant whose initializer references a
+                        // generic). Not an undeclared-identifier error — keep the
+                        // historical stub so synthesis proceeds as before.
+                        variable = new Variable(currentItem, "00000000", Constants.DATATYPES.STD_LOGIC_VECTOR)
+                        {
+                            Size = 8,
+                            IsStub = true
+                        };
+                    }
+                    else
+                    {
+                        throw new Parser.Models.ParserException(
+                            $"no declaration for \"{currentItem}\"", SourceLine, 0);
+                    }
                 }
                 else
                 {
@@ -1113,6 +1149,67 @@ public class Operation : IOperation {
     /// <c>Items</c> — <see cref="Execute()"/> switches on the type and
     /// invokes <c>Evaluate</c> per fire.
     /// </remarks>
+    /// <summary>
+    /// v1.17.0 (P3): build a usable <see cref="Variable"/> from a package
+    /// constant resolved out of <see cref="PackageRegistry"/>. The scanner
+    /// registration path stores a constant's <c>Value</c> but leaves
+    /// <c>Type = UNKNOWN</c>; infer a concrete datatype/size from the value so
+    /// downstream <see cref="Operator"/> evaluation treats it like a real
+    /// signal — an integer literal becomes INTEGER, a bit pattern like "00001"
+    /// becomes a STD_LOGIC_VECTOR sized to its length — instead of silently
+    /// collapsing to the old 8-bit "00000000" stub. An already-typed constant
+    /// is copied through unchanged.
+    /// </summary>
+    /// <summary>
+    /// v1.17.0 (P3): VHDL predefined parameterless names that resolve to no
+    /// user declaration yet are always in scope, so the undeclared-identifier
+    /// check must not reject them. <c>now</c> (the current simulation time) is
+    /// the one the sample corpus exercises.
+    /// </summary>
+    private static bool IsPredefinedName(string name) =>
+        string.Equals(name, "now", StringComparison.OrdinalIgnoreCase);
+
+    private static Variable MaterializeConstant(Variable c)
+    {
+        object value = c.Value;
+        Constants.DATATYPES type = c.Type;
+        int size = c.Size;
+
+        if (type == Constants.DATATYPES.UNKNOWN)
+        {
+            if (value is int)
+            {
+                type = Constants.DATATYPES.INTEGER;
+            }
+            else if (value is string vs)
+            {
+                string bare = vs.Trim().Trim('"');
+                if (int.TryParse(bare.Replace("_", string.Empty), out _))
+                {
+                    type = Constants.DATATYPES.INTEGER;
+                }
+                else if (bare.Length > 0 &&
+                         bare.All(ch => "01UXZWLH-".IndexOf(char.ToUpperInvariant(ch)) >= 0))
+                {
+                    type = Constants.DATATYPES.STD_LOGIC_VECTOR;
+                    size = bare.Length;
+                    value = bare;
+                }
+                else
+                {
+                    // Unresolvable value (e.g. an enum-literal name) — fall back
+                    // to the historical vector shape so synthesis still proceeds.
+                    type = Constants.DATATYPES.STD_LOGIC_VECTOR;
+                }
+            }
+        }
+
+        var mv = new Variable(c.Name, value, type, size) { IsConstant = true };
+        if (!string.IsNullOrEmpty(c.CustomTypeName))
+            mv.CustomTypeName = c.CustomTypeName;
+        return mv;
+    }
+
     private (bool success, object item) ParseUserDefinedFunctionCall(string functionName)
     {
         // Skip the function name (already processed), move to "("
@@ -1175,6 +1272,27 @@ public class Operation : IOperation {
         {
             // Fall through to stub on any registry error so the rest of
             // the expression still synthesises.
+        }
+
+        // v1.17.0 (P3): a call to a name unknown to every registry is an
+        // undefined subprogram — GHDL: `no declaration for "X"`. Signature-only
+        // package/IEEE functions (q_mul, resize, …) and constant arrays indexed
+        // like a call (rom_data(addr)) are NOT undefined: they are known to a
+        // registry, so they keep the legacy black-box stub below. Mirrors the
+        // known-callable predicate already used by ParseFunctionCall.
+        bool knownCallable =
+            StandardFunctions.IsStandardFunction(functionName)
+            || Services.FunctionRegistry.Instance.IsKnown(functionName)
+            || PackageRegistry.Instance.ContainsFunction(functionName)
+            || PackageRegistry.Instance.ContainsProcedure(functionName)
+            || PackageRegistry.Instance.ContainsConstant(functionName)
+            // declared somewhere in the source (a subprogram or indexed array/
+            // constant) but not evaluated into a live registry during this pass.
+            || PackageRegistry.Instance.IsDeclaredName(functionName);
+        if (!knownCallable)
+        {
+            throw new Parser.Models.ParserException(
+                $"no declaration for \"{functionName}\"", SourceLine, 0);
         }
 
         // Return a stub variable representing an unresolved function result

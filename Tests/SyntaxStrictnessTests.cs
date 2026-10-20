@@ -37,8 +37,12 @@ public static class SyntaxStrictnessTests
             ("C7: duplicate case choice is rejected",           Test_DuplicateCaseChoice),
             ("C6: non-exhaustive std_logic_vector case rejected", Test_NonExhaustiveCase),
             ("C10: enum choice not in the type is rejected",    Test_EnumChoiceNotInType),
+            ("C2: undeclared RHS signal is rejected",           Test_UndeclaredRhsSignal),
+            ("C3: undeclared assignment target is rejected",    Test_UndeclaredLhsTarget),
+            ("C9: undefined function call is rejected",         Test_UndefinedFunctionCall),
             ("Valid if/case/process still parses",              Test_ValidControlParses),
             ("Valid literal case (with others) still parses",   Test_ValidLiteralCaseParses),
+            ("Declared constant + signal still resolve",        Test_DeclaredConstantResolves),
         };
 
         foreach (var (name, run) in tests)
@@ -207,6 +211,48 @@ public static class SyntaxStrictnessTests
         "            y <= '1';",
         "        end if;",
         "    end process;",
+        "end architecture rtl;",
+    });
+
+    // P3 (v1.17.0): undeclared-identifier rejection.
+
+    private static bool Test_UndeclaredRhsSignal() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    y <= a and enable_x;",   // ERROR: enable_x never declared
+        "end architecture rtl;",
+    });
+
+    private static bool Test_UndeclaredLhsTarget() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    process(a)",
+        "    begin",
+        "        counter_next <= a;",  // ERROR: counter_next never declared
+        "    end process;",
+        "end architecture rtl;",
+    });
+
+    private static bool Test_UndefinedFunctionCall() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    y <= my_decode(a);",      // ERROR: my_decode defined nowhere
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a declared local constant and signal must still resolve
+    // (the undeclared check must not over-reject real declarations).
+    private static bool Test_DeclaredConstantResolves() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "    constant K : std_logic := '1';",
+        "    signal tmp : std_logic;",
+        "begin",
+        "    tmp <= a and K;",
+        "    y <= tmp;",
         "end architecture rtl;",
     });
 

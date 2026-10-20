@@ -46,6 +46,19 @@ public class PackageRegistry
     private readonly Dictionary<string, ProcedureDefinition> _globalProcedures = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// v1.17.0 (P3): every identifier that appears in a declaration position in
+    /// the source under analysis (signals, constants, variables, ports, generics,
+    /// subprogram names and their parameters, types/subtypes, aliases, components,
+    /// loop variables, record fields, enum literals). Populated up-front by
+    /// <see cref="RegisterDeclaredNamesFromSource"/>. The undeclared-identifier
+    /// check consults this so it rejects only names that are declared NOWHERE in
+    /// the source (matching GHDL's "no declaration for X"), not names that Kmila's
+    /// scope-builder merely failed to evaluate into the live Variable set (e.g. a
+    /// local constant whose initializer references a generic).
+    /// </summary>
+    private readonly HashSet<string> _declaredNames = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
     /// Gets all registered packages.
     /// </summary>
     public IReadOnlyDictionary<string, PackageDefinition> Packages => _packages;
@@ -280,6 +293,68 @@ public class PackageRegistry
         _globalConstants.Clear();
         _globalFunctions.Clear();
         _globalProcedures.Clear();
+        _declaredNames.Clear();
+    }
+
+    /// <summary>
+    /// v1.17.0 (P3): true when <paramref name="name"/> was seen in a declaration
+    /// position in the analysed source. See <see cref="_declaredNames"/>.
+    /// </summary>
+    public bool IsDeclaredName(string name) =>
+        !string.IsNullOrEmpty(name) && _declaredNames.Contains(name);
+
+    /// <summary>
+    /// v1.17.0 (P3): scan one source file's text for declaration positions and
+    /// record every declared identifier in <see cref="_declaredNames"/>. The scan
+    /// is deliberately generous — it collects any identifier that follows a
+    /// declaration keyword (<c>signal/constant/variable/type/subtype/function/
+    /// procedure/component/entity/architecture/alias/file/for</c>) or sits
+    /// immediately before a <c>:</c> (ports, generics, parameters, record fields,
+    /// labels) or inside an enum <c>type … is ( … )</c> list. Over-collecting is
+    /// safe here: it can only suppress a rejection, never create one, so a
+    /// genuinely-undeclared identifier (which appears in no declaration position)
+    /// is still caught.
+    /// </summary>
+    public void RegisterDeclaredNamesFromSource(string source)
+    {
+        if (string.IsNullOrEmpty(source)) return;
+
+        void Add(string n)
+        {
+            if (!string.IsNullOrWhiteSpace(n)) _declaredNames.Add(n.Trim());
+        }
+
+        // identifier(s) before a ':' that is NOT ':=' — ports, generics,
+        // parameters, signals/constants/variables, record fields, labels.
+        foreach (System.Text.RegularExpressions.Match m in
+                 System.Text.RegularExpressions.Regex.Matches(
+                     source,
+                     @"([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*:(?!=)"))
+        {
+            foreach (var part in m.Groups[1].Value.Split(','))
+                Add(part);
+        }
+
+        // identifier directly following a declaration keyword.
+        foreach (System.Text.RegularExpressions.Match m in
+                 System.Text.RegularExpressions.Regex.Matches(
+                     source,
+                     @"\b(?:signal|constant|variable|file|alias|type|subtype|component|entity|architecture|function|procedure|package|for)\s+([A-Za-z_]\w*)",
+                     System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+        {
+            Add(m.Groups[1].Value);
+        }
+
+        // enum literals: `type NAME is ( a, b, c )`.
+        foreach (System.Text.RegularExpressions.Match m in
+                 System.Text.RegularExpressions.Regex.Matches(
+                     source,
+                     @"\btype\s+[A-Za-z_]\w*\s+is\s*\(([^)]*)\)",
+                     System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+        {
+            foreach (var part in m.Groups[1].Value.Split(','))
+                Add(part);
+        }
     }
 
     /// <summary>
