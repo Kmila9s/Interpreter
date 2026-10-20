@@ -33,7 +33,10 @@ public static class SyntaxStrictnessTests
             ("S4: missing '=>' in a case choice is rejected",   Test_MissingArrowInCase),
             ("S6: ':=' on a signal (concurrent) is rejected",   Test_VarAssignOnSignal),
             ("S9: missing 'end if;' is rejected",               Test_MissingEndIf),
+            ("C1: undeclared case choice is rejected",          Test_UndeclaredCaseChoice),
+            ("C7: duplicate case choice is rejected",           Test_DuplicateCaseChoice),
             ("Valid if/case/process still parses",              Test_ValidControlParses),
+            ("Valid literal case (with others) still parses",   Test_ValidLiteralCaseParses),
         };
 
         foreach (var (name, run) in tests)
@@ -110,7 +113,52 @@ public static class SyntaxStrictnessTests
         "end architecture rtl;",
     });
 
-    // --- positive control: synthesis must NOT throw ---
+    private static bool Test_UndeclaredCaseChoice() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    process(sel)",
+        "    begin",
+        "        case sel is",
+        "            when \"00\" => y <= '0';",
+        "            when C     => y <= '1';",   // ERROR: C is undeclared
+        "            when others => y <= '0';",
+        "        end case;",
+        "    end process;",
+        "end architecture rtl;",
+    });
+
+    private static bool Test_DuplicateCaseChoice() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    process(sel)",
+        "    begin",
+        "        case sel is",
+        "            when \"00\" => y <= '0';",
+        "            when \"00\" => y <= '1';",   // ERROR: choice "00" already covered
+        "            when others => y <= '0';",
+        "        end case;",
+        "    end process;",
+        "end architecture rtl;",
+    });
+
+    // --- positive controls: synthesis must NOT throw ---
+
+    private static bool Test_ValidLiteralCaseParses() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    process(sel)",
+        "    begin",
+        "        case sel is",
+        "            when \"00\" => y <= '0';",
+        "            when \"01\" => y <= '1';",
+        "            when others => y <= '0';",
+        "        end case;",
+        "    end process;",
+        "end architecture rtl;",
+    });
 
     private static bool Test_ValidControlParses() => ExpectParses(Ent2, new[]
     {
