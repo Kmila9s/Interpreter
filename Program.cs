@@ -64,6 +64,14 @@ class Program
             return;
         }
 
+        // Syntax-strictness regression tests (P1, 2026-10-20). Standalone flag
+        // so they run independently of the full --test-delta battery.
+        if (args.Contains("--test-syntax"))
+        {
+            Environment.ExitCode = Tests.SyntaxStrictnessTests.RunAllTests();
+            return;
+        }
+
         // Check for simulation mode with VCD export
         // Usage: --sim <file.vhdl> [--cycles N] [--vcd output.vcd]
         int simIndex = Array.FindIndex(args, a => a == "--sim" || a == "-s");
@@ -302,6 +310,7 @@ class Program
         failures += Tests.PracticeExerciseTests.RunAllTests();
         failures += await Tests.CaseSelectorExpressionTests.RunAllTests();
         failures += Tests.PortStrictnessTests.RunAllTests();
+        failures += Tests.SyntaxStrictnessTests.RunAllTests();
         failures += await Tests.BlockStatementTests.RunAllTests();
         Environment.ExitCode = failures;
     }

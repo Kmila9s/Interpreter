@@ -810,18 +810,20 @@ public class Architecture : ISControl, IControl
     /// </summary>
     private void ConsumeEndIf()
     {
-        if (_streamer.Current?.Value?.ToLower() == "end")
-        {
-            _streamer.MoveNext(); // consume 'end'
-            if (_streamer.Current?.Value?.ToLower() == "if")
-            {
-                _streamer.MoveNext(); // consume 'if'
-            }
-            if (_streamer.Current?.Value == ";")
-            {
-                _streamer.MoveNext(); // consume ';'
-            }
-        }
+        // `end if ;` is required by VHDL — a missing terminator is a syntax
+        // error, not something to tolerate silently.
+        if (_streamer.Current?.Value?.ToLower() != "end")
+            throw new ParserException(
+                "'end if;' expected to close the if statement", _streamer.Current ?? _streamer.Previous);
+        _streamer.MoveNext(); // consume 'end'
+        if (_streamer.Current?.Value?.ToLower() != "if")
+            throw new ParserException(
+                "'if' expected after 'end'", _streamer.Current ?? _streamer.Previous);
+        _streamer.MoveNext(); // consume 'if'
+        if (_streamer.Current?.Value != ";")
+            throw new ParserException(
+                "';' expected after 'end if'", _streamer.Current ?? _streamer.Previous);
+        _streamer.MoveNext(); // consume ';'
     }
 
     /// <summary>
@@ -1144,6 +1146,13 @@ public class Architecture : ISControl, IControl
         if (!isProcedureCall && !isAssignment)
             throw new ParserException(
                 $"Unexpected token '{sep.Value}' after '{first.Value}' — expected '<=', ':=', or ';'",
+                sep);
+
+        // A concurrent statement's target is always a signal; ':=' (variable
+        // assignment) is illegal here — VHDL requires '<='.
+        if (isAssignment && sep.Value == ":=")
+            throw new ParserException(
+                $"':=' cannot assign to signal '{first.Value}' in a concurrent statement; use '<='",
                 sep);
 
         if (isProcedureCall)

@@ -1,0 +1,154 @@
+using Interpreter.Services;
+using Parser.Models;
+
+namespace Interpreter.Tests;
+
+/// <summary>
+/// Regression coverage for the P1 syntax-strictness hardening (2026-10-20).
+/// The build path (Interpreter synthesis: <see cref="Architecture"/> →
+/// <see cref="Process"/> / IfStructure / CaseStructure) used to "consume
+/// expected tokens only when present, never error on absence", so several
+/// pure-syntax errors GHDL rejects were silently accepted. These tests drive
+/// <see cref="Entity.Syntetize(string[])"/> + <see cref="Architecture.Syntetize(string[])"/>
+/// (the same calls the Debugger line-scanner makes) and assert each bad case
+/// now throws, while well-formed code still parses.
+///
+/// Fixtures mirror Kmila-9s/ReviewSyntaxGap/ (S1, S4, S6, S9) plus a valid
+/// control. The one-line-entity scanner fix lives in the Debugger module and is
+/// regression-covered by the CLI fixture gate, not here (Interpreter cannot
+/// reference Debugger).
+/// </summary>
+public static class SyntaxStrictnessTests
+{
+    /// <summary>Runs every syntax-strictness test, printing pass/fail for each.</summary>
+    /// <returns>The number of tests that failed.</returns>
+    public static int RunAllTests()
+    {
+        int failed = 0;
+        Console.WriteLine("=== Syntax Strictness Tests ===");
+
+        var tests = new (string Name, Func<bool> Run)[]
+        {
+            ("S1: missing ';' after 'end process' is rejected", Test_MissingSemicolonEndProcess),
+            ("S4: missing '=>' in a case choice is rejected",   Test_MissingArrowInCase),
+            ("S6: ':=' on a signal (concurrent) is rejected",   Test_VarAssignOnSignal),
+            ("S9: missing 'end if;' is rejected",               Test_MissingEndIf),
+            ("Valid if/case/process still parses",              Test_ValidControlParses),
+        };
+
+        foreach (var (name, run) in tests)
+        {
+            try
+            {
+                bool ok = run();
+                Console.WriteLine($"  [{(ok ? "PASS" : "FAIL")}] {name}");
+                if (!ok) failed++;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  [FAIL] {name} — exception: {ex.GetType().Name}: {ex.Message}");
+                failed++;
+            }
+        }
+
+        Console.WriteLine($"Results: {tests.Length - failed} passed, {failed} failed");
+        return failed;
+    }
+
+    // Shared entity used by the architecture-level cases.
+    private static readonly string[] Ent2 =
+    {
+        "entity dut is",
+        "    port (a : in std_logic; sel : in std_logic_vector(1 downto 0); y : out std_logic);",
+        "end entity dut;",
+    };
+
+    // --- negative cases: synthesis must throw ---
+
+    private static bool Test_MissingSemicolonEndProcess() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    process(a)",
+        "    begin",
+        "        y <= a;",
+        "    end process",          // ERROR: missing ';'
+        "end architecture rtl;",
+    });
+
+    private static bool Test_MissingArrowInCase() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    process(sel)",
+        "    begin",
+        "        case sel is",
+        "            when \"00\"    y <= '0';",   // ERROR: missing '=>'
+        "            when others => y <= '1';",
+        "        end case;",
+        "    end process;",
+        "end architecture rtl;",
+    });
+
+    private static bool Test_VarAssignOnSignal() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    y := a;",              // ERROR: ':=' on a signal in a concurrent statement
+        "end architecture rtl;",
+    });
+
+    private static bool Test_MissingEndIf() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    process(a)",
+        "    begin",
+        "        if a = '1' then",
+        "            y <= '1';",
+        "    end process;",          // ERROR: 'end if;' missing before 'end process'
+        "end architecture rtl;",
+    });
+
+    // --- positive control: synthesis must NOT throw ---
+
+    private static bool Test_ValidControlParses() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    process(a, sel)",
+        "    begin",
+        "        case sel is",
+        "            when \"00\" => y <= '0';",
+        "            when others => y <= a;",
+        "        end case;",
+        "        if sel(0) = '1' then",
+        "            y <= '1';",
+        "        end if;",
+        "    end process;",
+        "end architecture rtl;",
+    });
+
+    // --- helpers ---
+
+    private static bool ExpectThrows(string[] entityLines, string[] archLines)
+    {
+        try { Synthesize(entityLines, archLines); return false; } // no error → test fails
+        catch (ParserException) { return true; }
+        catch (Parser.Repositories.TokenStream.StreamerException) { return true; }
+    }
+
+    private static bool ExpectParses(string[] entityLines, string[] archLines)
+    {
+        try { Synthesize(entityLines, archLines); return true; }
+        catch { return false; }
+    }
+
+    private static void Synthesize(string[] entityLines, string[] archLines)
+    {
+        var entity = new Entity();
+        entity.Syntetize(entityLines);
+        var arch = new Architecture(entity.Ports, entity.Generics);
+        arch.Syntetize(archLines);
+    }
+}
