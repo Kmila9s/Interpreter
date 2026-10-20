@@ -395,6 +395,23 @@ public class CaseStructure : ISControl
             }
         }
 
+        // C6 (non-exhaustive): a std_logic / std_logic_vector / bit selector
+        // always requires a `when others` branch — those types carry meta-values
+        // (U/X/Z/W/L/H/-) that no finite set of 0/1 choices can cover, so GHDL
+        // rejects such a case without `others`. Enum/custom/integer selectors and
+        // matching-case (`case?`) are left out of this check.
+        if (!IsMatching
+            && !Branches.Any(b => b.IsOthers)
+            && _selector is { CustomTypeName: null }
+            && (_selector.Type == Constants.DATATYPES.STD_LOGIC
+                || _selector.Type == Constants.DATATYPES.STD_LOGIC_VECTOR
+                || _selector.Type == Constants.DATATYPES.BIT))
+        {
+            throw new ParserException(
+                $"case on '{_selectorName}' does not cover all choices; add 'when others =>'",
+                _streamer.Current ?? _streamer.Previous);
+        }
+
         // Populate Tasks with first branch for compatibility
         if (Branches.Count > 0)
         {
