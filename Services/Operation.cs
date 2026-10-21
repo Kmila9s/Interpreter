@@ -133,7 +133,7 @@ public class Operation : IOperation {
     /// <param name="RawData">The raw data of the operation.</param>
     /// <param name="Variables">The variables of the operation.</param>
     /// <param name="sourceLine">Optional 1-based source line; 0 = unknown.</param>
-    public Operation(string RawData, HashSet<Variable> Variables, int sourceLine = 0)
+    public Operation(string RawData, HashSet<Variable> Variables, int sourceLine = 0, bool isAssignmentStatement = false)
     {
         var _profileStopwatch = ParseProfile.Enabled ? System.Diagnostics.Stopwatch.StartNew() : null;
         SourceLine = sourceLine;
@@ -213,6 +213,18 @@ public class Operation : IOperation {
             Result = new Variable("ConditionResult", "false", Constants.DATATYPES.BOOLEAN);
             Result.PortType = Constants.PortType.OUT;
         }
+        // v1.18.0 (P4/C8): a signal assignment whose target is an input port is
+        // illegal — GHDL: `port "X" can't be assigned`. Gated on
+        // isAssignmentStatement (set only by the concurrent/process assignment
+        // statement parsers) because the ctor also splits a comparison like
+        // `if din <= x` on `<=`, and `din` may legitimately be an input port read.
+        if (isAssignmentStatement &&
+            Result is { IsPort: true, PortType: Constants.PortType.IN })
+        {
+            throw new Parser.Models.ParserException(
+                $"cannot assign to input port \"{Result.Name}\"", SourceLine, 0);
+        }
+
         _data = tokenizer.TokenizeLineReturn(RawData);
         var syntetized = Syntetize().ToList();
 #if DEBUG_OPERATION
@@ -227,6 +239,12 @@ public class Operation : IOperation {
 #endif
         ShuntingYard shuntingYard = new(syntetized);
         Items = shuntingYard.Result.ToArray();
+
+        // v1.19.0 (P4/C4+C5): type/width validation for a single-atom assignment
+        // (gated like C8 so comparisons are never mistaken for assignments).
+        if (isAssignmentStatement)
+            ValidateAssignmentTypeWidth();
+
         if (_profileStopwatch != null)
         {
             _profileStopwatch.Stop();
@@ -533,21 +551,57 @@ public class Operation : IOperation {
                     }
                 }
 
-                // v0.13.0: Handle undeclared identifiers gracefully
-                // This allows tests with package/constant references to pass
+                // v1.17.0 (P3): resolve an undeclared identifier against the
+                // package-constant registry before giving up. A name that is a
+                // real constant materialises as a typed Variable (this also fixes
+                // the latent "package constant evaluates to 0" bug, where such a
+                // name used to fall through to the 8-bit stub). A name that is
+                // neither a signal/port/generic/alias nor a package constant is a
+                // genuine undeclared-identifier error — GHDL: `no declaration for
+                // "X"`. A token still followed by `(` is a function/array edge
+                // that slipped past the branches above (e.g. a standard-function
+                // parse that failed); keep the historical stub there rather than
+                // mis-reporting it as undeclared.
                 Variable variable;
                 if (!Variables.Contains(currentItem))
                 {
-#if DEBUG
-                    Console.WriteLine($"[Operation] Warning: Undeclared identifier '{currentItem}' in expression '{_rawData}'");
-#endif
-                    // Create stub variable for undeclared identifier
-                    // Assume STD_LOGIC_VECTOR with size 8 as default
-                    variable = new Variable(currentItem, "00000000", Constants.DATATYPES.STD_LOGIC_VECTOR)
+                    // NB: `GetConstant(...) is { }` — a true null test. Variable
+                    // overloads `operator !=`/`==`, so a plain `!= null` would
+                    // bind to those overloads and report a null reference as
+                    // non-null; the pattern bypasses them.
+                    if (PackageRegistry.Instance.GetConstant(currentItem) is { } pkgConst)
                     {
-                        Size = 8,
-                        IsStub = true
-                    };
+                        variable = MaterializeConstant(pkgConst);
+                    }
+                    else if (_currentSyntetizeIndex + 1 < _data.Length &&
+                             _data[_currentSyntetizeIndex + 1] == "(")
+                    {
+                        variable = new Variable(currentItem, "00000000", Constants.DATATYPES.STD_LOGIC_VECTOR)
+                        {
+                            Size = 8,
+                            IsStub = true
+                        };
+                    }
+                    else if (IsPredefinedName(currentItem) ||
+                             PackageRegistry.Instance.IsDeclaredName(currentItem))
+                    {
+                        // Either a VHDL predefined name always in scope (e.g. `now`)
+                        // or a name that IS declared somewhere in the source but that
+                        // Kmila's scope-builder did not evaluate into the live Variable
+                        // set (e.g. a local constant whose initializer references a
+                        // generic). Not an undeclared-identifier error — keep the
+                        // historical stub so synthesis proceeds as before.
+                        variable = new Variable(currentItem, "00000000", Constants.DATATYPES.STD_LOGIC_VECTOR)
+                        {
+                            Size = 8,
+                            IsStub = true
+                        };
+                    }
+                    else
+                    {
+                        throw new Parser.Models.ParserException(
+                            $"no declaration for \"{currentItem}\"", SourceLine, 0);
+                    }
                 }
                 else
                 {
@@ -1113,6 +1167,147 @@ public class Operation : IOperation {
     /// <c>Items</c> — <see cref="Execute()"/> switches on the type and
     /// invokes <c>Evaluate</c> per fire.
     /// </remarks>
+    /// <summary>
+    /// v1.17.0 (P3): build a usable <see cref="Variable"/> from a package
+    /// constant resolved out of <see cref="PackageRegistry"/>. The scanner
+    /// registration path stores a constant's <c>Value</c> but leaves
+    /// <c>Type = UNKNOWN</c>; infer a concrete datatype/size from the value so
+    /// downstream <see cref="Operator"/> evaluation treats it like a real
+    /// signal — an integer literal becomes INTEGER, a bit pattern like "00001"
+    /// becomes a STD_LOGIC_VECTOR sized to its length — instead of silently
+    /// collapsing to the old 8-bit "00000000" stub. An already-typed constant
+    /// is copied through unchanged.
+    /// </summary>
+    /// <summary>
+    /// v1.19.0 (P4): reject a single-atom assignment whose RHS type or width
+    /// cannot match the LHS target — C4 (std_logic vs std_logic_vector) and C5
+    /// (vector width mismatch), matching GHDL. Deliberately conservative: it
+    /// fires only when the RHS is ONE lone literal or whole-signal reference,
+    /// because the type/width of a general RHS expression (concatenation,
+    /// conversions, <c>others =&gt;</c>, slices, function results) is not known
+    /// until evaluation, and those constructs are pervasive in valid designs.
+    /// </summary>
+    private void ValidateAssignmentTypeWidth()
+    {
+        // LHS must be a real, whole-signal declared target (not a stub, not the
+        // BOOLEAN ConditionResult a comparison/sliced-target resolves to, not an
+        // indexed single-bit target whose width is 1, not undetermined).
+        if (Result is null || Result.IsStub || ResultBitIndex is not null) return;
+        if (string.Equals(Result.Name, "ConditionResult", StringComparison.Ordinal)) return;
+        var lhsType = Result.Type;
+        if (lhsType == Constants.DATATYPES.UNKNOWN) return;
+
+        // RHS must be a single atom (one Variable; no operators / deferred items).
+        if (Items.Length != 1 || Items[0] is not Variable rhs) return;
+        if (rhs.IsStub || rhs.Type == Constants.DATATYPES.UNKNOWN) return;
+        string rhsVal = rhs.Value?.ToString() ?? string.Empty;
+        if (rhsVal.StartsWith("(others", StringComparison.OrdinalIgnoreCase)) return; // aggregate → width = LHS by construction
+
+        static bool IsScalar(Constants.DATATYPES t) =>
+            t == Constants.DATATYPES.STD_LOGIC || t == Constants.DATATYPES.BIT;
+        static bool IsVector(Constants.DATATYPES t) =>
+            t == Constants.DATATYPES.STD_LOGIC_VECTOR;
+
+        bool lhsScalar = IsScalar(lhsType), lhsVector = IsVector(lhsType);
+        bool rhsScalar = IsScalar(rhs.Type), rhsVector = IsVector(rhs.Type);
+
+        // Only compare within the std_logic / std_logic_vector family. INTEGER,
+        // NATURAL, BOOLEAN etc. coerce legitimately (to_integer/to_unsigned/…),
+        // so they are left alone.
+        if (!(lhsScalar || lhsVector) || !(rhsScalar || rhsVector)) return;
+
+        // C4 — scalar vs vector type mismatch.
+        if ((lhsScalar && rhsVector) || (lhsVector && rhsScalar))
+        {
+            string lhsClass = lhsScalar ? "std_logic" : "std_logic_vector";
+            string rhsClass = rhsScalar ? "std_logic" : "std_logic_vector";
+            throw new Parser.Models.ParserException(
+                $"type mismatch: cannot assign a {rhsClass} value to {lhsClass} signal \"{Result.Name}\"",
+                SourceLine, 0);
+        }
+
+        // C5 — width mismatch between two vectors. Only act on RELIABLE widths:
+        // Kmila defaults an unresolved generic/expression range (e.g.
+        // `std_logic_vector(WIDTH-1 downto 0)`) to Size 8, which would otherwise
+        // false-reject valid designs. A width is trusted only when it comes from
+        // a declared literal range (HasDeclaredRange) for a signal, or from a
+        // pure-binary literal's length. Hex/other literals and generic-sized
+        // signals are skipped.
+        if (lhsVector && rhsVector && Result.HasDeclaredRange && Result.Size > 0)
+        {
+            int lhsW = Result.Size;
+            int? rhsW = null;
+            if (rhs.Name.StartsWith("Literal-", StringComparison.Ordinal))
+            {
+                string bits = rhsVal.Replace("\"", string.Empty).Replace("'", string.Empty);
+                if (bits.Length > 0 &&
+                    bits.All(c => "01UXZWLH-".IndexOf(char.ToUpperInvariant(c)) >= 0))
+                    rhsW = bits.Length; // reliable: a binary/metavalue bit string
+            }
+            else if (rhs.HasDeclaredRange && rhs.Size > 0)
+            {
+                rhsW = rhs.Size; // reliable: a signal with a declared literal range
+            }
+
+            if (rhsW is int w && lhsW != w)
+            {
+                throw new Parser.Models.ParserException(
+                    $"width mismatch: {lhsW}-bit signal \"{Result.Name}\" assigned a {w}-bit value",
+                    SourceLine, 0);
+            }
+        }
+    }
+
+    /// <summary>
+    /// v1.17.0 (P3): VHDL predefined parameterless names that resolve to no
+    /// user declaration yet are always in scope, so the undeclared-identifier
+    /// check must not reject them. <c>now</c> (the current simulation time) is
+    /// the one the sample corpus exercises.
+    /// </summary>
+    private static bool IsPredefinedName(string name) =>
+        string.Equals(name, "now", StringComparison.OrdinalIgnoreCase);
+
+    private static Variable MaterializeConstant(Variable c)
+    {
+        object value = c.Value;
+        Constants.DATATYPES type = c.Type;
+        int size = c.Size;
+
+        if (type == Constants.DATATYPES.UNKNOWN)
+        {
+            if (value is int)
+            {
+                type = Constants.DATATYPES.INTEGER;
+            }
+            else if (value is string vs)
+            {
+                string bare = vs.Trim().Trim('"');
+                if (int.TryParse(bare.Replace("_", string.Empty), out _))
+                {
+                    type = Constants.DATATYPES.INTEGER;
+                }
+                else if (bare.Length > 0 &&
+                         bare.All(ch => "01UXZWLH-".IndexOf(char.ToUpperInvariant(ch)) >= 0))
+                {
+                    type = Constants.DATATYPES.STD_LOGIC_VECTOR;
+                    size = bare.Length;
+                    value = bare;
+                }
+                else
+                {
+                    // Unresolvable value (e.g. an enum-literal name) — fall back
+                    // to the historical vector shape so synthesis still proceeds.
+                    type = Constants.DATATYPES.STD_LOGIC_VECTOR;
+                }
+            }
+        }
+
+        var mv = new Variable(c.Name, value, type, size) { IsConstant = true };
+        if (!string.IsNullOrEmpty(c.CustomTypeName))
+            mv.CustomTypeName = c.CustomTypeName;
+        return mv;
+    }
+
     private (bool success, object item) ParseUserDefinedFunctionCall(string functionName)
     {
         // Skip the function name (already processed), move to "("
@@ -1175,6 +1370,27 @@ public class Operation : IOperation {
         {
             // Fall through to stub on any registry error so the rest of
             // the expression still synthesises.
+        }
+
+        // v1.17.0 (P3): a call to a name unknown to every registry is an
+        // undefined subprogram — GHDL: `no declaration for "X"`. Signature-only
+        // package/IEEE functions (q_mul, resize, …) and constant arrays indexed
+        // like a call (rom_data(addr)) are NOT undefined: they are known to a
+        // registry, so they keep the legacy black-box stub below. Mirrors the
+        // known-callable predicate already used by ParseFunctionCall.
+        bool knownCallable =
+            StandardFunctions.IsStandardFunction(functionName)
+            || Services.FunctionRegistry.Instance.IsKnown(functionName)
+            || PackageRegistry.Instance.ContainsFunction(functionName)
+            || PackageRegistry.Instance.ContainsProcedure(functionName)
+            || PackageRegistry.Instance.ContainsConstant(functionName)
+            // declared somewhere in the source (a subprogram or indexed array/
+            // constant) but not evaluated into a live registry during this pass.
+            || PackageRegistry.Instance.IsDeclaredName(functionName);
+        if (!knownCallable)
+        {
+            throw new Parser.Models.ParserException(
+                $"no declaration for \"{functionName}\"", SourceLine, 0);
         }
 
         // Return a stub variable representing an unresolved function result

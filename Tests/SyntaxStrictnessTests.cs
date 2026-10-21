@@ -37,8 +37,18 @@ public static class SyntaxStrictnessTests
             ("C7: duplicate case choice is rejected",           Test_DuplicateCaseChoice),
             ("C6: non-exhaustive std_logic_vector case rejected", Test_NonExhaustiveCase),
             ("C10: enum choice not in the type is rejected",    Test_EnumChoiceNotInType),
+            ("C2: undeclared RHS signal is rejected",           Test_UndeclaredRhsSignal),
+            ("C3: undeclared assignment target is rejected",    Test_UndeclaredLhsTarget),
+            ("C9: undefined function call is rejected",         Test_UndefinedFunctionCall),
+            ("C8: assignment to an input port is rejected",     Test_AssignToInputPort),
+            ("C4: scalar <= vector type mismatch is rejected",  Test_TypeMismatchScalarVector),
+            ("C5: literal width mismatch is rejected",          Test_WidthMismatchLiteral),
             ("Valid if/case/process still parses",              Test_ValidControlParses),
             ("Valid literal case (with others) still parses",   Test_ValidLiteralCaseParses),
+            ("Declared constant + signal still resolve",        Test_DeclaredConstantResolves),
+            ("Reading an input port on the RHS still parses",   Test_ReadInputPortParses),
+            ("Matching-width vector assignment still parses",   Test_MatchingWidthParses),
+            ("Expression RHS is not width-checked",             Test_ExpressionRhsNotWidthChecked),
         };
 
         foreach (var (name, run) in tests)
@@ -207,6 +217,104 @@ public static class SyntaxStrictnessTests
         "            y <= '1';",
         "        end if;",
         "    end process;",
+        "end architecture rtl;",
+    });
+
+    // P3 (v1.17.0): undeclared-identifier rejection.
+
+    private static bool Test_UndeclaredRhsSignal() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    y <= a and enable_x;",   // ERROR: enable_x never declared
+        "end architecture rtl;",
+    });
+
+    private static bool Test_UndeclaredLhsTarget() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    process(a)",
+        "    begin",
+        "        counter_next <= a;",  // ERROR: counter_next never declared
+        "    end process;",
+        "end architecture rtl;",
+    });
+
+    private static bool Test_UndefinedFunctionCall() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    y <= my_decode(a);",      // ERROR: my_decode defined nowhere
+        "end architecture rtl;",
+    });
+
+    private static bool Test_AssignToInputPort() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    a <= '0';",                // ERROR: `a` is mode `in`
+        "end architecture rtl;",
+    });
+
+    private static bool Test_TypeMismatchScalarVector() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    y <= sel;",                 // ERROR: std_logic <= std_logic_vector
+        "end architecture rtl;",
+    });
+
+    private static bool Test_WidthMismatchLiteral() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "    signal v3 : std_logic_vector(2 downto 0);",
+        "begin",
+        "    v3 <= \"1010\";",            // ERROR: 4-bit literal into a 3-bit signal
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a matching-width literal assignment must still parse.
+    private static bool Test_MatchingWidthParses() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "    signal v3 : std_logic_vector(2 downto 0);",
+        "begin",
+        "    v3 <= \"101\";",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: an expression RHS (concatenation) must be skipped by the
+    // single-atom type/width check, never width-rejected.
+    private static bool Test_ExpressionRhsNotWidthChecked() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "    signal v3 : std_logic_vector(2 downto 0);",
+        "begin",
+        "    v3 <= sel & a;",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: reading an input port on the RHS (and driving an output)
+    // must still parse — the port-mode check must only reject in-port *targets*.
+    private static bool Test_ReadInputPortParses() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    y <= a and sel(0);",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a declared local constant and signal must still resolve
+    // (the undeclared check must not over-reject real declarations).
+    private static bool Test_DeclaredConstantResolves() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "    constant K : std_logic := '1';",
+        "    signal tmp : std_logic;",
+        "begin",
+        "    tmp <= a and K;",
+        "    y <= tmp;",
         "end architecture rtl;",
     });
 

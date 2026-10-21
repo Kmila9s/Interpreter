@@ -1245,7 +1245,7 @@ public class Architecture : ISControl, IControl
                 }
 
                 // Regular assignment
-                Operation op = new(operation, variables, sourceLine: assignLine);
+                Operation op = new(operation, variables, sourceLine: assignLine, isAssignmentStatement: true);
                 Tasks.Add(op);
                 break;
         }

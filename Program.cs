@@ -199,6 +199,13 @@ class Program
                 // entries are isolated from the previous one.
                 SkipDiagnosticLog.Instance.Clear();
 
+                // v1.20.0 (P3 follow-up): after the per-file clear, re-scan THIS
+                // file's packages + declared names, mirroring the app scan path,
+                // so same-file package constants/functions resolve and the
+                // undeclared-identifier check sees every declared name.
+                try { PackageSubtypeScanner.ScanFile(testFile); } catch { /* best-effort */ }
+                try { PackageRegistry.Instance.RegisterDeclaredNamesFromSource(File.ReadAllText(testFile)); } catch { /* best-effort */ }
+
                 string raw = File.ReadAllText(testFile);
                 var result = ProcessVhdlCode(raw, _cts.Token);
                 raw = null!;  // release the source string immediately

@@ -576,7 +576,7 @@ public class Process : ISControl, IControl
         switch (type)
         {
             case OperationType.ASSIGNATION:
-                Operation op = new(operation, variables, sourceLine: assignLine);
+                Operation op = new(operation, variables, sourceLine: assignLine, isAssignmentStatement: true);
                 Tasks.Add(op);
                 break;
         }
