@@ -1255,7 +1255,7 @@ public class Architecture : ISControl, IControl
                 // Check for conditional assignment (when...else pattern)
                 if (operation.Contains("when", StringComparison.OrdinalIgnoreCase))
                 {
-                    var condAssign = ConditionalAssignment.TryParse(operation, variables);
+                    var condAssign = ConditionalAssignment.TryParse(operation, variables, assignLine);
                     if (condAssign != null)
                     {
                         Tasks.Add(condAssign);

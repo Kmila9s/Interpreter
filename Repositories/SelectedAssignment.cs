@@ -327,6 +327,10 @@ public class SelectedAssignment : ISControl
     {
         if (_streamer == null) return;
 
+        // Capture the statement's source line up-front (before tokens are
+        // consumed) for the gated validation pass at the end of this method.
+        int sourceLine = _streamer.Current?.Line ?? 0;
+
         // Expect 'with'
         if (_streamer.Current?.Value.ToLower() == "with")
         {
@@ -373,6 +377,47 @@ public class SelectedAssignment : ISControl
 
         // Parse choices
         ParseChoices();
+
+        // v1.22.0 (item 3): extend the input-port (C8) and type/width (C4/C5)
+        // checks — which until now only reached plain concurrent + process
+        // assignments — to this selected (with…select) form.
+        ValidateChoiceAssignments(sourceLine);
+    }
+
+    /// <summary>
+    /// Runs the same input-port (C8) and type/width (C4/C5) validation that a
+    /// plain concurrent assignment gets, by constructing a <em>gated,
+    /// validation-only</em> <see cref="Services.Operation"/>
+    /// (<c>"target &lt;= value"</c>, <c>isAssignmentStatement: true</c>) for each
+    /// choice value and discarding it. The ctor resolves the real target from
+    /// <see cref="_variables"/> and throws a <see cref="ParserException"/> on a
+    /// violation. Only that intended rejection escapes — any other ctor failure
+    /// on an unusual-but-valid value expression is swallowed, so a valid design
+    /// is never destabilised. The target index is preserved (e.g. <c>y(0)</c>)
+    /// so an indexed write is treated as a single-bit assignment and the width
+    /// check is skipped (otherwise <c>y &lt;= '1'</c> would false-trip C4).
+    /// </summary>
+    private void ValidateChoiceAssignments(int sourceLine)
+    {
+        if (string.IsNullOrEmpty(TargetName)) return;
+
+        string targetStr = TargetBitIndex is int idx
+            ? $"{TargetName}({idx})"
+            : TargetName;
+
+        foreach (var choice in Choices)
+        {
+            if (string.IsNullOrWhiteSpace(choice.ValueExpression))
+                continue;
+
+            try
+            {
+                _ = new Operation($"{targetStr} <= {choice.ValueExpression}",
+                                  _variables, sourceLine, isAssignmentStatement: true);
+            }
+            catch (ParserException) { throw; }
+            catch { /* never destabilise a valid design on an unexpected ctor failure */ }
+        }
     }
 
     /// <summary>

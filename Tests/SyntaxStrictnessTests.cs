@@ -44,6 +44,12 @@ public static class SyntaxStrictnessTests
             ("C4: scalar <= vector type mismatch is rejected",  Test_TypeMismatchScalarVector),
             ("C5: literal width mismatch is rejected",          Test_WidthMismatchLiteral),
             ("C11: missing ';' on a signal assignment rejected",Test_MissingSemicolonConcurrent),
+            ("C8 via when…else: assign to input port rejected", Test_AssignToInputPort_WhenElse),
+            ("C8 via with…select: assign to input port rejected", Test_AssignToInputPort_WithSelect),
+            ("C4 via when…else: scalar <= vector rejected",     Test_TypeMismatch_WhenElse),
+            ("C4 via with…select: scalar <= vector rejected",   Test_TypeMismatch_WithSelect),
+            ("C5 via when…else: literal width mismatch rejected", Test_WidthMismatch_WhenElse),
+            ("C5 via with…select: literal width mismatch rejected", Test_WidthMismatch_WithSelect),
             ("Valid if/case/process still parses",              Test_ValidControlParses),
             ("Valid literal case (with others) still parses",   Test_ValidLiteralCaseParses),
             ("Declared constant + signal still resolve",        Test_DeclaredConstantResolves),
@@ -51,6 +57,10 @@ public static class SyntaxStrictnessTests
             ("Matching-width vector assignment still parses",   Test_MatchingWidthParses),
             ("Expression RHS is not width-checked",             Test_ExpressionRhsNotWidthChecked),
             ("Conditional '<=' comparison still parses",        Test_ConditionalComparisonParses),
+            ("Valid when…else assignment still parses",         Test_ValidWhenElseParses),
+            ("Valid with…select assignment still parses",       Test_ValidWithSelectParses),
+            ("Metavalue char literal 'X' is scalar, not vector", Test_MetavalueCharLiteralParses),
+            ("with…select with 'X' when others still parses",   Test_WithSelectMetavalueOthersParses),
         };
 
         foreach (var (name, run) in tests)
@@ -337,6 +347,106 @@ public static class SyntaxStrictnessTests
         "begin",
         "    tmp <= a and K;",
         "    y <= tmp;",
+        "end architecture rtl;",
+    });
+
+    // --- item 3: C8/C4/C5 now also reach when…else and with…select forms ---
+
+    // C8 via when…else: driving an input-port *target* is illegal even inside a
+    // conditional assignment.
+    private static bool Test_AssignToInputPort_WhenElse() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    a <= '0' when sel = \"00\" else '1';",   // ERROR: `a` is mode `in`
+        "end architecture rtl;",
+    });
+
+    // C8 via with…select.
+    private static bool Test_AssignToInputPort_WithSelect() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    with sel select a <= '0' when \"00\", '1' when others;",  // ERROR: `a` is mode `in`
+        "end architecture rtl;",
+    });
+
+    // C4 via when…else: scalar target ⇐ vector value.
+    private static bool Test_TypeMismatch_WhenElse() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    y <= sel when a = '1' else sel;",        // ERROR: std_logic <= std_logic_vector
+        "end architecture rtl;",
+    });
+
+    // C4 via with…select.
+    private static bool Test_TypeMismatch_WithSelect() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    with sel select y <= sel when \"00\", sel when others;",  // ERROR: std_logic <= std_logic_vector
+        "end architecture rtl;",
+    });
+
+    // C5 via when…else: 4-bit literal into a 3-bit target.
+    private static bool Test_WidthMismatch_WhenElse() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "    signal v3 : std_logic_vector(2 downto 0);",
+        "begin",
+        "    v3 <= \"1010\" when a = '1' else \"000\";",  // ERROR: 4-bit literal into 3-bit signal
+        "end architecture rtl;",
+    });
+
+    // C5 via with…select.
+    private static bool Test_WidthMismatch_WithSelect() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "    signal v3 : std_logic_vector(2 downto 0);",
+        "begin",
+        "    with sel select v3 <= \"1010\" when \"00\", \"000\" when others;",  // ERROR: 4-bit literal
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a valid when…else (matching types/widths, output target)
+    // must still parse — the new checks must not over-reject.
+    private static bool Test_ValidWhenElseParses() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    y <= '1' when sel = \"00\" else '0';",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a valid with…select must still parse.
+    private static bool Test_ValidWithSelectParses() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    with sel select y <= '1' when \"00\", '0' when others;",
+        "end architecture rtl;",
+    });
+
+    // Positive guard (root-cause fix): a single-quoted std_logic metavalue
+    // literal ('X','W','L','H', …) is a SCALAR, not a vector, so assigning it to
+    // a scalar target must not trip the C4 type check. The datatype finder
+    // mislabels these; the assignment check corrects it from the raw source.
+    private static bool Test_MetavalueCharLiteralParses() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    y <= 'X';",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a with…select whose default is a metavalue char literal
+    // (the `'X' when others` shape used by real mux designs, e.g. bench 014).
+    private static bool Test_WithSelectMetavalueOthersParses() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    with sel select y <= '1' when \"00\", 'X' when others;",
         "end architecture rtl;",
     });
 

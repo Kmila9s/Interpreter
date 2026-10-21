@@ -310,7 +310,7 @@ public class ConditionalAssignment : ISControl
     /// <param name="operation">The raw operation string like "target &lt;= val1 when cond1 else val2".</param>
     /// <param name="variables">The variables in scope.</param>
     /// <returns>A new ConditionalAssignment instance, or null if not a conditional assignment.</returns>
-    public static ConditionalAssignment? TryParse(string operation, HashSet<Variable> variables)
+    public static ConditionalAssignment? TryParse(string operation, HashSet<Variable> variables, int sourceLine = 0)
     {
         // Check if this contains 'when' keyword (indicating conditional assignment)
         if (!operation.Contains("when", StringComparison.OrdinalIgnoreCase))
@@ -334,7 +334,45 @@ public class ConditionalAssignment : ISControl
         // Parse branches from value part
         ParseBranchesFromString(assignment, valuePart);
 
+        // v1.22.0 (item 3): extend the input-port (C8) and type/width (C4/C5)
+        // checks to this conditional (when…else) form.
+        assignment.ValidateBranchAssignments(targetPart, sourceLine);
+
         return assignment;
+    }
+
+    /// <summary>
+    /// Runs the same input-port (C8) and type/width (C4/C5) validation that a
+    /// plain concurrent assignment gets, by constructing a <em>gated,
+    /// validation-only</em> <see cref="Services.Operation"/>
+    /// (<c>"target &lt;= value"</c>, <c>isAssignmentStatement: true</c>) for each
+    /// branch value and discarding it. The ctor resolves the real target from
+    /// <see cref="_variables"/> and throws a <see cref="ParserException"/> on a
+    /// violation. Only that intended rejection escapes — any other ctor failure
+    /// on an unusual-but-valid value expression is swallowed, so a valid design
+    /// is never destabilised. Only branch <em>values</em> are validated, never a
+    /// <c>when</c> condition (a condition legitimately uses <c>&lt;=</c> as a
+    /// comparison). <paramref name="targetPart"/> is the raw LHS and preserves
+    /// any index, so an indexed write skips the width check.
+    /// </summary>
+    private void ValidateBranchAssignments(string targetPart, int sourceLine)
+    {
+        if (string.IsNullOrWhiteSpace(targetPart))
+            return;
+
+        foreach (var branch in Branches)
+        {
+            if (string.IsNullOrWhiteSpace(branch.ValueExpression))
+                continue;
+
+            try
+            {
+                _ = new Operation($"{targetPart} <= {branch.ValueExpression}",
+                                  _variables, sourceLine, isAssignmentStatement: true);
+            }
+            catch (ParserException) { throw; }
+            catch { /* never destabilise a valid design on an unexpected ctor failure */ }
+        }
     }
 
     /// <summary>
