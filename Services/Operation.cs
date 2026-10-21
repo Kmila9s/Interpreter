@@ -1211,6 +1211,26 @@ public class Operation : IOperation {
         bool lhsScalar = IsScalar(lhsType), lhsVector = IsVector(lhsType);
         bool rhsScalar = IsScalar(rhs.Type), rhsVector = IsVector(rhs.Type);
 
+        // A SINGLE-quoted character literal ('0','1','X','W','L','H','Z','U','-')
+        // is ALWAYS a scalar std_logic value. Kmila's datatype finder mislabels
+        // 'X'/'W'/'L'/'H' as a vector, which would false-reject a perfectly legal
+        // `y <= 'X'` (and, via with…select/when…else, `… 'X' when others`). Detect
+        // it from the RAW source RHS (the parsed literal's stored Value may be
+        // expanded to a padded string, so it isn't reliable here). A DOUBLE-quoted
+        // `"0"` is a 1-bit vector and is deliberately NOT matched (quote char is
+        // the discriminator).
+        if (rhs.Name.StartsWith("Literal-", StringComparison.Ordinal))
+        {
+            int opIdx = _rawData.IndexOf("<=", StringComparison.Ordinal);
+            if (opIdx < 0) opIdx = _rawData.IndexOf(":=", StringComparison.Ordinal);
+            string rawRhs = opIdx >= 0 ? _rawData[(opIdx + 2)..].Trim() : string.Empty;
+            if (rawRhs.Length == 3 && rawRhs[0] == '\'' && rawRhs[^1] == '\'')
+            {
+                rhsScalar = true;
+                rhsVector = false;
+            }
+        }
+
         // Only compare within the std_logic / std_logic_vector family. INTEGER,
         // NATURAL, BOOLEAN etc. coerce legitimately (to_integer/to_unsigned/…),
         // so they are left alone.
