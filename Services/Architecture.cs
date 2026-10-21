@@ -1186,6 +1186,8 @@ public class Architecture : ISControl, IControl
         }
 
         var rhsBuilder = new StringBuilder();
+        int rhsParenDepth = 0;
+        bool rhsSawWhen = false;
         while (_streamer.Current?.Value != ";")
         {
             if (_streamer.Current == null)
@@ -1199,7 +1201,24 @@ public class Architecture : ISControl, IControl
                 throw new ParserException(
                     $"Unexpected token '{_streamer.Current.Value}' inside concurrent statement — not a valid VHDL identifier, keyword, operator, or literal",
                     _streamer.Current);
-            rhsBuilder.Append(_streamer.Current.Value).Append(' ');
+
+            var cur = _streamer.Current.Value;
+            if (cur == "(") rhsParenDepth++;
+            else if (cur == ")") rhsParenDepth--;
+            else if (cur.Equals("when", StringComparison.OrdinalIgnoreCase)) rhsSawWhen = true;
+            // C11 (v1.21.0): a second assignment operator at paren-depth 0 means
+            // the RHS has run past a missing ';' into the next statement. ':=' is
+            // never valid inside an expression, and a plain-assignment '<=' at
+            // depth 0 here is the next statement. A relational '<=' used as an
+            // operand appears either parenthesised or inside a conditional
+            // (`… when <cond> else …`) condition — so once a `when` has been seen
+            // the depth-0 '<=' is a comparison and must not be flagged.
+            else if (rhsParenDepth == 0 && !rhsSawWhen && (cur == ":=" || cur == "<="))
+                throw new ParserException(
+                    $"';' expected to terminate the assignment to '{first.Value}' (found '{cur}' — missing ';'?)",
+                    _streamer.Current);
+
+            rhsBuilder.Append(cur).Append(' ');
             _streamer.MoveNext();
         }
         string rhs = rhsBuilder.ToString().Trim();

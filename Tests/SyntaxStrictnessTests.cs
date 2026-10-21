@@ -43,12 +43,14 @@ public static class SyntaxStrictnessTests
             ("C8: assignment to an input port is rejected",     Test_AssignToInputPort),
             ("C4: scalar <= vector type mismatch is rejected",  Test_TypeMismatchScalarVector),
             ("C5: literal width mismatch is rejected",          Test_WidthMismatchLiteral),
+            ("C11: missing ';' on a signal assignment rejected",Test_MissingSemicolonConcurrent),
             ("Valid if/case/process still parses",              Test_ValidControlParses),
             ("Valid literal case (with others) still parses",   Test_ValidLiteralCaseParses),
             ("Declared constant + signal still resolve",        Test_DeclaredConstantResolves),
             ("Reading an input port on the RHS still parses",   Test_ReadInputPortParses),
             ("Matching-width vector assignment still parses",   Test_MatchingWidthParses),
             ("Expression RHS is not width-checked",             Test_ExpressionRhsNotWidthChecked),
+            ("Conditional '<=' comparison still parses",        Test_ConditionalComparisonParses),
         };
 
         foreach (var (name, run) in tests)
@@ -292,6 +294,26 @@ public static class SyntaxStrictnessTests
         "    signal v3 : std_logic_vector(2 downto 0);",
         "begin",
         "    v3 <= sel & a;",
+        "end architecture rtl;",
+    });
+
+    private static bool Test_MissingSemicolonConcurrent() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    y <= a and sel(0)",         // ERROR: missing ';'
+        "    y <= a;",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a conditional assignment whose condition uses '<=' as a
+    // comparison must still parse — the missing-';' check must not flag it.
+    private static bool Test_ConditionalComparisonParses() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "    signal v3 : std_logic_vector(2 downto 0);",
+        "begin",
+        "    y <= '1' when v3 <= \"010\" else '0';",
         "end architecture rtl;",
     });
 
