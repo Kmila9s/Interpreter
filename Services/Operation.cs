@@ -1264,6 +1264,10 @@ public class Operation : IOperation {
                     rhsW = rhs.Size;
                 }
 
+                // Fallback for a based literal (x"…"/o"…"/b"…") whose stored value
+                // isn't a pure-binary string: its length IS certain. (v1.27.0)
+                rhsW ??= ExpressionWidthInference.TryComputeWidth(rawRhs, Variables);
+
                 if (rhsW is int w && lhsW != w)
                     throw new Parser.Models.ValidationException(
                         $"width mismatch: {lhsW}-bit signal \"{Result.Name}\" assigned a {w}-bit value",

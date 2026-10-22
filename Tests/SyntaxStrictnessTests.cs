@@ -56,6 +56,8 @@ public static class SyntaxStrictnessTests
             ("C5 concatenation width mismatch rejected",         Test_Width_ConcatMismatch),
             ("C4 concatenation into a scalar rejected",          Test_Width_ConcatIntoScalar),
             ("C5 literal-slice width mismatch rejected",         Test_Width_SliceMismatch),
+            ("C5 hex-literal width mismatch rejected",           Test_Width_HexMismatch),
+            ("C11 indexed next-target (missing ';') rejected",   Test_C11_IndexedNextTarget),
             ("C8 via when…else: assign to input port rejected", Test_AssignToInputPort_WhenElse),
             ("C8 via with…select: assign to input port rejected", Test_AssignToInputPort_WithSelect),
             ("C4 via when…else: scalar <= vector rejected",     Test_TypeMismatch_WhenElse),
@@ -84,6 +86,8 @@ public static class SyntaxStrictnessTests
             ("matching-width concatenation still parses",        Test_Width_ConcatMatchParses),
             ("concat with a non-literal slice still parses",     Test_Width_NonLiteralSliceParses),
             ("arithmetic / conversion RHS not width-checked",    Test_Width_ArithConversionParses),
+            ("matching hex-literal width still parses",          Test_Width_HexMatchParses),
+            ("indexed comparison in a condition still parses",   Test_C11_IndexComparisonParses),
         };
 
         foreach (var (name, run) in tests)
@@ -754,6 +758,47 @@ public static class SyntaxStrictnessTests
         "    signal t8 : std_logic_vector(7 downto 0);",
         "begin",
         "    y8 <= std_logic_vector(unsigned(t8) + 1);",
+        "end architecture rtl;",
+    });
+
+    // --- quick-win cleanups (v1.27.0): hex-literal width + indexed C11 edge ---
+
+    // Reject: a hex literal whose length differs from the target (12 ≠ 8).
+    private static bool Test_Width_HexMismatch() => ExpectThrows(EntW, new[]
+    {
+        "architecture rtl of dutw is",
+        "begin",
+        "    y8 <= x\"FFF\";",            // ERROR: 12-bit hex into an 8-bit signal
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a matching hex literal must parse (x"AB" = 8 bits).
+    private static bool Test_Width_HexMatchParses() => ExpectParses(EntW, new[]
+    {
+        "architecture rtl of dutw is",
+        "begin",
+        "    y8 <= x\"AB\";",
+        "end architecture rtl;",
+    });
+
+    // Reject: a when…else with no else, missing ';', whose next statement has an
+    // INDEXED target (the stray '<=' predecessor is ')').
+    private static bool Test_C11_IndexedNextTarget() => ExpectThrows(EntW, new[]
+    {
+        "architecture rtl of dutw is",
+        "begin",
+        "    ys <= '1' when a4 = \"0000\"",   // ERROR: missing ';'
+        "    y8(0) <= '1';",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: an indexed comparison in a condition must still parse — the
+    // ')' walk-back must not mistake `a4(0) <= b2(0)` for a new statement.
+    private static bool Test_C11_IndexComparisonParses() => ExpectParses(EntW, new[]
+    {
+        "architecture rtl of dutw is",
+        "begin",
+        "    ys <= '1' when a4(0) <= b2(0) else '0';",
         "end architecture rtl;",
     });
 

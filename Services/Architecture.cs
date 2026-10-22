@@ -1199,8 +1199,9 @@ public class Architecture : ISControl, IControl
         // must NOT be read as a missing-';' signal. Nested conditional expressions are
         // parenthesised (depth > 0), so they never toggle this.
         bool rhsInCondition = false;
-        // Rolling two-token history for the C11 stray-operator detector.
-        Parser.Models.Token? rhsPrev = null, rhsPrevPrev = null;
+        // Rolling RHS token history for the C11 stray-operator detector (lets it
+        // walk back across an indexed/sliced next-target, e.g. `z(0) <=`).
+        var rhsTokens = new List<Parser.Models.Token>();
         while (_streamer.Current?.Value != ";")
         {
             if (_streamer.Current == null)
@@ -1227,14 +1228,13 @@ public class Architecture : ISControl, IControl
             // waveform context, and — guarded — a '<=' that starts a new statement
             // inside a trailing when…else condition (operand-before-target).
             else if (ConcurrentAssignmentTermination.IsStrayAssignmentOperator(
-                         curTok, rhsParenDepth, rhsInCondition, rhsPrev, rhsPrevPrev))
+                         curTok, rhsParenDepth, rhsInCondition, rhsTokens))
                 throw new ValidationException(
                     $"';' expected to terminate the assignment to '{first.Value}' (found '{cur}' — missing ';'?)",
                     curTok);
 
             rhsBuilder.Append(cur).Append(' ');
-            rhsPrevPrev = rhsPrev;
-            rhsPrev = curTok;
+            rhsTokens.Add(curTok);
             _streamer.MoveNext();
         }
         string rhs = rhsBuilder.ToString().Trim();
