@@ -221,7 +221,7 @@ public class Operation : IOperation {
         if (isAssignmentStatement &&
             Result is { IsPort: true, PortType: Constants.PortType.IN })
         {
-            throw new Parser.Models.ParserException(
+            throw new Parser.Models.ValidationException(
                 $"cannot assign to input port \"{Result.Name}\"", SourceLine, 0);
         }
 
@@ -1241,7 +1241,7 @@ public class Operation : IOperation {
         {
             string lhsClass = lhsScalar ? "std_logic" : "std_logic_vector";
             string rhsClass = rhsScalar ? "std_logic" : "std_logic_vector";
-            throw new Parser.Models.ParserException(
+            throw new Parser.Models.ValidationException(
                 $"type mismatch: cannot assign a {rhsClass} value to {lhsClass} signal \"{Result.Name}\"",
                 SourceLine, 0);
         }
@@ -1271,7 +1271,7 @@ public class Operation : IOperation {
 
             if (rhsW is int w && lhsW != w)
             {
-                throw new Parser.Models.ParserException(
+                throw new Parser.Models.ValidationException(
                     $"width mismatch: {lhsW}-bit signal \"{Result.Name}\" assigned a {w}-bit value",
                     SourceLine, 0);
             }

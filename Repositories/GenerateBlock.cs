@@ -349,48 +349,7 @@ public class GenerateBlock : ISControl
         while (bodyStream.Current != null && iterations < maxIterations)
         {
             iterations++;
-
-            if (bodyStream.Current.Type == KEYWORDS)
-            {
-                switch (bodyStream.Current.Value.ToLower())
-                {
-                    case "process":
-                        Process process = new(iterationVariables, bodyStream);
-                        process.Syntetize();
-                        Tasks.Add(process);
-                        break;
-
-                    case "if":
-                        // Check if it's if-generate or regular if
-                        if (LooksLikeIfGenerate(bodyStream))
-                        {
-                            GenerateBlock nestedGen = new(iterationVariables, bodyStream);
-                            nestedGen.Syntetize();
-                            Tasks.Add(nestedGen);
-                        }
-                        else
-                        {
-                            IfStructure ifStruct = new(iterationVariables, bodyStream);
-                            ifStruct.Syntetize();
-                            Tasks.Add(ifStruct);
-                            ConsumeEndKeyword(bodyStream, "if");
-                        }
-                        break;
-
-                    default:
-                        bodyStream.MoveNext();
-                        break;
-                }
-            }
-            else if (bodyStream.Current.Type == IDENTIFIERS)
-            {
-                // Concurrent assignment
-                ParseConcurrentStatement(bodyStream, iterationVariables);
-            }
-            else
-            {
-                bodyStream.MoveNext();
-            }
+            DispatchBodyStatement(bodyStream, iterationVariables);
         }
     }
 
@@ -426,6 +385,29 @@ public class GenerateBlock : ISControl
     }
 
     /// <summary>
+    /// Detects a labeled statement (<c>identifier : …</c>) at the current position
+    /// without consuming it, returning the (lower-cased) keyword that follows the
+    /// colon — e.g. <c>process</c>, <c>if</c>, <c>for</c> — or "" for a labeled
+    /// assignment/instantiation.
+    /// </summary>
+    private static bool IsLabeledStatement(TokenStream stream, out string keyword)
+    {
+        keyword = string.Empty;
+        if (stream.Current?.Type != IDENTIFIERS) return false;
+
+        stream.SetRollBack();
+        stream.MoveNext(); // past the label
+        bool isLabel = stream.Current?.Value == ":";
+        if (isLabel)
+        {
+            stream.MoveNext(); // past ':'
+            keyword = stream.Current?.Value.ToLower() ?? string.Empty;
+        }
+        stream.RollBack();
+        return isLabel;
+    }
+
+    /// <summary>
     /// Parses a concurrent statement.
     /// </summary>
     /// <param name="stream">The token stream to parse from.</param>
@@ -435,11 +417,45 @@ public class GenerateBlock : ISControl
         // Phase B+ Deep AST (follow-up): capture the LHS line before the
         // streamer walks through the statement.
         int assignLine = stream.Current?.Line ?? 0;
+        var first = stream.Current;
 
         var rawDataBuilder = new StringBuilder();
+        // C11 (v1.24.0) state, mirroring the architecture path. This loop starts AT
+        // the target, so the statement's OWN first '<=' is the assignment operator
+        // and is exempted; only a LATER stray operator signals a missing ';'.
+        int genParenDepth = 0;
+        bool genInCondition = false;
+        bool genSeenAssignOp = false;
+        // A depth-0 ':' (not ':=') means this statement is a DECLARATION
+        // (`name : type [:= init]`) or a labeled assignment/instantiation, not a
+        // plain concurrent assignment — suppress stray-operator detection then, so a
+        // declaration's `:=` init is never mistaken for a missing ';'.
+        bool genSawColon = false;
+        Token? genPrev = null, genPrevPrev = null;
         while (stream.Current?.Value != ";")
         {
-            rawDataBuilder.Append(stream.Current?.Value + " ");
+            if (stream.Current == null)
+                throw new ValidationException(
+                    $"Unexpected end of input in concurrent assignment for '{first?.Value}' — missing ';'?",
+                    stream.Previous);
+
+            var curTok = stream.Current;
+            var cur = curTok.Value;
+            if (cur == "(") genParenDepth++;
+            else if (cur == ")") genParenDepth--;
+            else if (genParenDepth == 0 && cur == ":") genSawColon = true;
+            else if (genParenDepth == 0 && cur.Equals("when", StringComparison.OrdinalIgnoreCase)) genInCondition = true;
+            else if (genParenDepth == 0 && cur.Equals("else", StringComparison.OrdinalIgnoreCase)) genInCondition = false;
+            else if (genParenDepth == 0 && !genSeenAssignOp && cur == "<=") genSeenAssignOp = true;
+            else if (!genSawColon && ConcurrentAssignmentTermination.IsStrayAssignmentOperator(
+                         curTok, genParenDepth, genInCondition, genPrev, genPrevPrev))
+                throw new ValidationException(
+                    $"';' expected to terminate the assignment to '{first?.Value}' (found '{cur}' — missing ';'?)",
+                    curTok);
+
+            rawDataBuilder.Append(cur + " ");
+            genPrevPrev = genPrev;
+            genPrev = curTok;
             stream.MoveNext();
         }
         stream.MoveNext(); // consume ';'
@@ -454,7 +470,7 @@ public class GenerateBlock : ISControl
             // Check for conditional assignment
             if (operation.Contains("when", StringComparison.OrdinalIgnoreCase))
             {
-                var condAssign = ConditionalAssignment.TryParse(operation, variables);
+                var condAssign = ConditionalAssignment.TryParse(operation, variables, assignLine);
                 if (condAssign != null)
                 {
                     Tasks.Add(condAssign);
@@ -462,7 +478,13 @@ public class GenerateBlock : ISControl
                 }
             }
 
-            Operation op = new(operation, variables, sourceLine: assignLine);
+            // v1.24.0: gate as an assignment statement so C8/C4/C5 apply to
+            // generate-block assignments too — but ONLY for a genuine concurrent
+            // assignment. A statement carrying a depth-0 ':' is a declaration
+            // (`name : type := init`) or a labeled form that merely reached here;
+            // gating it would mis-fire C4/C5 on its type/init, so leave it ungated
+            // (its pre-existing behaviour).
+            Operation op = new(operation, variables, sourceLine: assignLine, isAssignmentStatement: !genSawColon);
             Tasks.Add(op);
         }
     }
@@ -581,30 +603,113 @@ public class GenerateBlock : ISControl
         while (stream.Current != null && iterations < maxIterations)
         {
             iterations++;
+            DispatchBodyStatement(stream, variables);
+        }
+    }
 
-            if (stream.Current.Type == KEYWORDS)
+    /// <summary>
+    /// Dispatches one statement of a generate body (shared by the for-generate
+    /// unroller and the if-generate body parser). Routes nested processes, nested
+    /// generates and if-statements — including the common LABELED forms
+    /// (<c>label : process</c>, <c>label : if…generate</c>, <c>label : for…generate</c>)
+    /// — to their proper handlers, so they are not mis-read as concurrent
+    /// assignments. Everything else is parsed as a concurrent (possibly labeled)
+    /// assignment, where the C11/C8/C4/C5 validation runs.
+    /// </summary>
+    private void DispatchBodyStatement(TokenStream stream, HashSet<Variable> variables)
+    {
+        if (stream.Current == null) return;
+
+        if (stream.Current.Type == KEYWORDS)
+        {
+            switch (stream.Current.Value.ToLower())
             {
-                switch (stream.Current.Value.ToLower())
+                case "process":
+                {
+                    Process process = new(variables, stream);
+                    process.Syntetize();
+                    Tasks.Add(process);
+                    break;
+                }
+                case "if":
+                    DispatchIfOrIfGenerate(stream, variables);
+                    break;
+                case "for":
+                {
+                    GenerateBlock forGen = new(variables, stream);
+                    forGen.Syntetize();
+                    Tasks.Add(forGen);
+                    break;
+                }
+                default:
+                    stream.MoveNext();
+                    break;
+            }
+        }
+        else if (stream.Current.Type == IDENTIFIERS)
+        {
+            // A LABELED nested statement (`label : process | if…generate |
+            // for…generate`) starts with an identifier; route it to the proper
+            // handler so it is not mis-read as a concurrent assignment. VHDL requires
+            // labels on generate statements, so nested generates always land here.
+            // Note: `name : type [:= init]` declarations and `label : y <= …`
+            // assignments are NOT special-cased — they fall through to
+            // ParseConcurrentStatement, whose leading-':' guard handles them.
+            if (IsLabeledStatement(stream, out string stmtKeyword)
+                && (stmtKeyword is "process" or "if" or "for"))
+            {
+                stream.MoveNext(); // consume label
+                stream.MoveNext(); // consume ':'
+                switch (stmtKeyword)
                 {
                     case "process":
-                        Process process = new(variables, stream);
-                        process.Syntetize();
-                        Tasks.Add(process);
+                    {
+                        Process labeledProc = new(variables, stream);
+                        labeledProc.Syntetize();
+                        Tasks.Add(labeledProc);
                         break;
-
-                    default:
-                        stream.MoveNext();
+                    }
+                    case "for":
+                    {
+                        GenerateBlock labeledFor = new(variables, stream);
+                        labeledFor.Syntetize();
+                        Tasks.Add(labeledFor);
+                        break;
+                    }
+                    case "if":
+                        DispatchIfOrIfGenerate(stream, variables);
                         break;
                 }
             }
-            else if (stream.Current.Type == IDENTIFIERS)
+            else
             {
                 ParseConcurrentStatement(stream, variables);
             }
-            else
-            {
-                stream.MoveNext();
-            }
+        }
+        else
+        {
+            stream.MoveNext();
+        }
+    }
+
+    /// <summary>
+    /// Dispatches an <c>if</c> at the current position as either a nested
+    /// if-generate or a regular if-statement.
+    /// </summary>
+    private void DispatchIfOrIfGenerate(TokenStream stream, HashSet<Variable> variables)
+    {
+        if (LooksLikeIfGenerate(stream))
+        {
+            GenerateBlock nestedGen = new(variables, stream);
+            nestedGen.Syntetize();
+            Tasks.Add(nestedGen);
+        }
+        else
+        {
+            IfStructure ifStruct = new(variables, stream);
+            ifStruct.Syntetize();
+            Tasks.Add(ifStruct);
+            ConsumeEndKeyword(stream, "if");
         }
     }
 
