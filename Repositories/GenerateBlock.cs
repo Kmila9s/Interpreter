@@ -431,7 +431,7 @@ public class GenerateBlock : ISControl
         // plain concurrent assignment — suppress stray-operator detection then, so a
         // declaration's `:=` init is never mistaken for a missing ';'.
         bool genSawColon = false;
-        Token? genPrev = null, genPrevPrev = null;
+        var genTokens = new List<Token>();
         while (stream.Current?.Value != ";")
         {
             if (stream.Current == null)
@@ -448,14 +448,13 @@ public class GenerateBlock : ISControl
             else if (genParenDepth == 0 && cur.Equals("else", StringComparison.OrdinalIgnoreCase)) genInCondition = false;
             else if (genParenDepth == 0 && !genSeenAssignOp && cur == "<=") genSeenAssignOp = true;
             else if (!genSawColon && ConcurrentAssignmentTermination.IsStrayAssignmentOperator(
-                         curTok, genParenDepth, genInCondition, genPrev, genPrevPrev))
+                         curTok, genParenDepth, genInCondition, genTokens))
                 throw new ValidationException(
                     $"';' expected to terminate the assignment to '{first?.Value}' (found '{cur}' — missing ';'?)",
                     curTok);
 
             rawDataBuilder.Append(cur + " ");
-            genPrevPrev = genPrev;
-            genPrev = curTok;
+            genTokens.Add(curTok);
             stream.MoveNext();
         }
         stream.MoveNext(); // consume ';'

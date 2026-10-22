@@ -37,10 +37,9 @@ internal static class ConcurrentAssignmentTermination
     /// <param name="parenDepth">Current parenthesis nesting (0 = top level).</param>
     /// <param name="inCondition">True while inside a when…else CONDITION, where a
     /// '&lt;=' is a relational comparison rather than an assignment operator.</param>
-    /// <param name="prev">The token immediately before <paramref name="cur"/>, or null.</param>
-    /// <param name="prevPrev">The token two before <paramref name="cur"/>, or null.</param>
+    /// <param name="history">The RHS tokens emitted BEFORE <paramref name="cur"/>, in order.</param>
     public static bool IsStrayAssignmentOperator(
-        Token cur, int parenDepth, bool inCondition, Token? prev, Token? prevPrev)
+        Token cur, int parenDepth, bool inCondition, IReadOnlyList<Token> history)
     {
         if (parenDepth != 0) return false;
         var val = cur.Value;
@@ -56,29 +55,57 @@ internal static class ConcurrentAssignmentTermination
 
         // Inside a when…else CONDITION, a '<=' is normally a relational
         // comparison. It is the next statement ONLY when it reads as
-        // `<operand> <target-identifier> <=` — two operands with no operator
-        // between them, which is never valid in a boolean condition. Everything
-        // below is a guard to keep false positives at zero.
-        if (prev is null || prevPrev is null) return false;
+        // `<operand> <target> <=` — two operands with no operator between them,
+        // which is never valid in a boolean condition. The target may be a plain
+        // identifier (`z <=`) or an indexed/sliced name (`z(0) <=`, whose last
+        // token is ')').
+        if (history is null || history.Count == 0) return false;
 
-        // (1) The target candidate must be a plain identifier. This already
-        // excludes time units (TIME_VARIABLES), attributes (VECTORS_ATTRIBUTES),
-        // ')', literals and operators by type; also exclude operator keywords
-        // that leak in as IDENTIFIERS (mod).
-        if (prev.Type != IDENTIFIERS) return false;
-        if (OperatorKeywords.Contains(prev.Value)) return false;
+        Token last = history[^1];
+        Token? target;
+        int precedingIdx;
 
-        // (2) The token before the target must END an operand (identifier,
-        // literal, qualified name, or a closing ')'), and must not be an operator
-        // keyword — so a comparison like `a and cnt <= max` (prevPrev = `and`,
-        // KEYWORDS) is never flagged.
-        bool prevPrevIsOperand =
-            prevPrev.Type == IDENTIFIERS ||
-            prevPrev.Type == LITERALS ||
-            prevPrev.Type == QUALIFIED_IDENTIFIERS ||
-            prevPrev.Value == ")";
-        if (!prevPrevIsOperand) return false;
-        if (OperatorKeywords.Contains(prevPrev.Value)) return false;
+        if (last.Type == IDENTIFIERS)
+        {
+            target = last;
+            precedingIdx = history.Count - 2;
+        }
+        else if (last.Value == ")")
+        {
+            // Walk back to the matching '(' then the identifier before it (the base
+            // target name), so an indexed/sliced next-target `z(0) <=` is seen.
+            int depth = 0, i = history.Count - 1;
+            for (; i >= 0; i--)
+            {
+                if (history[i].Value == ")") depth++;
+                else if (history[i].Value == "(") { depth--; if (depth == 0) break; }
+            }
+            if (i - 1 < 0 || history[i - 1].Type != IDENTIFIERS) return false;
+            target = history[i - 1];
+            precedingIdx = i - 2;
+        }
+        else
+        {
+            return false;
+        }
+
+        // Target must be a plain identifier that isn't an operator keyword leaking
+        // in as IDENTIFIERS (mod). Time units / attributes are other types already.
+        if (OperatorKeywords.Contains(target.Value)) return false;
+
+        // The token before the target must END an operand (identifier, literal,
+        // qualified name, or a closing ')'), and not be an operator keyword — so a
+        // comparison like `a and cnt <= max` (preceding = `and`, KEYWORDS) and the
+        // condition's first operand (preceding = `when`) are never flagged.
+        if (precedingIdx < 0) return false;
+        Token preceding = history[precedingIdx];
+        bool precedingIsOperand =
+            preceding.Type == IDENTIFIERS ||
+            preceding.Type == LITERALS ||
+            preceding.Type == QUALIFIED_IDENTIFIERS ||
+            preceding.Value == ")";
+        if (!precedingIsOperand) return false;
+        if (OperatorKeywords.Contains(preceding.Value)) return false;
 
         return true;
     }
