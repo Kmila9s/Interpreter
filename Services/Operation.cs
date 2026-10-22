@@ -1197,84 +1197,99 @@ public class Operation : IOperation {
         var lhsType = Result.Type;
         if (lhsType == Constants.DATATYPES.UNKNOWN) return;
 
-        // RHS must be a single atom (one Variable; no operators / deferred items).
-        if (Items.Length != 1 || Items[0] is not Variable rhs) return;
-        if (rhs.IsStub || rhs.Type == Constants.DATATYPES.UNKNOWN) return;
-        string rhsVal = rhs.Value?.ToString() ?? string.Empty;
-        if (rhsVal.StartsWith("(others", StringComparison.OrdinalIgnoreCase)) return; // aggregate → width = LHS by construction
-
         static bool IsScalar(Constants.DATATYPES t) =>
             t == Constants.DATATYPES.STD_LOGIC || t == Constants.DATATYPES.BIT;
         static bool IsVector(Constants.DATATYPES t) =>
             t == Constants.DATATYPES.STD_LOGIC_VECTOR;
 
         bool lhsScalar = IsScalar(lhsType), lhsVector = IsVector(lhsType);
-        bool rhsScalar = IsScalar(rhs.Type), rhsVector = IsVector(rhs.Type);
+        // Only std_logic / std_logic_vector targets are checked; INTEGER/NATURAL/
+        // BOOLEAN etc. coerce legitimately and are left alone.
+        if (!(lhsScalar || lhsVector)) return;
 
-        // A SINGLE-quoted character literal ('0','1','X','W','L','H','Z','U','-')
-        // is ALWAYS a scalar std_logic value. Kmila's datatype finder mislabels
-        // 'X'/'W'/'L'/'H' as a vector, which would false-reject a perfectly legal
-        // `y <= 'X'` (and, via with…select/when…else, `… 'X' when others`). Detect
-        // it from the RAW source RHS (the parsed literal's stored Value may be
-        // expanded to a padded string, so it isn't reliable here). A DOUBLE-quoted
-        // `"0"` is a 1-bit vector and is deliberately NOT matched (quote char is
-        // the discriminator).
-        if (rhs.Name.StartsWith("Literal-", StringComparison.Ordinal))
+        // The raw source RHS (after the assignment operator). The engine re-joins
+        // tokens with spaces, e.g. `a ( 22 downto 0 )`. Shared by the single-atom
+        // char-literal reclassification and the expression-width path below.
+        int opIdx = _rawData.IndexOf("<=", StringComparison.Ordinal);
+        if (opIdx < 0) opIdx = _rawData.IndexOf(":=", StringComparison.Ordinal);
+        string rawRhs = opIdx >= 0 ? _rawData[(opIdx + 2)..].Trim() : string.Empty;
+
+        // ---- Single-atom RHS (one Variable; existing behaviour, unchanged) ----
+        if (Items.Length == 1 && Items[0] is Variable rhs)
         {
-            int opIdx = _rawData.IndexOf("<=", StringComparison.Ordinal);
-            if (opIdx < 0) opIdx = _rawData.IndexOf(":=", StringComparison.Ordinal);
-            string rawRhs = opIdx >= 0 ? _rawData[(opIdx + 2)..].Trim() : string.Empty;
-            if (rawRhs.Length == 3 && rawRhs[0] == '\'' && rawRhs[^1] == '\'')
+            if (rhs.IsStub || rhs.Type == Constants.DATATYPES.UNKNOWN) return;
+            string rhsVal = rhs.Value?.ToString() ?? string.Empty;
+            if (rhsVal.StartsWith("(others", StringComparison.OrdinalIgnoreCase)) return; // aggregate → width = LHS by construction
+
+            bool rhsScalar = IsScalar(rhs.Type), rhsVector = IsVector(rhs.Type);
+
+            // A SINGLE-quoted character literal ('0','1','X','W','L','H','Z','U','-')
+            // is ALWAYS a scalar std_logic value. Kmila's datatype finder mislabels
+            // 'X'/'W'/'L'/'H' as a vector, which would false-reject a legal `y <= 'X'`.
+            // A DOUBLE-quoted `"0"` is a 1-bit vector and is deliberately NOT matched.
+            if (rhs.Name.StartsWith("Literal-", StringComparison.Ordinal)
+                && rawRhs.Length == 3 && rawRhs[0] == '\'' && rawRhs[^1] == '\'')
             {
                 rhsScalar = true;
                 rhsVector = false;
             }
-        }
 
-        // Only compare within the std_logic / std_logic_vector family. INTEGER,
-        // NATURAL, BOOLEAN etc. coerce legitimately (to_integer/to_unsigned/…),
-        // so they are left alone.
-        if (!(lhsScalar || lhsVector) || !(rhsScalar || rhsVector)) return;
+            if (!(rhsScalar || rhsVector)) return;
 
-        // C4 — scalar vs vector type mismatch.
-        if ((lhsScalar && rhsVector) || (lhsVector && rhsScalar))
-        {
-            string lhsClass = lhsScalar ? "std_logic" : "std_logic_vector";
-            string rhsClass = rhsScalar ? "std_logic" : "std_logic_vector";
-            throw new Parser.Models.ValidationException(
-                $"type mismatch: cannot assign a {rhsClass} value to {lhsClass} signal \"{Result.Name}\"",
-                SourceLine, 0);
-        }
-
-        // C5 — width mismatch between two vectors. Only act on RELIABLE widths:
-        // Kmila defaults an unresolved generic/expression range (e.g.
-        // `std_logic_vector(WIDTH-1 downto 0)`) to Size 8, which would otherwise
-        // false-reject valid designs. A width is trusted only when it comes from
-        // a declared literal range (HasDeclaredRange) for a signal, or from a
-        // pure-binary literal's length. Hex/other literals and generic-sized
-        // signals are skipped.
-        if (lhsVector && rhsVector && Result.HasDeclaredRange && Result.Size > 0)
-        {
-            int lhsW = Result.Size;
-            int? rhsW = null;
-            if (rhs.Name.StartsWith("Literal-", StringComparison.Ordinal))
+            // C4 — scalar vs vector type mismatch.
+            if ((lhsScalar && rhsVector) || (lhsVector && rhsScalar))
             {
-                string bits = rhsVal.Replace("\"", string.Empty).Replace("'", string.Empty);
-                if (bits.Length > 0 &&
-                    bits.All(c => "01UXZWLH-".IndexOf(char.ToUpperInvariant(c)) >= 0))
-                    rhsW = bits.Length; // reliable: a binary/metavalue bit string
-            }
-            else if (rhs.HasDeclaredRange && rhs.Size > 0)
-            {
-                rhsW = rhs.Size; // reliable: a signal with a declared literal range
-            }
-
-            if (rhsW is int w && lhsW != w)
-            {
+                string lhsClass = lhsScalar ? "std_logic" : "std_logic_vector";
+                string rhsClass = rhsScalar ? "std_logic" : "std_logic_vector";
                 throw new Parser.Models.ValidationException(
-                    $"width mismatch: {lhsW}-bit signal \"{Result.Name}\" assigned a {w}-bit value",
+                    $"type mismatch: cannot assign a {rhsClass} value to {lhsClass} signal \"{Result.Name}\"",
                     SourceLine, 0);
             }
+
+            // C5 — width mismatch. Only on RELIABLE widths (HasDeclaredRange LHS,
+            // and a pure-binary literal or declared-range signal RHS).
+            if (lhsVector && rhsVector && Result.HasDeclaredRange && Result.Size > 0)
+            {
+                int lhsW = Result.Size;
+                int? rhsW = null;
+                if (rhs.Name.StartsWith("Literal-", StringComparison.Ordinal))
+                {
+                    string bits = rhsVal.Replace("\"", string.Empty).Replace("'", string.Empty);
+                    if (bits.Length > 0 &&
+                        bits.All(c => "01UXZWLH-".IndexOf(char.ToUpperInvariant(c)) >= 0))
+                        rhsW = bits.Length;
+                }
+                else if (rhs.HasDeclaredRange && rhs.Size > 0)
+                {
+                    rhsW = rhs.Size;
+                }
+
+                if (rhsW is int w && lhsW != w)
+                    throw new Parser.Models.ValidationException(
+                        $"width mismatch: {lhsW}-bit signal \"{Result.Name}\" assigned a {w}-bit value",
+                        SourceLine, 0);
+            }
+            return;
+        }
+
+        // ---- Expression RHS (v1.26.0): conservative certain-width inference ----
+        // Everything here is purely additive; it only fires when the width/type is
+        // provably certain, so it never false-rejects an expression Kmila can't size.
+
+        // C4 — a concatenation is always an array, so it is illegal into a scalar target.
+        if (lhsScalar && ExpressionWidthInference.HasTopLevelConcat(rawRhs))
+            throw new Parser.Models.ValidationException(
+                $"type mismatch: cannot assign a std_logic_vector value to std_logic signal \"{Result.Name}\"",
+                SourceLine, 0);
+
+        // C5 — compare a fully-certain RHS width against a RELIABLE LHS width.
+        if (lhsVector && Result.HasDeclaredRange && Result.Size > 0)
+        {
+            int? exprW = ExpressionWidthInference.TryComputeWidth(rawRhs, Variables);
+            if (exprW is int ew && ew != Result.Size)
+                throw new Parser.Models.ValidationException(
+                    $"width mismatch: {Result.Size}-bit signal \"{Result.Name}\" assigned a {ew}-bit value",
+                    SourceLine, 0);
         }
     }
 
