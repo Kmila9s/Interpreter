@@ -754,7 +754,11 @@ public class VariableSyntetizer : ISControl
                 // Store custom type name reference for debugging/analysis
                 if (customTypeDef != null)
                 {
-                    // We could add a CustomTypeName property to Variable if needed
+                    // Record the enum type name (precise-C10). Kept separate from
+                    // CustomTypeName so the case numeric/exhaustiveness gates that
+                    // key on CustomTypeName are unaffected.
+                    if (customTypeDef.Kind == TypeKind.Enumeration)
+                        newVar.EnumTypeName = customTypeDef.Name;
 #if DEBUG
                     Console.WriteLine($"[VariableSyntetizer] Created '{newVar.Name}' with custom type '{customTypeDef.Name}', Size={newVar.Size}");
 #endif
