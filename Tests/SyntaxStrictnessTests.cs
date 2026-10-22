@@ -53,6 +53,9 @@ public static class SyntaxStrictnessTests
             ("C11 in a for-generate body rejected",              Test_Gen_MissingSemicolon),
             ("C8 in a generate body (assign input port) rejected", Test_Gen_AssignInputPort),
             ("C11 on a with…select in a generate rejected",      Test_Gen_WithSelectMissingSemicolon),
+            ("C5 concatenation width mismatch rejected",         Test_Width_ConcatMismatch),
+            ("C4 concatenation into a scalar rejected",          Test_Width_ConcatIntoScalar),
+            ("C5 literal-slice width mismatch rejected",         Test_Width_SliceMismatch),
             ("C8 via when…else: assign to input port rejected", Test_AssignToInputPort_WhenElse),
             ("C8 via with…select: assign to input port rejected", Test_AssignToInputPort_WithSelect),
             ("C4 via when…else: scalar <= vector rejected",     Test_TypeMismatch_WhenElse),
@@ -78,6 +81,9 @@ public static class SyntaxStrictnessTests
             ("condition indexed operand before '<=' still parses", Test_GuardedIndexOperandParses),
             ("valid nested generate (decls + begin) still parses", Test_Gen_NestedValidParses),
             ("valid with…select in a generate still parses",      Test_Gen_WithSelectValidParses),
+            ("matching-width concatenation still parses",        Test_Width_ConcatMatchParses),
+            ("concat with a non-literal slice still parses",     Test_Width_NonLiteralSliceParses),
+            ("arithmetic / conversion RHS not width-checked",    Test_Width_ArithConversionParses),
         };
 
         foreach (var (name, run) in tests)
@@ -675,6 +681,79 @@ public static class SyntaxStrictnessTests
         "            q(0) <= d(0);",
         "        end generate g_in;",
         "    end generate g_out;",
+        "end architecture rtl;",
+    });
+
+    // --- eval-time width model: C4/C5 on expression RHS (certain-width inference) ---
+
+    private static readonly string[] EntW =
+    {
+        "entity dutw is",
+        "    generic (W : integer := 16);",
+        "    port (a4 : in std_logic_vector(3 downto 0);",
+        "          b2 : in std_logic_vector(1 downto 0);",
+        "          a24 : in std_logic_vector(23 downto 0);",
+        "          gw : in std_logic_vector(W-1 downto 0);",
+        "          y6 : out std_logic_vector(5 downto 0);",
+        "          y8 : out std_logic_vector(7 downto 0);",
+        "          ygw : out std_logic_vector(W-1 downto 0);",
+        "          ys : out std_logic);",
+        "end entity dutw;",
+    };
+
+    // Reject: a concatenation whose summed width differs from the target (6 ≠ 8).
+    private static bool Test_Width_ConcatMismatch() => ExpectThrows(EntW, new[]
+    {
+        "architecture rtl of dutw is",
+        "begin",
+        "    y8 <= a4 & b2;",            // ERROR: 6-bit value into an 8-bit signal
+        "end architecture rtl;",
+    });
+
+    // Reject: a concatenation (always an array) assigned to a scalar target.
+    private static bool Test_Width_ConcatIntoScalar() => ExpectThrows(EntW, new[]
+    {
+        "architecture rtl of dutw is",
+        "begin",
+        "    ys <= a4 & b2;",            // ERROR: std_logic_vector into std_logic
+        "end architecture rtl;",
+    });
+
+    // Reject: a literal-bounded slice whose width differs from the target (6 ≠ 8).
+    private static bool Test_Width_SliceMismatch() => ExpectThrows(EntW, new[]
+    {
+        "architecture rtl of dutw is",
+        "begin",
+        "    y8 <= a24(5 downto 0);",    // ERROR: 6-bit slice into an 8-bit signal
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a matching-width concatenation must parse (4 + 2 = 6).
+    private static bool Test_Width_ConcatMatchParses() => ExpectParses(EntW, new[]
+    {
+        "architecture rtl of dutw is",
+        "begin",
+        "    y6 <= a4 & b2;",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a concat containing a NON-literal slice has unknown width →
+    // must be skipped (not width-checked).
+    private static bool Test_Width_NonLiteralSliceParses() => ExpectParses(EntW, new[]
+    {
+        "architecture rtl of dutw is",
+        "begin",
+        "    ygw <= gw(W-3 downto 0) & \"00\";",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: arithmetic / conversion RHS has unknown vector width → skipped.
+    private static bool Test_Width_ArithConversionParses() => ExpectParses(EntW, new[]
+    {
+        "architecture rtl of dutw is",
+        "    signal t8 : std_logic_vector(7 downto 0);",
+        "begin",
+        "    y8 <= std_logic_vector(unsigned(t8) + 1);",
         "end architecture rtl;",
     });
 
