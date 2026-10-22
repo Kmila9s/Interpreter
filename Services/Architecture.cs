@@ -313,6 +313,11 @@ public class Architecture : ISControl, IControl
     /// <param name="cancellationToken">Cancellation token.</param>
     public void SyntetizeBehaviour(CancellationToken cancellationToken)
     {
+        // precise-C10: publish THIS architecture's enum types (cleared + reloaded)
+        // so CaseStructure can resolve a selector's enum type and its literals.
+        // Done per architecture to avoid cross-architecture type-name leakage.
+        EnumTypeRegistry.Instance.LoadFrom(CustomTypes);
+
         // v0.13.0 Fix: Move comparators list outside the loop to prevent repeated allocation
         // Previously created a new List<Variable> on every iteration, causing memory pressure
         HashSet<Variable> comparators = [.. _ports, .. _generics, .. _signals];

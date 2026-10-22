@@ -502,6 +502,17 @@ public class CaseStructure : ISControl
            || PackageRegistry.Instance.ContainsConstant(name);
 
     /// <summary>
+    /// True when an in-scope variable/constant named <paramref name="name"/> is
+    /// itself of enum type <paramref name="enumType"/> — i.e. a legal value of the
+    /// selector's type (e.g. `constant INIT : state_t`), so precise-C10 must not
+    /// mistake it for a cross-enum literal that merely shares the name.
+    /// </summary>
+    private bool IsValueOfEnumType(string name, string enumType)
+        => _variables.Any(v =>
+               v.Name.Equals(name, StringComparison.OrdinalIgnoreCase) &&
+               string.Equals(v.EnumTypeName, enumType, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
     /// Synthesizes a single 'when' branch.
     /// </summary>
     private void SyntetizeWhenBranch()
@@ -544,6 +555,24 @@ public class CaseStructure : ISControl
             }
             else if (!string.IsNullOrWhiteSpace(currentValue))
             {
+                // precise-C10: on an ENUM selector of a known type T, a choice that
+                // is an enumeration literal of a DIFFERENT enum is illegal
+                // (GHDL: `'X' is not a literal of type 'T'`). Fires ONLY when T's
+                // literals are known, the choice is NOT one of them, and the choice
+                // is definitively a literal of some other enum — so a valid literal
+                // (incl. a literal colliding with a same-named signal) never trips
+                // it; everything else defers to C1 below. Literals come from the
+                // enum TYPE (EnumTypeRegistry), never from enum-literal Variables,
+                // so the case-insensitive literal/signal collision can't hide one.
+                if (_streamer.Current?.Type == IDENTIFIERS
+                    && _selector?.EnumTypeName is string enumT
+                    && EnumTypeRegistry.Instance.Literals(enumT) is { } selectorLits
+                    && !selectorLits.Any(l => l.Equals(currentValue, StringComparison.OrdinalIgnoreCase))
+                    && !IsValueOfEnumType(currentValue, enumT)
+                    && EnumTypeRegistry.Instance.IsAnyEnumLiteral(currentValue))
+                    throw new ValidationException(
+                        $"'{currentValue}' is not a literal of type '{enumT}'", _streamer.Current);
+
                 // C1 (undeclared case choice): on a numeric/vector selector a
                 // choice written as an identifier must name a declared or package
                 // constant — there are no enum literals to match. An unknown name

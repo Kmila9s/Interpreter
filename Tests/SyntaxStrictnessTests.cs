@@ -37,6 +37,9 @@ public static class SyntaxStrictnessTests
             ("C7: duplicate case choice is rejected",           Test_DuplicateCaseChoice),
             ("C6: non-exhaustive std_logic_vector case rejected", Test_NonExhaustiveCase),
             ("C10: enum choice not in the type is rejected",    Test_EnumChoiceNotInType),
+            ("precise-C10: cross-enum literal rejected",        Test_C10_CrossEnum),
+            ("precise-C10: cross-enum in a '|' alt rejected",   Test_C10_CrossEnumAlt),
+            ("precise-C10: same-enum '|' alts still parse",     Test_C10_SameEnumParses),
             ("C2: undeclared RHS signal is rejected",           Test_UndeclaredRhsSignal),
             ("C3: undeclared assignment target is rejected",    Test_UndeclaredLhsTarget),
             ("C9: undefined function call is rejected",         Test_UndefinedFunctionCall),
@@ -799,6 +802,66 @@ public static class SyntaxStrictnessTests
         "architecture rtl of dutw is",
         "begin",
         "    ys <= '1' when a4(0) <= b2(0) else '0';",
+        "end architecture rtl;",
+    });
+
+    // --- precise-C10: type-precise cross-enum case validation ---
+
+    private static readonly string[] EntE =
+    {
+        "entity dute is",
+        "    port (clk : in std_logic; y : out std_logic);",
+        "end entity dute;",
+    };
+
+    // Reject: a choice that is a literal of a DIFFERENT enum than the selector.
+    private static bool Test_C10_CrossEnum() => ExpectThrows(EntE, new[]
+    {
+        "architecture rtl of dute is",
+        "    type t1 is (A, B);",
+        "    type t2 is (C, D);",
+        "    signal s : t1;",
+        "begin",
+        "    process(clk) begin",
+        "        case s is",
+        "            when A => y <= '0';",
+        "            when C => y <= '1';",      // ERROR: C is a t2 literal, not t1
+        "            when others => y <= '0';",
+        "        end case;",
+        "    end process;",
+        "end architecture rtl;",
+    });
+
+    // Reject: cross-enum literal inside a '|' alternative.
+    private static bool Test_C10_CrossEnumAlt() => ExpectThrows(EntE, new[]
+    {
+        "architecture rtl of dute is",
+        "    type t1 is (A, B);",
+        "    type t2 is (C, D);",
+        "    signal s : t1;",
+        "begin",
+        "    process(clk) begin",
+        "        case s is",
+        "            when A | C => y <= '0';",  // ERROR: C is a t2 literal
+        "            when others => y <= '1';",
+        "        end case;",
+        "    end process;",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: '|' alternatives that are all literals of the selector type.
+    private static bool Test_C10_SameEnumParses() => ExpectParses(EntE, new[]
+    {
+        "architecture rtl of dute is",
+        "    type t1 is (A, B, Cc, Dd);",
+        "    signal s : t1;",
+        "begin",
+        "    process(clk) begin",
+        "        case s is",
+        "            when A | B => y <= '0';",
+        "            when others => y <= '1';",
+        "        end case;",
+        "    end process;",
         "end architecture rtl;",
     });
 
