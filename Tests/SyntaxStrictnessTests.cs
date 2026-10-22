@@ -44,6 +44,9 @@ public static class SyntaxStrictnessTests
             ("C4: scalar <= vector type mismatch is rejected",  Test_TypeMismatchScalarVector),
             ("C5: literal width mismatch is rejected",          Test_WidthMismatchLiteral),
             ("C11: missing ';' on a signal assignment rejected",Test_MissingSemicolonConcurrent),
+            ("C11 via when…else: missing ';' rejected",         Test_MissingSemicolon_WhenElse),
+            ("C11 via with…select: missing ';' rejected",       Test_MissingSemicolon_WithSelect),
+            ("C11 via with…select: content after others rejected", Test_MissingSemicolon_WithSelectOthers),
             ("C8 via when…else: assign to input port rejected", Test_AssignToInputPort_WhenElse),
             ("C8 via with…select: assign to input port rejected", Test_AssignToInputPort_WithSelect),
             ("C4 via when…else: scalar <= vector rejected",     Test_TypeMismatch_WhenElse),
@@ -61,6 +64,8 @@ public static class SyntaxStrictnessTests
             ("Valid with…select assignment still parses",       Test_ValidWithSelectParses),
             ("Metavalue char literal 'X' is scalar, not vector", Test_MetavalueCharLiteralParses),
             ("with…select with 'X' when others still parses",   Test_WithSelectMetavalueOthersParses),
+            ("when…else with 'after' delay still parses",        Test_WhenElseAfterDelayParses),
+            ("with…select with 'after' delay still parses",      Test_WithSelectAfterDelayParses),
         };
 
         foreach (var (name, run) in tests)
@@ -316,6 +321,39 @@ public static class SyntaxStrictnessTests
         "end architecture rtl;",
     });
 
+    // C11 via when…else: a missing ';' on an else-terminated conditional runs the
+    // RHS past into the next statement; the depth-0 '<=' in the waveform context
+    // (not inside a condition) is detected.
+    private static bool Test_MissingSemicolon_WhenElse() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    y <= '1' when sel = \"00\" else '0'",   // ERROR: missing ';'
+        "    y <= a;",
+        "end architecture rtl;",
+    });
+
+    // C11 via with…select: a missing ';' leaks the next statement's '<=' into the
+    // choice list, which is never valid there.
+    private static bool Test_MissingSemicolon_WithSelect() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    with sel select y <= '1' when \"00\", '0' when \"01\"",   // ERROR: missing ';'
+        "    y <= a;",
+        "end architecture rtl;",
+    });
+
+    // C11 via with…select: nothing may follow an `others` choice except ';'.
+    private static bool Test_MissingSemicolon_WithSelectOthers() => ExpectThrows(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    with sel select y <= '1' when \"00\", '0' when others",   // ERROR: missing ';'
+        "    y <= a;",
+        "end architecture rtl;",
+    });
+
     // Positive guard: a conditional assignment whose condition uses '<=' as a
     // comparison must still parse — the missing-';' check must not flag it.
     private static bool Test_ConditionalComparisonParses() => ExpectParses(Ent2, new[]
@@ -447,6 +485,26 @@ public static class SyntaxStrictnessTests
         "architecture rtl of dut is",
         "begin",
         "    with sel select y <= '1' when \"00\", 'X' when others;",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a when…else waveform with an `after` delay must still parse —
+    // the C11 state machine must not mistake `after`/`ns` for a statement boundary.
+    private static bool Test_WhenElseAfterDelayParses() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    y <= '1' after 5 ns when sel = \"00\" else '0';",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a with…select waveform with an `after` delay must still parse
+    // (the shape used by real mux designs, e.g. bench 014-mux-sel).
+    private static bool Test_WithSelectAfterDelayParses() => ExpectParses(Ent2, new[]
+    {
+        "architecture rtl of dut is",
+        "begin",
+        "    with sel select y <= '1' after 5 ns when \"00\", '0' when others;",
         "end architecture rtl;",
     });
 
