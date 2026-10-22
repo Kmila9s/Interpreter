@@ -52,6 +52,7 @@ public static class SyntaxStrictnessTests
             ("C11 trailing-comparison then next stmt rejected",  Test_MissingSemicolon_TrailingCmp),
             ("C11 in a for-generate body rejected",              Test_Gen_MissingSemicolon),
             ("C8 in a generate body (assign input port) rejected", Test_Gen_AssignInputPort),
+            ("C11 on a with…select in a generate rejected",      Test_Gen_WithSelectMissingSemicolon),
             ("C8 via when…else: assign to input port rejected", Test_AssignToInputPort_WhenElse),
             ("C8 via with…select: assign to input port rejected", Test_AssignToInputPort_WithSelect),
             ("C4 via when…else: scalar <= vector rejected",     Test_TypeMismatch_WhenElse),
@@ -76,6 +77,7 @@ public static class SyntaxStrictnessTests
             ("condition 'mod' before '<=' still parses",         Test_GuardedModBeforeComparisonParses),
             ("condition indexed operand before '<=' still parses", Test_GuardedIndexOperandParses),
             ("valid nested generate (decls + begin) still parses", Test_Gen_NestedValidParses),
+            ("valid with…select in a generate still parses",      Test_Gen_WithSelectValidParses),
         };
 
         foreach (var (name, run) in tests)
@@ -630,6 +632,31 @@ public static class SyntaxStrictnessTests
         "begin",
         "    g : for i in 0 to 0 generate",
         "        clk <= '0';",           // ERROR: `clk` is mode `in`
+        "    end generate;",
+        "end architecture rtl;",
+    });
+
+    // Reject: a with…select inside a generate with a missing ';' (the form now
+    // dispatched to SelectedAssignment from generate bodies).
+    private static bool Test_Gen_WithSelectMissingSemicolon() => ExpectThrows(EntG, new[]
+    {
+        "architecture rtl of dutg is",
+        "begin",
+        "    g : for i in 0 to 0 generate",
+        "        with clk select q(0) <= d(0) when '0', d(1) when others",  // ERROR: missing ';'
+        "        q(1) <= d(1);",
+        "    end generate;",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a valid with…select inside a generate (indexed target with a
+    // loop variable) must still parse.
+    private static bool Test_Gen_WithSelectValidParses() => ExpectParses(EntG, new[]
+    {
+        "architecture rtl of dutg is",
+        "begin",
+        "    g : for i in 0 to 3 generate",
+        "        with clk select q(i) <= d(i) when '0', d(i) when others;",
         "    end generate;",
         "end architecture rtl;",
     });
