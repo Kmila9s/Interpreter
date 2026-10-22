@@ -395,6 +395,10 @@ public class Architecture : ISControl, IControl
                                     forGen.Syntetize();
                                     Tasks.Add(forGen);
                                 }
+                                // A genuine validation rejection (missing ';', assign to an
+                                // input port, type/width mismatch) must surface; only a
+                                // synthesis-complexity failure is blackboxed.
+                                catch (ValidationException) { throw; }
                                 catch
                                 {
                                     SkipGenerateBody(label);
@@ -408,6 +412,9 @@ public class Architecture : ISControl, IControl
                                     ifGen.Syntetize();
                                     Tasks.Add(ifGen);
                                 }
+                                // A genuine validation rejection must surface; only a
+                                // synthesis-complexity failure is blackboxed.
+                                catch (ValidationException) { throw; }
                                 catch
                                 {
                                     SkipGenerateBody(label);
@@ -1192,6 +1199,8 @@ public class Architecture : ISControl, IControl
         // must NOT be read as a missing-';' signal. Nested conditional expressions are
         // parenthesised (depth > 0), so they never toggle this.
         bool rhsInCondition = false;
+        // Rolling two-token history for the C11 stray-operator detector.
+        Parser.Models.Token? rhsPrev = null, rhsPrevPrev = null;
         while (_streamer.Current?.Value != ";")
         {
             if (_streamer.Current == null)
@@ -1206,27 +1215,26 @@ public class Architecture : ISControl, IControl
                     $"Unexpected token '{_streamer.Current.Value}' inside concurrent statement — not a valid VHDL identifier, keyword, operator, or literal",
                     _streamer.Current);
 
-            var cur = _streamer.Current.Value;
+            var curTok = _streamer.Current;
+            var cur = curTok.Value;
             if (cur == "(") rhsParenDepth++;
             else if (cur == ")") rhsParenDepth--;
             else if (rhsParenDepth == 0 && cur.Equals("when", StringComparison.OrdinalIgnoreCase)) rhsInCondition = true;
             else if (rhsParenDepth == 0 && cur.Equals("else", StringComparison.OrdinalIgnoreCase)) rhsInCondition = false;
-            // C11 (v1.21.0, extended v1.23.0): a stray assignment operator at
-            // paren-depth 0 means the RHS ran past a missing ';' into the next
-            // statement. ':=' is never valid in a concurrent RHS expression, so a
-            // depth-0 ':=' is always the next statement. A depth-0 '<=' is the next
-            // statement UNLESS we are inside a when…else CONDITION, where '<=' is a
-            // relational comparison (so it is allowed there).
-            else if (rhsParenDepth == 0 && cur == ":=")
-                throw new ParserException(
-                    $"';' expected to terminate the assignment to '{first.Value}' (found ':=' — missing ';'?)",
-                    _streamer.Current);
-            else if (rhsParenDepth == 0 && !rhsInCondition && cur == "<=")
-                throw new ParserException(
-                    $"';' expected to terminate the assignment to '{first.Value}' (found '<=' — missing ';'?)",
-                    _streamer.Current);
+            // C11 (v1.21.0, extended v1.23.0/v1.24.0): a stray assignment operator
+            // at paren-depth 0 means the RHS ran past a missing ';' into the next
+            // statement. The shared detector handles ':=' (always), a '<=' in a
+            // waveform context, and — guarded — a '<=' that starts a new statement
+            // inside a trailing when…else condition (operand-before-target).
+            else if (ConcurrentAssignmentTermination.IsStrayAssignmentOperator(
+                         curTok, rhsParenDepth, rhsInCondition, rhsPrev, rhsPrevPrev))
+                throw new ValidationException(
+                    $"';' expected to terminate the assignment to '{first.Value}' (found '{cur}' — missing ';'?)",
+                    curTok);
 
             rhsBuilder.Append(cur).Append(' ');
+            rhsPrevPrev = rhsPrev;
+            rhsPrev = curTok;
             _streamer.MoveNext();
         }
         string rhs = rhsBuilder.ToString().Trim();

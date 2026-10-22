@@ -47,6 +47,11 @@ public static class SyntaxStrictnessTests
             ("C11 via when…else: missing ';' rejected",         Test_MissingSemicolon_WhenElse),
             ("C11 via with…select: missing ';' rejected",       Test_MissingSemicolon_WithSelect),
             ("C11 via with…select: content after others rejected", Test_MissingSemicolon_WithSelectOthers),
+            ("C11 trailing-condition (no else), str operand rejected", Test_MissingSemicolon_TrailingCond_Str),
+            ("C11 trailing-condition (no else), id operand rejected", Test_MissingSemicolon_TrailingCond_Id),
+            ("C11 trailing-comparison then next stmt rejected",  Test_MissingSemicolon_TrailingCmp),
+            ("C11 in a for-generate body rejected",              Test_Gen_MissingSemicolon),
+            ("C8 in a generate body (assign input port) rejected", Test_Gen_AssignInputPort),
             ("C8 via when…else: assign to input port rejected", Test_AssignToInputPort_WhenElse),
             ("C8 via with…select: assign to input port rejected", Test_AssignToInputPort_WithSelect),
             ("C4 via when…else: scalar <= vector rejected",     Test_TypeMismatch_WhenElse),
@@ -66,6 +71,11 @@ public static class SyntaxStrictnessTests
             ("with…select with 'X' when others still parses",   Test_WithSelectMetavalueOthersParses),
             ("when…else with 'after' delay still parses",        Test_WhenElseAfterDelayParses),
             ("with…select with 'after' delay still parses",      Test_WithSelectAfterDelayParses),
+            ("condition '<=' comparison (guarded) still parses", Test_GuardedConditionComparisonParses),
+            ("condition 'and' before '<=' still parses",         Test_GuardedAndBeforeComparisonParses),
+            ("condition 'mod' before '<=' still parses",         Test_GuardedModBeforeComparisonParses),
+            ("condition indexed operand before '<=' still parses", Test_GuardedIndexOperandParses),
+            ("valid nested generate (decls + begin) still parses", Test_Gen_NestedValidParses),
         };
 
         foreach (var (name, run) in tests)
@@ -505,6 +515,139 @@ public static class SyntaxStrictnessTests
         "architecture rtl of dut is",
         "begin",
         "    with sel select y <= '1' after 5 ns when \"00\", '0' when others;",
+        "end architecture rtl;",
+    });
+
+    // --- item A: guarded trailing-condition heuristic (missing ';' with a '<=' next stmt) ---
+
+    // Entity with a second output, a boolean, and integer operands so conditions
+    // can legitimately use '<=' / 'and' / 'mod' comparisons.
+    private static readonly string[] EntC =
+    {
+        "entity dutc is",
+        "    port (a : in std_logic; b : in std_logic; en : in boolean;",
+        "          sel : in std_logic_vector(1 downto 0);",
+        "          cnt : in integer; max : in integer;",
+        "          y : out std_logic; z : out std_logic);",
+        "end entity dutc;",
+    };
+
+    // Reject: no-else conditional, missing ';', next statement — operand before the
+    // new target is a string literal.
+    private static bool Test_MissingSemicolon_TrailingCond_Str() => ExpectThrows(EntC, new[]
+    {
+        "architecture rtl of dutc is",
+        "begin",
+        "    y <= a when sel = \"00\"",     // ERROR: missing ';'
+        "    z <= b;",
+        "end architecture rtl;",
+    });
+
+    // Reject: operand before the new target is an identifier (bare boolean condition).
+    private static bool Test_MissingSemicolon_TrailingCond_Id() => ExpectThrows(EntC, new[]
+    {
+        "architecture rtl of dutc is",
+        "begin",
+        "    y <= a when en",               // ERROR: missing ';'
+        "    z <= b;",
+        "end architecture rtl;",
+    });
+
+    // Reject: condition ENDS in a '<=' comparison; the next statement's target is
+    // still caught (it follows the operand `max`).
+    private static bool Test_MissingSemicolon_TrailingCmp() => ExpectThrows(EntC, new[]
+    {
+        "architecture rtl of dutc is",
+        "begin",
+        "    y <= a when cnt <= max",       // ERROR: missing ';'
+        "    z <= b;",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a '<=' comparison in the condition must still parse.
+    private static bool Test_GuardedConditionComparisonParses() => ExpectParses(EntC, new[]
+    {
+        "architecture rtl of dutc is",
+        "begin",
+        "    y <= a when cnt <= max else b;",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a '<=' after the `and` keyword-operator must still parse.
+    private static bool Test_GuardedAndBeforeComparisonParses() => ExpectParses(EntC, new[]
+    {
+        "architecture rtl of dutc is",
+        "begin",
+        "    y <= a when en and cnt <= max else b;",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: `mod` (tokenised as an identifier, the key trap) before a '<='
+    // comparison must still parse.
+    private static bool Test_GuardedModBeforeComparisonParses() => ExpectParses(EntC, new[]
+    {
+        "architecture rtl of dutc is",
+        "begin",
+        "    y <= a when cnt mod max <= cnt else b;",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: an indexed operand `sel(0)` before a '<=' comparison (prev = ')').
+    private static bool Test_GuardedIndexOperandParses() => ExpectParses(EntC, new[]
+    {
+        "architecture rtl of dutc is",
+        "begin",
+        "    y <= a when sel(0) <= b else '0';",
+        "end architecture rtl;",
+    });
+
+    // --- item B: generate-block validation (C11/C8) + nested-construct handling ---
+
+    private static readonly string[] EntG =
+    {
+        "entity dutg is",
+        "    port (d : in std_logic_vector(3 downto 0); clk : in std_logic;",
+        "          q : out std_logic_vector(3 downto 0));",
+        "end entity dutg;",
+    };
+
+    // Reject: missing ';' on a concurrent assignment inside a for-generate.
+    private static bool Test_Gen_MissingSemicolon() => ExpectThrows(EntG, new[]
+    {
+        "architecture rtl of dutg is",
+        "begin",
+        "    g : for i in 0 to 3 generate",
+        "        q(i) <= d(i)",          // ERROR: missing ';'
+        "        q(i) <= d(i);",
+        "    end generate;",
+        "end architecture rtl;",
+    });
+
+    // Reject: driving an input port inside a generate (C8 now reaches generates).
+    private static bool Test_Gen_AssignInputPort() => ExpectThrows(EntG, new[]
+    {
+        "architecture rtl of dutg is",
+        "begin",
+        "    g : for i in 0 to 0 generate",
+        "        clk <= '0';",           // ERROR: `clk` is mode `in`
+        "    end generate;",
+        "end architecture rtl;",
+    });
+
+    // Positive guard: a nested if-generate with a declarative part + begin (the
+    // shape that previously broke the refactor) must still parse.
+    private static bool Test_Gen_NestedValidParses() => ExpectParses(EntG, new[]
+    {
+        "architecture rtl of dutg is",
+        "begin",
+        "    g_out : if true generate",
+        "        signal tmp : std_logic;",
+        "        constant K : integer := 2;",
+        "    begin",
+        "        g_in : if true generate",
+        "            q(0) <= d(0);",
+        "        end generate g_in;",
+        "    end generate g_out;",
         "end architecture rtl;",
     });
 
