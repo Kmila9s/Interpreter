@@ -487,16 +487,33 @@ public class SelectedAssignment : ISControl
             }
 
             // Parse choices until ',' or ';'
+            bool sawOthers = false;
             while (_streamer.Current != null && _streamer.Current.Value != "," && _streamer.Current.Value != ";")
             {
                 string val = _streamer.Current.Value;
 
+                // C11 (v1.23.0): a choice list is locally static — it never contains
+                // an assignment operator. A '<=' / ':=' here means the previous
+                // choices ran past a missing ';' into the next statement.
+                if (val == "<=" || val == ":=")
+                    throw new ParserException(
+                        $"';' expected to terminate the selected assignment to '{TargetName}' (found '{val}' — missing ';'?)",
+                        _streamer.Current);
+
                 if (val.ToLower() == "others")
                 {
                     choice.IsOthers = true;
+                    sawOthers = true;
                 }
                 else if (val != "|")
                 {
+                    // C11 (v1.23.0): nothing may follow an `others` choice except ';';
+                    // more content here means a missing ';'.
+                    if (sawOthers)
+                        throw new ParserException(
+                            $"';' expected to terminate the selected assignment to '{TargetName}' (found '{val}' — missing ';'?)",
+                            _streamer.Current);
+
                     // Add as a choice value
                     choice.Choices.Add(val);
                 }

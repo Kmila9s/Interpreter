@@ -1187,7 +1187,11 @@ public class Architecture : ISControl, IControl
 
         var rhsBuilder = new StringBuilder();
         int rhsParenDepth = 0;
-        bool rhsSawWhen = false;
+        // True while inside a when…else CONDITION (between a depth-0 `when` and the
+        // following depth-0 `else`/`;`), where a `<=` is a relational comparison and
+        // must NOT be read as a missing-';' signal. Nested conditional expressions are
+        // parenthesised (depth > 0), so they never toggle this.
+        bool rhsInCondition = false;
         while (_streamer.Current?.Value != ";")
         {
             if (_streamer.Current == null)
@@ -1205,17 +1209,21 @@ public class Architecture : ISControl, IControl
             var cur = _streamer.Current.Value;
             if (cur == "(") rhsParenDepth++;
             else if (cur == ")") rhsParenDepth--;
-            else if (cur.Equals("when", StringComparison.OrdinalIgnoreCase)) rhsSawWhen = true;
-            // C11 (v1.21.0): a second assignment operator at paren-depth 0 means
-            // the RHS has run past a missing ';' into the next statement. ':=' is
-            // never valid inside an expression, and a plain-assignment '<=' at
-            // depth 0 here is the next statement. A relational '<=' used as an
-            // operand appears either parenthesised or inside a conditional
-            // (`… when <cond> else …`) condition — so once a `when` has been seen
-            // the depth-0 '<=' is a comparison and must not be flagged.
-            else if (rhsParenDepth == 0 && !rhsSawWhen && (cur == ":=" || cur == "<="))
+            else if (rhsParenDepth == 0 && cur.Equals("when", StringComparison.OrdinalIgnoreCase)) rhsInCondition = true;
+            else if (rhsParenDepth == 0 && cur.Equals("else", StringComparison.OrdinalIgnoreCase)) rhsInCondition = false;
+            // C11 (v1.21.0, extended v1.23.0): a stray assignment operator at
+            // paren-depth 0 means the RHS ran past a missing ';' into the next
+            // statement. ':=' is never valid in a concurrent RHS expression, so a
+            // depth-0 ':=' is always the next statement. A depth-0 '<=' is the next
+            // statement UNLESS we are inside a when…else CONDITION, where '<=' is a
+            // relational comparison (so it is allowed there).
+            else if (rhsParenDepth == 0 && cur == ":=")
                 throw new ParserException(
-                    $"';' expected to terminate the assignment to '{first.Value}' (found '{cur}' — missing ';'?)",
+                    $"';' expected to terminate the assignment to '{first.Value}' (found ':=' — missing ';'?)",
+                    _streamer.Current);
+            else if (rhsParenDepth == 0 && !rhsInCondition && cur == "<=")
+                throw new ParserException(
+                    $"';' expected to terminate the assignment to '{first.Value}' (found '<=' — missing ';'?)",
                     _streamer.Current);
 
             rhsBuilder.Append(cur).Append(' ');
