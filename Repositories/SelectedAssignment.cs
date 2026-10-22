@@ -53,6 +53,11 @@ public class SelectedAssignment : ISControl
     private readonly HashSet<Variable> _variables;
     /// <summary>The token stream used for parsing the selected assignment, or null if constructed explicitly.</summary>
     private readonly TokenStream? _streamer;
+    /// <summary>True when the target carried an index expression <c>target(…)</c>, whether or
+    /// not it resolved to a literal <see cref="TargetBitIndex"/>. A non-literal index (e.g. a
+    /// generate loop variable, <c>q(i)</c>) means the element can't be reliably typed, so the
+    /// type/width validation is skipped for it.</summary>
+    private bool _targetWasIndexed;
 
     /// <summary>
     /// Gets the selector expression.
@@ -401,6 +406,11 @@ public class SelectedAssignment : ISControl
     {
         if (string.IsNullOrEmpty(TargetName)) return;
 
+        // A non-literal index (e.g. a generate loop variable, `q(i)`) can't be
+        // reduced to a reliable element type/width, so skip the check rather than
+        // compare a scalar value against the whole vector (false C4).
+        if (_targetWasIndexed && TargetBitIndex is null) return;
+
         string targetStr = TargetBitIndex is int idx
             ? $"{TargetName}({idx})"
             : TargetName;
@@ -428,6 +438,7 @@ public class SelectedAssignment : ISControl
     private void ParseTargetIndex()
     {
         if (_streamer?.Current?.Value != "(") return;
+        _targetWasIndexed = true;
         _streamer.MoveNext();
 
         // Collect tokens until the matching closing paren.
@@ -496,7 +507,7 @@ public class SelectedAssignment : ISControl
                 // an assignment operator. A '<=' / ':=' here means the previous
                 // choices ran past a missing ';' into the next statement.
                 if (val == "<=" || val == ":=")
-                    throw new ParserException(
+                    throw new ValidationException(
                         $"';' expected to terminate the selected assignment to '{TargetName}' (found '{val}' — missing ';'?)",
                         _streamer.Current);
 
@@ -510,7 +521,7 @@ public class SelectedAssignment : ISControl
                     // C11 (v1.23.0): nothing may follow an `others` choice except ';';
                     // more content here means a missing ';'.
                     if (sawOthers)
-                        throw new ParserException(
+                        throw new ValidationException(
                             $"';' expected to terminate the selected assignment to '{TargetName}' (found '{val}' — missing ';'?)",
                             _streamer.Current);
 

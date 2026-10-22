@@ -641,6 +641,13 @@ public class GenerateBlock : ISControl
                     Tasks.Add(forGen);
                     break;
                 }
+                case "with":
+                {
+                    SelectedAssignment selAssign = new(variables, stream);
+                    selAssign.Syntetize();
+                    Tasks.Add(selAssign);
+                    break;
+                }
                 default:
                     stream.MoveNext();
                     break;
@@ -656,7 +663,7 @@ public class GenerateBlock : ISControl
             // assignments are NOT special-cased — they fall through to
             // ParseConcurrentStatement, whose leading-':' guard handles them.
             if (IsLabeledStatement(stream, out string stmtKeyword)
-                && (stmtKeyword is "process" or "if" or "for"))
+                && (stmtKeyword is "process" or "if" or "for" or "with"))
             {
                 stream.MoveNext(); // consume label
                 stream.MoveNext(); // consume ':'
@@ -679,6 +686,13 @@ public class GenerateBlock : ISControl
                     case "if":
                         DispatchIfOrIfGenerate(stream, variables);
                         break;
+                    case "with":
+                    {
+                        SelectedAssignment labeledSel = new(variables, stream);
+                        labeledSel.Syntetize();
+                        Tasks.Add(labeledSel);
+                        break;
+                    }
                 }
             }
             else
