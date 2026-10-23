@@ -1007,4 +1007,92 @@ public sealed class SourceElaborator
             return rename[m.Value.ToLowerInvariant()];
         });
     }
+
+    // ---------- Standalone generic specialization (for resource estimation) ----------
+
+    /// <summary>
+    /// Produces a <em>standalone</em> VHDL source for a single entity with its
+    /// generics resolved to concrete values — the entity's own declared defaults,
+    /// overridden by <paramref name="genericOverrides"/>. Unlike
+    /// <see cref="ElaborateOrNull"/>, the entity keeps its ports (it is not
+    /// inlined), so a resource estimate over the result counts clocked <em>port</em>
+    /// targets the same way the un-parameterized child would. The
+    /// <c>generic (...)</c> clause is stripped since every generic becomes a
+    /// constant, and generic references in the port/signal widths are substituted
+    /// with their values.
+    /// </summary>
+    /// <remarks>
+    /// Intended for the hierarchical resource estimator: when a parent instantiates
+    /// a width-parameterized component (e.g. <c>reg_n generic map (N =&gt; 16)</c>),
+    /// re-parsing this specialized source yields the child's resource usage at the
+    /// <em>instantiated</em> width instead of its default. Returns null when the
+    /// entity isn't found in <paramref name="sourceText"/> or declares no generics.
+    /// Nested generic expressions (a generic whose value references another
+    /// generic) are not resolved to a fixed point and may be left unsubstituted.
+    /// </remarks>
+    /// <param name="sourceText">The VHDL source containing the entity (its own file).</param>
+    /// <param name="entityName">Name of the entity to specialize.</param>
+    /// <param name="genericOverrides">Generic name → value (e.g. "N" → "16").</param>
+    /// <returns>Standalone specialized source, or null.</returns>
+    public static string? SpecializeEntitySource(
+        string sourceText, string entityName,
+        IReadOnlyDictionary<string, string> genericOverrides)
+    {
+        if (string.IsNullOrEmpty(sourceText) || string.IsNullOrEmpty(entityName))
+            return null;
+
+        EntityRecord? rec = null;
+        foreach (var r in ParseEntities(sourceText))
+            if (string.Equals(r.Name, entityName, StringComparison.OrdinalIgnoreCase))
+            { rec = r; break; }
+        if (rec == null) return null;
+
+        // Resolve generics: the entity's declared defaults, then explicit overrides.
+        var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        ExtractGenericDefaults(values, rec.EntityText);
+        if (genericOverrides != null)
+            foreach (var kv in genericOverrides)
+                if (!string.IsNullOrWhiteSpace(kv.Key))
+                    values[kv.Key.Trim().ToLowerInvariant()] = (kv.Value ?? string.Empty).Trim();
+        if (values.Count == 0) return null; // no generics → nothing to specialize
+
+        // Strip the generic clause first (all generics are now constants), THEN
+        // substitute references, so we never corrupt the `generic (...)` block.
+        string entityText = RemoveGenericClause(rec.EntityText);
+        string archText   = rec.ArchitectureText;
+        foreach (var kv in values)
+        {
+            var one = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [kv.Key] = kv.Value };
+            entityText = RenameTokens(entityText, one);
+            archText   = RenameTokens(archText, one);
+        }
+
+        var sb = new StringBuilder();
+        if (!string.IsNullOrWhiteSpace(rec.HeaderText)) sb.AppendLine(rec.HeaderText.Trim());
+        sb.AppendLine(entityText.Trim());
+        sb.AppendLine(archText.Trim());
+        return sb.ToString();
+    }
+
+    /// <summary>Removes the <c>generic (...)</c> clause (and its trailing
+    /// semicolon) from an entity declaration, balancing nested parens.</summary>
+    private static string RemoveGenericClause(string entityText)
+    {
+        var m = GenericStartRe.Match(entityText);
+        if (!m.Success) return entityText;
+        int open = m.Index;              // start of "generic ("
+        int i = m.Index + m.Length;      // just past "generic ("
+        int depth = 1;
+        while (i < entityText.Length && depth > 0)
+        {
+            if (entityText[i] == '(') depth++;
+            else if (entityText[i] == ')') depth--;
+            i++;
+        }
+        if (depth != 0) return entityText; // unbalanced — leave untouched
+        int j = i;
+        while (j < entityText.Length && char.IsWhiteSpace(entityText[j])) j++;
+        if (j < entityText.Length && entityText[j] == ';') j++;
+        return entityText.Remove(open, j - open);
+    }
 }

@@ -36,6 +36,18 @@ public class Entity : ISControl, IControl{
     /// </summary>
     public Resources ResourceUsage { get; private set; } = default!;
 
+    /// <summary>
+    /// Gets or sets the whole-subtree resource estimation for this entity when
+    /// it is a structural parent (instantiates sub-components via port map):
+    /// its own logic plus every instantiated component's logic, recursively.
+    /// <c>null</c> for leaf entities — consumers fall back to
+    /// <see cref="ResourceUsage"/>. Populated by a post-parse aggregation pass
+    /// (see <see cref="Resources.ComputeHierarchical"/>), not during synthesis,
+    /// because the sibling entities it sums may not be parsed yet when this
+    /// entity's architecture is set.
+    /// </summary>
+    public Resources? HierarchicalResourceUsage { get; set; }
+
     private Tokenizer _tokenizer = new(string.Empty);
     private TokenStream _streamer = default!;
 
