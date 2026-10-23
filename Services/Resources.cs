@@ -93,6 +93,123 @@ public class Resources
     }
 
     /// <summary>
+    /// Folds another entity's <em>logic</em> resources (flip-flops, LUTs, DSP
+    /// slices, BRAM) and clock signals into this estimate. Used when a
+    /// structural parent aggregates the usage of a port-mapped sub-component.
+    /// </summary>
+    /// <remarks>
+    /// I/O pins are deliberately <strong>not</strong> added: a child entity's
+    /// ports are internal nets inside the parent, not device pins — only the
+    /// top entity's own ports consume package I/O. Clock signals are unioned so
+    /// a clock shared across the hierarchy is counted once.
+    /// </remarks>
+    /// <param name="child">The sub-component's self resource estimate.</param>
+    public void IncludeSubComponentLogic(Resources child)
+    {
+        if (child == null) return;
+        FlipFlops  += child.FlipFlops;
+        LUTs       += child.LUTs;
+        DSPSlices  += child.DSPSlices;
+        BRAMBlocks += child.BRAMBlocks;
+        foreach (var clk in child.ClockSignals)
+            ClockSignals.Add(clk);
+        ClockDomains = ClockSignals.Count;
+    }
+
+    /// <summary>
+    /// Computes whole-subtree resource usage for a structural entity: the
+    /// entity's own logic plus the logic of every component it instantiates via
+    /// port map, recursively. Each instantiation is a separate hardware copy
+    /// (two instances of the same component = twice the logic). I/O pins reflect
+    /// the <paramref name="root"/> entity's own ports only.
+    /// </summary>
+    /// <remarks>
+    /// Hierarchy edges are read from <see cref="EntityRegistry"/> (populated
+    /// during parse); child entities are resolved by name against
+    /// <paramref name="byName"/>, which the caller must populate with the
+    /// fully-parsed design entities (each carrying its self <see cref="Entity.ResourceUsage"/>).
+    /// <para><strong>Generics:</strong> when <paramref name="specializeChild"/> is
+    /// supplied, an instance's <c>generic map</c> overrides (e.g. <c>N =&gt; 16</c>)
+    /// are honored by re-synthesizing that child at the instantiated generics.
+    /// Remaining edges that fall back to default-generic figures: a non-leaf child
+    /// with a generic map, a generic whose value isn't a literal (e.g. propagated
+    /// from the parent's own generics), and nested generic expressions.</para>
+    /// </remarks>
+    /// <param name="root">The entity whose subtree usage to estimate.</param>
+    /// <param name="byName">Design entities keyed by name (case-insensitive recommended).</param>
+    /// <param name="specializeChild">Optional resolver that returns a child's self
+    /// estimate re-synthesized at an instance's <c>generic map</c> overrides
+    /// (childName, generic name→value) → <see cref="Resources"/>, or null to fall
+    /// back to the child's default-generic estimate. Supplied by the caller because
+    /// re-parsing lives above the Interpreter layer.</param>
+    /// <returns>A new <see cref="Resources"/> holding the aggregated totals.</returns>
+    public static Resources ComputeHierarchical(
+        Entity root,
+        IReadOnlyDictionary<string, Entity> byName,
+        Func<string, IReadOnlyDictionary<string, string>, Resources?>? specializeChild = null)
+    {
+        var total = new Resources(root);
+        total.Calculate(); // root self: IO from root ports + its own FF/LUT/DSP/BRAM/clocks
+        if (byName == null) return total;
+
+        // Ancestor-path set guards illegal instantiation cycles. Repeated
+        // *siblings* are still counted because we iterate instances, not names.
+        var ancestors = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { root.Name };
+        AccumulateSubComponents(total, root.Name, byName, ancestors, specializeChild);
+        return total;
+    }
+
+    private static void AccumulateSubComponents(
+        Resources total, string parentName,
+        IReadOnlyDictionary<string, Entity> byName, HashSet<string> ancestors,
+        Func<string, IReadOnlyDictionary<string, string>, Resources?>? specializeChild)
+    {
+        foreach (var inst in EntityRegistry.Instance.GetComponentInstances(parentName))
+        {
+            if (inst == null || string.IsNullOrEmpty(inst.EntityName)) continue;
+            if (!byName.TryGetValue(inst.EntityName, out var child) || child == null) continue;
+
+            // Prefer a generic-specialized estimate when the instance passes a
+            // generic map (e.g. an N-bit register at N => 16). Fall back to the
+            // child's default-generic self estimate when no map / resolver, or
+            // when specialization can't be applied (non-leaf, non-literal, etc.).
+            Resources? childSelf = null;
+            if (specializeChild != null && inst.GenericMap != null && inst.GenericMap.Count > 0)
+            {
+                var overrides = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var kv in inst.GenericMap)
+                {
+                    var v = kv.Value?.ToString();
+                    if (!string.IsNullOrWhiteSpace(kv.Key) && !string.IsNullOrWhiteSpace(v))
+                        overrides[kv.Key] = v!;
+                }
+                if (overrides.Count > 0)
+                    childSelf = specializeChild(inst.EntityName, overrides);
+            }
+            childSelf ??= child.ResourceUsage ?? BuildSelf(child);
+
+            // One hardware copy per instantiation.
+            if (childSelf != null) total.IncludeSubComponentLogic(childSelf);
+
+            // Recurse into the child's own instantiations (skip on cycle).
+            if (ancestors.Contains(inst.EntityName)) continue;
+            ancestors.Add(inst.EntityName);
+            AccumulateSubComponents(total, inst.EntityName, byName, ancestors, specializeChild);
+            ancestors.Remove(inst.EntityName);
+        }
+    }
+
+    /// <summary>Computes an entity's self-only estimate (fallback when its
+    /// <see cref="Entity.ResourceUsage"/> hasn't been populated).</summary>
+    private static Resources? BuildSelf(Entity e)
+    {
+        if (e?.Architecture == null) return null;
+        var r = new Resources(e);
+        r.Calculate();
+        return r;
+    }
+
+    /// <summary>
     /// Counts I/O pins from entity port declarations.
     /// Accuracy: 100% (exact count)
     /// </summary>
