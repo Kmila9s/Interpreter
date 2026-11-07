@@ -52,9 +52,18 @@ internal sealed class OrthogonalRouter
     // Deterministic lane bookkeeping.
     private readonly Dictionary<(int Corridor, string Net), double> _corridorLaneX = new();
     private readonly Dictionary<int, int> _corridorNext = new();
+    // Planned lane assignment: the ordered, distinct nets that pass through each
+    // corridor, filled by Plan() before any routing and turned into evenly-spread
+    // lane x's by FinalizeLanes(). This replaces the old modulo-wrapped lanes,
+    // which made the 11th+ net in a corridor reuse an earlier net's exact x and
+    // draw on top of it.
+    private readonly Dictionary<int, List<string>> _corridorNets = new();
+    private bool _lanesPlanned;
     private readonly Dictionary<string, int> _feedbackLane = new(StringComparer.Ordinal);
     private int _feedbackCount;
-    private readonly Dictionary<long, int> _flyoverUse = new();
+    // Horizontal crossing lanes already placed, so a new crossing over an
+    // overlapping x-range picks a different y instead of drawing on top.
+    private readonly List<(double Y, double X1, double X2)> _placedHoriz = new();
 
     public OrthogonalRouter(double[] colXArr, double[] colW, int nCols,
         double portStripW, double canvasW, double canvasH, IReadOnlyCollection<Rect> obstacles)
@@ -91,15 +100,70 @@ internal sealed class OrthogonalRouter
     private double CorridorLeft(int g) => g < 0 ? _portStripW : ColRight(g);
     private double CorridorRight(int g) => g + 1 >= _nCols ? _canvasW - _portStripW : ColLeft(g + 1);
 
+    /// <summary>Registers that <paramref name="net"/> will pass through the
+    /// corridor(s) between its source and sink columns, so FinalizeLanes can give
+    /// every net in a corridor its own evenly-spread lane. Call once per routed
+    /// branch, before any Route call.</summary>
+    public void Plan(string net, double sx, double tx)
+    {
+        int a = ColumnOfX(sx), b = ColumnOfX(tx);
+        // Mirror the corridors Route() actually uses: the one right of the source
+        // and the one left of the sink (same corridor for an adjacent hop).
+        RegisterCorridor(a, net);
+        RegisterCorridor(b - 1, net);
+    }
+
+    private void RegisterCorridor(int g, string net)
+    {
+        if (g < -1 || g >= _nCols) return;
+        var list = _corridorNets.TryGetValue(g, out var l) ? l : (_corridorNets[g] = new List<string>());
+        if (!list.Contains(net)) list.Add(net);
+    }
+
+    /// <summary>Turns the planned per-corridor net lists into evenly-spread lane
+    /// x's — one distinct lane per net, filling the corridor width — so no two
+    /// nets share a vertical track. Idempotent; call after all Plan() calls.</summary>
+    public void FinalizeLanes()
+    {
+        foreach (var (g, nets) in _corridorNets)
+        {
+            double left = CorridorLeft(g) + CorridorInset;
+            double right = CorridorRight(g) - CorridorInset;
+            if (right <= left) { double c = (CorridorLeft(g) + CorridorRight(g)) / 2.0; left = right = c; }
+            int n = nets.Count;
+            for (int i = 0; i < n; i++)
+                _corridorLaneX[(g, nets[i])] = left + (i + 1.0) / (n + 1.0) * (right - left);
+        }
+        _lanesPlanned = true;
+    }
+
     /// <summary>A deterministic vertical lane x inside corridor
     /// <paramref name="g"/>. The same net reuses the same lane so a fan-out
-    /// collapses into a shared trunk.</summary>
+    /// collapses into a shared trunk. Lanes are planned up front (see
+    /// <see cref="FinalizeLanes"/>) so distinct nets never share a track; the
+    /// lazy path below is a fallback for any unplanned branch.</summary>
     private double CorridorLaneX(int g, string net)
     {
         if (_corridorLaneX.TryGetValue((g, net), out var cached)) return cached;
+        if (_lanesPlanned)
+        {
+            // Unplanned net reaching here is rare (planning covers every routed
+            // branch); append it to the corridor and re-space so it still gets a
+            // unique lane rather than colliding.
+            RegisterCorridor(g, net);
+            int gg = Math.Clamp(g, -1, _nCols - 1);
+            if (_corridorNets.TryGetValue(gg, out var nets))
+            {
+                double l = CorridorLeft(gg) + CorridorInset, r = CorridorRight(gg) - CorridorInset;
+                if (r <= l) { double c = (CorridorLeft(gg) + CorridorRight(gg)) / 2.0; l = r = c; }
+                int n = nets.Count;
+                for (int i = 0; i < n; i++)
+                    _corridorLaneX[(gg, nets[i])] = l + (i + 1.0) / (n + 1.0) * (r - l);
+                if (_corridorLaneX.TryGetValue((g, net), out var now)) return now;
+            }
+        }
         int idx = _corridorNext.GetValueOrDefault(g);
         _corridorNext[g] = idx + 1;
-
         double left = CorridorLeft(g), right = CorridorRight(g);
         double center = (left + right) / 2.0;
         double width = right - left;
@@ -108,6 +172,21 @@ internal sealed class OrthogonalRouter
         double x = Math.Clamp(center + off, left + CorridorInset, right - CorridorInset);
         _corridorLaneX[(g, net)] = x;
         return x;
+    }
+
+    /// <summary>True if a horizontal crossing at <paramref name="y"/> over
+    /// [<paramref name="x1"/>, <paramref name="x2"/>] doesn't share a lane with an
+    /// already-placed crossing whose x-range overlaps it.</summary>
+    private bool HorizLaneFree(double x1, double x2, double y)
+    {
+        if (x1 > x2) (x1, x2) = (x2, x1);
+        foreach (var p in _placedHoriz)
+        {
+            if (Math.Abs(p.Y - y) >= HorizLaneSpacing - 0.5) continue;
+            if (x2 <= p.X1 || x1 >= p.X2) continue; // x-ranges don't overlap
+            return false;
+        }
+        return true;
     }
 
     /// <summary>True if a horizontal segment at <paramref name="y"/> spanning
@@ -151,16 +230,22 @@ internal sealed class OrthogonalRouter
             if (d < bestDist) { bestDist = d; best = y; }
         }
 
-        // Nudge parallel crossings that land on the same lane apart, keeping
-        // the result clear.
-        long bucket = (long)Math.Round(best);
-        int used = _flyoverUse.GetValueOrDefault(bucket);
-        _flyoverUse[bucket] = used + 1;
-        if (used > 0)
+        // Spread parallel crossings so two nets that would share a lane don't
+        // draw on top of each other. Search outward from the preferred clear lane
+        // for a y that is both block-clear and not already taken by an
+        // overlapping crossing; fall back to the express band if none is free.
+        double chosen = best; // fallback: the nearest clear lane, even if shared
+        for (int k = 0; k <= 80; k++)
         {
-            double nudged = best + ((used % 2 == 1 ? 1 : -1) * ((used + 1) / 2) * HorizLaneSpacing);
-            if (HorizClear(x1, x2, nudged)) best = nudged;
+            double cand = best + ((k % 2 == 0 ? 1 : -1) * ((k + 1) / 2) * HorizLaneSpacing);
+            if (HorizClear(x1, x2, cand) && HorizLaneFree(x1, x2, cand))
+            {
+                chosen = cand;
+                break;
+            }
         }
+        _placedHoriz.Add((chosen, x1, x2));
+        best = chosen;
 
         if (best + FeedbackGap > CanvasHeight) CanvasHeight = best + FeedbackGap;
         return best;

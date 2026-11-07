@@ -161,8 +161,12 @@ public sealed class SourceElaborator
         @"\bgeneric\s*\(",
         RegexOptions.IgnoreCase | RegexOptions.Singleline);
 
+    // Match a signal/constant declaration at line start OR after a `;`, so
+    // several on one line (`signal s1 : ...; signal c1 : ...; signal c2 : ...;`)
+    // are all collected — otherwise only the first is prefixed when inlining an
+    // instance, and the rest collide across repeated instances (duplicate c1).
     private static readonly Regex SignalDeclRe = new(
-        @"^\s*(signal|constant)\s+(?<names>[\w,\s]+?)\s*:",
+        @"(?:^|;)\s*(signal|constant)\s+(?<names>[\w,\s]+?)\s*:",
         RegexOptions.IgnoreCase | RegexOptions.Multiline);
 
     private static readonly Regex ComponentDeclRe = new(
