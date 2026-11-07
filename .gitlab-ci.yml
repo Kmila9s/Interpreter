@@ -20,6 +20,6 @@ before_script:
     - git clone --depth 20 "http://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}:8083/${CI_PROJECT_NAMESPACE}/LibraryCompiler.git" ../LibraryCompiler
 build-test:
     stage: test
-    image: mcr.microsoft.com/dotnet/sdk:9.0
+    image: mcr.microsoft.com/dotnet/sdk:10.0
     script:
-        - dotnet run -c Release -f net9.0 -p:TargetFrameworks=net9.0
+        - dotnet run -c Release -f net10.0 -p:TargetFrameworks=net10.0

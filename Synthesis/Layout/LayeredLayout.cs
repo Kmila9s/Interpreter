@@ -292,8 +292,18 @@ public static class LayeredLayout
                 if (seenBand.Add(key)) bandOrder.Add(key);
             }
 
-            double slot = GateH + rowGapV;
             double y = TopPad;
+            // Height of one column's stacked cells in a band, honouring each
+            // cell's own height. For a pure-gate band every cell is GateH so this
+            // equals the old uniform-slot math exactly (coordinates unchanged);
+            // a band holding a boxed component instance (taller than a gate so its
+            // pin rows don't crowd) grows only as much as that box needs.
+            double StackH(IReadOnlyList<string> list)
+            {
+                double h = 0;
+                foreach (var id in list) h += CellH(id);
+                return h + Math.Max(0, list.Count - 1) * rowGapV;
+            }
             foreach (var band in bandOrder)
             {
                 // Per-column cell lists for this band, each ordered by the
@@ -312,15 +322,20 @@ public static class LayeredLayout
                 }
                 if (bandRows == 0) continue;
 
-                double bandH = bandRows * GateH + Math.Max(0, bandRows - 1) * rowGapV;
+                double bandH = 0;
+                for (int col = 0; col < columns.Count; col++)
+                    bandH = Math.Max(bandH, StackH(perCol[col]));
                 for (int col = 0; col < columns.Count; col++)
                 {
                     var list = perCol[col];
-                    // Center this column's cells within the band's rows so a
-                    // single-cell column lines up with taller neighbours.
-                    double off = (bandRows - list.Count) / 2.0 * slot;
+                    // Center this column's cells within the band so a short column
+                    // lines up with taller neighbours; stack by each cell's height.
+                    double yy = y + (bandH - StackH(list)) / 2.0;
                     for (int r = 0; r < list.Count; r++)
-                        cellBounds[list[r]] = new Rect(ColX(col), y + off + r * slot, GateW, GateH);
+                    {
+                        cellBounds[list[r]] = new Rect(ColX(col), yy, CellW(list[r]), CellH(list[r]));
+                        yy += CellH(list[r]) + rowGapV;
+                    }
                 }
                 y += bandH + BandGap;
             }
@@ -401,6 +416,12 @@ public static class LayeredLayout
             // crosses a block. The router grows the canvas downward if it needs
             // extra feedback lanes.
             var router = new OrthogonalRouter(colXArr, colW, nCols, PortStripW, canvasW, canvasH, cellBounds.Values.ToList());
+
+            // Resolve every branch first, then plan corridor lanes from the full
+            // set, so each net gets its own evenly-spread vertical track (no two
+            // nets stacked on one x). Routing happens in the second pass.
+            var branches = new List<(string NetId, double Sx, double Sy, double Tx, double Ty,
+                                     string? FromCellId, string? ToCellId)>();
             for (int netIdx = 0; netIdx < netlist.Nets.Count; netIdx++)
             {
                 var net = netlist.Nets[netIdx];
@@ -408,15 +429,21 @@ public static class LayeredLayout
                 if (src is not var (sx, sy, fromCellId)) continue;
                 var sinks = ResolveSinks(net.Id, consumersOf, pinPositions, portPositions, netlist).ToList();
                 if (sinks.Count == 0) continue;
-
                 foreach (var (tx, ty, toCellId) in sinks)
                 {
-                    wires.Add(new WirePath(
-                        net.Id,
-                        router.Route(net.Id, sx, sy, tx, ty),
-                        FromCellId: fromCellId,
-                        ToCellId: toCellId));
+                    branches.Add((net.Id, sx, sy, tx, ty, fromCellId, toCellId));
+                    router.Plan(net.Id, sx, tx);
                 }
+            }
+            router.FinalizeLanes();
+
+            foreach (var br in branches)
+            {
+                wires.Add(new WirePath(
+                    br.NetId,
+                    router.Route(br.NetId, br.Sx, br.Sy, br.Tx, br.Ty),
+                    FromCellId: br.FromCellId,
+                    ToCellId: br.ToCellId));
             }
             canvasH = router.CanvasHeight;
             return new LaidOutNetlist(netlist, cellBounds, pinPositions, portPositions, wires, canvasW, canvasH);

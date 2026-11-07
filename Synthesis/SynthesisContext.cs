@@ -73,6 +73,12 @@ internal sealed class SynthesisContext
         return net;
     }
 
+    /// <summary>Returns an already-created net by name (case-insensitive), or
+    /// null. Used by the component schematic pass to tie a port-map bit-slice
+    /// like <c>a(0)</c> back to its existing bus net <c>a</c>.</summary>
+    public Net? TryGetNet(string name)
+        => _netsByName.TryGetValue(name, out var n) ? n : null;
+
     /// <summary>
     /// Allocates a fresh internal net for an intermediate gate output. The
     /// generated name embeds the source line when available so the Naive
