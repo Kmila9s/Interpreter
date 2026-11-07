@@ -38,6 +38,15 @@ public class SignalHistory
     private readonly Dictionary<Variable, List<int>> _sourceLines = new();
 
     /// <summary>
+    /// Per-signal count of entries FIFO-evicted by the <see cref="MaxSamplesPerSignal"/>
+    /// cap. The "absolute" index of the i-th retained entry is
+    /// <c>_evicted[signal] + i</c>. <see cref="ReadSince"/> uses this so the
+    /// live-waveform watermark stays valid after eviction. Empty / zero on short
+    /// runs (nothing evicted).
+    /// </summary>
+    private readonly Dictionary<Variable, long> _evicted = new();
+
+    /// <summary>
     /// Lock for thread safety.
     /// </summary>
     private readonly object _lock = new();
@@ -46,6 +55,22 @@ public class SignalHistory
     /// Whether recording is enabled.
     /// </summary>
     public bool IsRecording { get; set; } = true;
+
+    /// <summary>
+    /// Maximum (time, value) samples retained per signal while recording. Once a
+    /// signal exceeds this, the oldest samples are FIFO-evicted in amortized-O(1)
+    /// batches so a long / free-running simulation keeps BOUNDED memory — the
+    /// root-cause fix for the long-running freeze + crash (unbounded history was
+    /// the primary heap-growth source). Set to 0 or negative to opt into
+    /// UNBOUNDED retention (full-fidelity VCD export over an entire run).
+    ///
+    /// Default 5000 ≫ what any teaching waveform needs to scrub; a short run
+    /// never reaches it, so eviction never fires and every exported value and
+    /// timestamp stays byte-identical to before this cap existed. Eviction
+    /// advances <see cref="_evicted"/> so <see cref="ReadSince"/>'s watermark
+    /// arithmetic stays correct.
+    /// </summary>
+    public int MaxSamplesPerSignal { get; set; } = 5000;
 
     /// <summary>
     /// Read-only view of the raw history dictionary. Returns the live
@@ -133,6 +158,29 @@ public class SignalHistory
 
             _history[signal].Add(Tuple.Create(timeMoment, value));
             _sourceLines[signal].Add(sourceLine);
+
+            // Long-run safety cap (2026-11-06): bound per-signal retention so a
+            // free-running / very long sim cannot grow the heap without limit —
+            // the primary driver of the long-running freeze + crash. Evict the
+            // oldest in amortized-O(1) batches (RemoveRange of a chunk, not one
+            // per add) and track the dropped count so ReadSince's watermark stays
+            // valid. MaxSamplesPerSignal <= 0 means unbounded (opt-in full VCD).
+            if (MaxSamplesPerSignal > 0)
+            {
+                var list = _history[signal];
+                if (list.Count > MaxSamplesPerSignal)
+                {
+                    int remove = Math.Max(1, MaxSamplesPerSignal / 8);
+                    if (remove > list.Count) remove = list.Count;
+                    list.RemoveRange(0, remove);
+                    if (_sourceLines.TryGetValue(signal, out var sl))
+                    {
+                        int slRemove = Math.Min(remove, sl.Count);
+                        if (slRemove > 0) sl.RemoveRange(0, slRemove);
+                    }
+                    _evicted[signal] = (_evicted.TryGetValue(signal, out var ev) ? ev : 0L) + remove;
+                }
+            }
         }
     }
 
@@ -231,14 +279,20 @@ public class SignalHistory
         lock (_lock)
         {
             if (!_history.TryGetValue(signal, out var h)) return fromIndex;
-            int total = h.Count;
-            if (fromIndex < 0) fromIndex = 0;
-            for (int i = fromIndex; i < total; i++)
+            long baseOff = _evicted.TryGetValue(signal, out var ev) ? ev : 0L;
+            // fromIndex is an ABSOLUTE entry index (count of entries the caller has
+            // already consumed). Translate to a local index into the retained
+            // window. A watermark that fell into the evicted region clamps to the
+            // window start — those entries are gone from the bounded live view.
+            long localStart = fromIndex - baseOff;
+            if (localStart < 0) localStart = 0;
+            if (localStart > h.Count) localStart = h.Count;
+            for (int i = (int)localStart; i < h.Count; i++)
             {
                 var e = h[i];
                 onEntry(e.Item1, e.Item2);
             }
-            return total;
+            return (int)(baseOff + h.Count);
         }
     }
 
@@ -382,6 +436,7 @@ public class SignalHistory
         {
             _history.Clear();
             _sourceLines.Clear();
+            _evicted.Clear();
         }
     }
 
@@ -397,6 +452,7 @@ public class SignalHistory
                 _history[key].Clear();
                 if (_sourceLines.TryGetValue(key, out var lines)) lines.Clear();
             }
+            _evicted.Clear();
         }
     }
 
