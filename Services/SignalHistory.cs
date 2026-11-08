@@ -73,6 +73,18 @@ public class SignalHistory
     public int MaxSamplesPerSignal { get; set; } = 5000;
 
     /// <summary>
+    /// Optional spill sink for the <see cref="MaxSamplesPerSignal"/> cap (long-run
+    /// Phase 2, 2026-11-08). When set, every batch of samples about to be FIFO-evicted
+    /// is handed to this callback FIRST — in time order, per signal, as
+    /// (timeMoment, value, sourceLine) — so a host can persist it (e.g. a per-run
+    /// on-disk trace store) instead of losing it. Invoked on the recording thread
+    /// while the history lock is held: the sink must be fast and non-blocking
+    /// (enqueue and return) and must not call back into this instance. Null (the
+    /// default) = eviction simply drops, exactly as before.
+    /// </summary>
+    public Action<Variable, IReadOnlyList<(long TimeMoment, object Value, int SourceLine)>>? OnEvicting { get; set; }
+
+    /// <summary>
     /// Read-only view of the raw history dictionary. Returns the live
     /// dictionary as <see cref="IReadOnlyDictionary{TKey,TValue}"/> so
     /// callers can iterate without forcing a copy on every access — the
@@ -172,8 +184,19 @@ public class SignalHistory
                 {
                     int remove = Math.Max(1, MaxSamplesPerSignal / 8);
                     if (remove > list.Count) remove = list.Count;
+                    _sourceLines.TryGetValue(signal, out var sl);
+                    var spill = OnEvicting;
+                    if (spill != null)
+                    {
+                        // Hand the batch to the spill sink before it is dropped.
+                        var batch = new (long, object, int)[remove];
+                        for (int i = 0; i < remove; i++)
+                            batch[i] = (list[i].Item1, list[i].Item2,
+                                        sl != null && i < sl.Count ? sl[i] : 0);
+                        spill(signal, batch);
+                    }
                     list.RemoveRange(0, remove);
-                    if (_sourceLines.TryGetValue(signal, out var sl))
+                    if (sl != null)
                     {
                         int slRemove = Math.Min(remove, sl.Count);
                         if (slRemove > 0) sl.RemoveRange(0, slRemove);
