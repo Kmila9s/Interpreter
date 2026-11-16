@@ -1425,6 +1425,12 @@ while (_streamer.Current != null)
 
 ## 10. Changelog
 
+### Version 3.0.6 (2026-11-16)
+
+*   `SourceElaborator` (comments and string masking), `PackageSubtypeScanner`
+    and the `Program.cs` continuation joiner use `Parser.Models.VhdlText`
+    (string-aware) instead of their own copies (FE-8).
+
 ### Version 3.0.4 (2026-11-16)
 
 *   **GAP-ELAB-001 — elaborator closer forms.** `SourceElaborator.EntityRe`

@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.RegularExpressions;
+using Parser.Models;
 
 namespace Interpreter.Services;
 
@@ -180,9 +181,9 @@ public sealed class SourceElaborator
 
     private static IEnumerable<EntityRecord> ParseEntities(string source)
     {
-        // Strip line comments first so they don't poison the regexes (each
-        // file is small — full body scan is OK).
-        var stripped = StripLineComments(source);
+        // Strip line comments first (string-aware, line breaks kept) so they
+        // don't poison the regexes — each file is small, a full scan is OK.
+        var stripped = VhdlText.StripLineComments(source);
 
         // Capture library/use lines that precede the first entity declaration —
         // we want to forward those into the flat output.
@@ -267,92 +268,6 @@ public sealed class SourceElaborator
         }
     }
 
-    // Strips `-- ...` line comments while preserving line breaks so line
-    // numbers in downstream errors still line up with the original file.
-    // F-G-12 followup (2026-07-18): the previous version was blind to
-    // string literals, so `report "-------- " & name & …` was mistaken
-    // for a line comment starting at the first `-` and everything after
-    // it on the same line got dropped — bricking any report / assert
-    // whose message contained `--`. Now tracks a per-line insideString
-    // flag on each `"` so `--` inside a literal passes through untouched.
-    private static string StripLineComments(string src)
-    {
-        var sb = new StringBuilder(src.Length);
-        int i = 0;
-        bool insideString = false;
-        while (i < src.Length)
-        {
-            char c = src[i];
-            if (c == '\n')
-            {
-                // Strings don't span lines in VHDL — reset the flag at EOL.
-                insideString = false;
-                sb.Append(c);
-                i++;
-                continue;
-            }
-            if (c == '"')
-            {
-                insideString = !insideString;
-                sb.Append(c);
-                i++;
-                continue;
-            }
-            if (!insideString && i + 1 < src.Length && c == '-' && src[i + 1] == '-')
-            {
-                while (i < src.Length && src[i] != '\n') i++;
-                continue;
-            }
-            sb.Append(c);
-            i++;
-        }
-        return sb.ToString();
-    }
-
-    // F-G-09 (2026-07-17): return a copy of <paramref name="src"/> where the
-    // *contents* of every double-quoted string literal are replaced with
-    // `.` characters. The opening/closing `"` are kept so anything that
-    // keys on the delimiter still sees it. Length is preserved character-
-    // for-character, so callers can use this masked copy for regex scans
-    // (`SplitArchitecture`, `InstanceRe`) while continuing to Substring
-    // from the original source — indexes into the two strings match up.
-    //
-    // Was: the un-masked source let the arch-splitting regex false-match
-    // the word `end` inside `report "TB: end of stimulus";`, decrementing
-    // `innerDepth` from 1 to 0 while still inside `stim_proc`, so the
-    // next real `end process;` was mis-treated as the architecture's own
-    // close and the elaborator emitted a truncated body with a dangling
-    // `stim_proc` (Session 22 pass 4 residual). Testbench cases with
-    // `end` anywhere in a report / assert message hit this; SimulatorBench
-    // dodged it because none of its report strings contain the word `end`.
-    private static string MaskStringLiterals(string src)
-    {
-        var sb = new StringBuilder(src.Length);
-        int i = 0;
-        while (i < src.Length)
-        {
-            if (src[i] == '"')
-            {
-                sb.Append('"');
-                i++;
-                while (i < src.Length && src[i] != '"' && src[i] != '\n')
-                {
-                    sb.Append('.');
-                    i++;
-                }
-                if (i < src.Length && src[i] == '"')
-                {
-                    sb.Append('"');
-                    i++;
-                }
-                continue;
-            }
-            sb.Append(src[i]);
-            i++;
-        }
-        return sb.ToString();
-    }
-
     // Splits the body of a `port(...)` or `generic(...)` block into
     // individual identifier names. Each clause looks like
     //   `name1, name2 : direction type := default; name3 : ...`
@@ -397,7 +312,7 @@ public sealed class SourceElaborator
         // `report "TB: end of stimulus";` doesn't false-match as a real
         // VHDL `end`. Indexes into `masked` line up with `source`, so we
         // substring from `source` for the output.
-        string masked = MaskStringLiterals(source);
+        string masked = VhdlText.MaskStringLiterals(source);
         // Opening keywords that introduce a nested begin/end pair.
         // `procedure` and `function` use `begin ... end function`. `process`
         // uses `process ... begin ... end process`. Generate/block also.
