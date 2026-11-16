@@ -762,7 +762,7 @@ internal static class ConcurrentAssignSynthesizer
                 try
                 {
                     var parseScope = BuildInliningScope(fdef, duf.Variables);
-                    var tokenizer = new Parser.Repositories.Tokenizer(string.Empty);
+                    var tokenizer = new Parser.Repositories.Tokenizer();
                     var sourceLines = fdef.BodyLines != null && fdef.BodyLines.Length > 0
                         ? fdef.BodyLines
                         : fdef.BodyRaw.Split('\n');

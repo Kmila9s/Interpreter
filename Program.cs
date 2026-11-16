@@ -499,7 +499,7 @@ class Program
             Console.WriteLine($"[IEEE] stub root: {IEEELibraryLoader.Instance.StubRoot ?? "(not found — fallback names seeded)"}");
         }
 
-        Tokenizer tok = new("");
+        Tokenizer tok = new();
         var lines = raw.Split("\n")
                        .Where(p => !String.IsNullOrEmpty(p.Trim()) && p != " ")
                        .ToArray();

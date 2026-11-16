@@ -136,8 +136,12 @@ public sealed class SourceElaborator
 
     // ---------- Entity / architecture extraction ----------
 
+    // Closer forms accepted (IEEE 1076-1993+): `end;`, `end entity;`,
+    // `end <name>;`, `end entity <name>;`. GAP-ELAB-001: the keyword and the
+    // label are each optional, so `end entity;` must not require trailing
+    // whitespace after `entity`.
     private static readonly Regex EntityRe = new(
-        @"^\s*entity\s+(?<name>\w+)\s+is\b(?<body>.*?)\bend\s+(?:entity\s+)?(?:\k<name>\s*)?;",
+        @"^\s*entity\s+(?<name>\w+)\s+is\b(?<body>.*?)\bend\b\s*(?:entity\b\s*)?(?:\k<name>\b\s*)?;",
         RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Multiline);
 
     // Locates the start of an architecture (`architecture <aname> of <ename> is`).
@@ -169,8 +173,9 @@ public sealed class SourceElaborator
         @"(?:^|;)\s*(signal|constant)\s+(?<names>[\w,\s]+?)\s*:",
         RegexOptions.IgnoreCase | RegexOptions.Multiline);
 
+    // `is` after the component name is optional since VHDL-93.
     private static readonly Regex ComponentDeclRe = new(
-        @"\bcomponent\s+(?<cname>\w+)\s+is\b.*?\bend\s+component(?:\s+\k<cname>)?\s*;",
+        @"\bcomponent\s+(?<cname>\w+)(?:\s+is)?\b.*?\bend\s+component(?:\s+\k<cname>)?\s*;",
         RegexOptions.IgnoreCase | RegexOptions.Singleline);
 
     private static IEnumerable<EntityRecord> ParseEntities(string source)

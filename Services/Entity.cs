@@ -9,7 +9,7 @@ namespace Interpreter.Services;
 /// <summary>
 /// Represents a VHDL entity.
 /// </summary>
-public class Entity : ISControl, IControl{
+public class Entity : ISControl{
     /// <summary>
     /// Gets the name of the entity.
     /// </summary>
@@ -48,7 +48,7 @@ public class Entity : ISControl, IControl{
     /// </summary>
     public Resources? HierarchicalResourceUsage { get; set; }
 
-    private Tokenizer _tokenizer = new(string.Empty);
+    private Tokenizer _tokenizer = new();
     private TokenStream _streamer = default!;
 
     /// <summary>
@@ -170,10 +170,6 @@ public class Entity : ISControl, IControl{
         progress.ReportPhase(1f, "Entity parsed", ProcessingPhase.ParsingEntity, Name);
     }
 
-    /// <summary>
-    /// Synthesizes the behavior of the entity.
-    /// </summary>
-    public void SyntetizeBehaviour() => SyntetizeBehaviour(CancellationToken.None);
 
     /// <summary>
     /// Synthesizes the behavior of the entity.
@@ -214,15 +210,6 @@ public class Entity : ISControl, IControl{
             _streamer.Expect(PARENTHESIS);
             _streamer.Expect(OPERATORS); // ;
         }
-
-    }
-
-    /// <summary>
-    /// Synthesizes the behavior of the entity from raw data.
-    /// </summary>
-    /// <param name="Behaviour">The raw data of the behavior.</param>
-    public void SyntetizeBehaviour(string[] Behaviour)
-    {
 
     }
 

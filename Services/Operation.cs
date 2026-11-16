@@ -139,7 +139,7 @@ public class Operation : IOperation {
         SourceLine = sourceLine;
         this.Variables = Variables;
         _rawData = RawData;
-        Tokenizer tokenizer = new(string.Empty);
+        Tokenizer tokenizer = new();
 
         // v0.16.1: Support both signal assignment (<=) and variable assignment (:=)
         bool isSignalAssignment = RawData.Contains("<=");

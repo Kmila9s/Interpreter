@@ -320,26 +320,6 @@ public class SignalHistory
     }
 
     /// <summary>
-    /// Gets the history for a signal by name.
-    /// </summary>
-    /// <param name="signalName">The signal name.</param>
-    /// <returns>List of (time, value) tuples, or empty list if not found.</returns>
-    public List<Tuple<long, object>> GetSignalHistoryByName(string signalName)
-    {
-        lock (_lock)
-        {
-            var signal = _history.Keys.FirstOrDefault(v =>
-                v.Name.Equals(signalName, StringComparison.OrdinalIgnoreCase));
-
-            if (signal is not null)
-            {
-                return new List<Tuple<long, object>>(_history[signal]);
-            }
-            return new List<Tuple<long, object>>();
-        }
-    }
-
-    /// <summary>
     /// Gets the value of a signal at a specific time.
     /// Returns the most recent value at or before the specified time.
     /// </summary>
@@ -368,18 +348,6 @@ public class SignalHistory
             }
 
             return result?.Item2;
-        }
-    }
-
-    /// <summary>
-    /// Gets all tracked signal names.
-    /// </summary>
-    /// <returns>List of signal names.</returns>
-    public List<string> GetTrackedSignalNames()
-    {
-        lock (_lock)
-        {
-            return _history.Keys.Select(v => v.Name).ToList();
         }
     }
 
@@ -459,22 +427,6 @@ public class SignalHistory
         {
             _history.Clear();
             _sourceLines.Clear();
-            _evicted.Clear();
-        }
-    }
-
-    /// <summary>
-    /// Clears history but keeps signal registrations.
-    /// </summary>
-    public void ClearHistory()
-    {
-        lock (_lock)
-        {
-            foreach (var key in _history.Keys)
-            {
-                _history[key].Clear();
-                if (_sourceLines.TryGetValue(key, out var lines)) lines.Clear();
-            }
             _evicted.Clear();
         }
     }

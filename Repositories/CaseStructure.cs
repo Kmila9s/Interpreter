@@ -807,9 +807,4 @@ public class CaseStructure : ISControl
         }
     }
 
-    /// <summary>
-    /// Not implemented - use Syntetize() instead.
-    /// </summary>
-    /// <param name="data">The raw data for synthesis (unused).</param>
-    public void Syntetize(string[] data) => throw new NotImplementedException();
 }

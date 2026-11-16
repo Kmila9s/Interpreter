@@ -461,9 +461,4 @@ public class IfStructure : ISControl
         }
     }
 
-    /// <summary>
-    /// Synthesizes the behavior from an array of strings. This method is not implemented.
-    /// </summary>
-    /// <param name="data">The raw data for synthesis.</param>
-    public void Syntetize(string[] data) => throw new NotImplementedException();
 }

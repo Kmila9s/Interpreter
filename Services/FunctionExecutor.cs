@@ -115,14 +115,6 @@ public class FunctionExecutor
     }
 
     /// <summary>
-    /// Executes a user-defined function asynchronously.
-    /// </summary>
-    public async Task<object?> ExecuteFunctionAsync(string functionName, object[] arguments, HashSet<Variable> callerVariables)
-    {
-        return await Task.Run(() => ExecuteFunction(functionName, arguments, callerVariables));
-    }
-
-    /// <summary>
     /// Bench bug #19 perf: refreshes the cached scope's parameter Variables
     /// with the current call's arguments. The Variable instances stay the
     /// same (so the body's already-synthesised Operations remain valid);
@@ -235,7 +227,7 @@ public class FunctionExecutor
         }
 
         // Tokenize the body
-        Tokenizer tokenizer = new(string.Empty);
+        Tokenizer tokenizer = new();
         List<Token> allTokens = new();
 
         // Tokenize each line of the body
@@ -642,7 +634,7 @@ public class FunctionExecutor
             return;
         }
 
-        Tokenizer tokenizer = new(string.Empty);
+        Tokenizer tokenizer = new();
 
         // Tokenize each line of the body
         foreach (var line in procedure.BodyLines ?? Array.Empty<string>())
@@ -735,11 +727,4 @@ public class FunctionExecutor
     /// </summary>
     public int CallStackDepth => _callStack.Count;
 
-    /// <summary>
-    /// Gets the current call stack as a string (for debugging).
-    /// </summary>
-    public string GetCallStackTrace()
-    {
-        return string.Join(" -> ", _callStack.Reverse());
-    }
 }

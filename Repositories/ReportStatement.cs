@@ -118,6 +118,4 @@ public sealed class ReportStatement : ISControl
         return Task.CompletedTask;
     }
 
-    /// <summary>Not used — see <see cref="Syntetize()"/>.</summary>
-    public void Syntetize(string[] data) => throw new NotImplementedException();
 }

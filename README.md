@@ -7,8 +7,17 @@ This module is a core component of **Kmila-9s**, a project officially titled "Ap
 **Author:** Ulrich Tamayo Daniel
 **Email:** dulricht1700@alumno.ipn.mx
 **Email 2:** danielulrichtamayo@gmail.com
-**Version:** 1.9.0 (branch `v1.9.0`)
-**Last Updated:** 2026-10-08
+**Version:** 3.0.4 (branch `v3.0.4`)
+**Last Updated:** 2026-11-16
+
+> **Update 2026-11-16 (v3.0.1–v3.0.4, multi-HDL Phase 0)** — the engine is now
+> loaded through the app's language-neutral `Kmila.Frontend` (see
+> `App/Kmila/README.md` §7.3). In this repo: dead code and the never-implemented
+> `ISControl.Syntetize(string[])` / `IControl` stubs removed (v3.0.1);
+> `SourceElaborator` accepts every entity closer (`end;`, `end entity;`,
+> `end entity X;`, `end X;`) and components declared without `is`
+> (v3.0.4, GAP-ELAB-001); the `--test-delta` suites run to completion again and
+> are part of CI (see §7 and §10).
 
 > **Update 2026-10-08 (v1.9.0)** — schematic layout only; the simulation engine is
 > untouched. Added **obstacle-aware wire routing** for the block styles (RTL/Nodos):
@@ -1063,9 +1072,14 @@ foreach (var entity in entities)
 
 There are **two test surfaces** today:
 
-#### 7.1. xUnit regression suite (`Interpreter/Tests/`) — authoritative
+#### 7.1. Engine unit suites (`Interpreter/Tests/`) — authoritative
 
-Run with `dotnet test`. This is the surface to trust for regressions:
+Hand-rolled suites compiled into this project and run with
+`dotnet run -c Release -f net10.0 -- --test-delta` from the module root (the
+GHDL reference VCDs `reference_*.vcd` and `test_*.vhdl` fixtures are read from
+there). The process exit code is the total failure count; a test that throws
+counts as a failure without aborting the rest. Runs in CI since v3.0.4.
+(Moving them to an xUnit project is tracked in the multi-HDL handoff.)
 
 | Test file | Focus |
 |-----------|-------|
@@ -1085,7 +1099,7 @@ Run with `dotnet test`. This is the surface to trust for regressions:
 
 The corpus has grown to **54 `test*.vhdl` fixtures** (numbered through `test41`, plus named variants). It is a smoke/exploration harness, not a pass/fail gate. Rough coverage of the first fixtures:
 
-> **Repository hygiene:** the module root also carries leftover scratch artifacts that are **not part of the build or either test surface** — `Program.cs.1` (a stale copy of `Program.cs`), `run_delta_tests.cs`, and several loose golden/scratch VCDs (`counter_sim.vcd`, `reference_*.vcd`, `test_*.vcd`). They can be ignored/removed during cleanup; the authoritative VCD goldens used by tests live under `Interpreter/Tests/`.
+> **Repository hygiene:** `Program.cs.1` and `run_delta_tests.cs` were removed in v3.0.1. The `reference_*.vcd` files in the module root are **used** by `DeltaCycleEngineTests` (GHDL goldens); `counter_sim.vcd`, `test_output.vcd` and `test_*_counter.vcd` are scratch output.
 
 | Tests | Coverage |
 |-------|----------|
@@ -1410,6 +1424,40 @@ while (_streamer.Current != null)
 ---
 
 ## 10. Changelog
+
+### Version 3.0.4 (2026-11-16)
+
+*   **GAP-ELAB-001 — elaborator closer forms.** `SourceElaborator.EntityRe`
+    required whitespace after `end entity`, so the valid VHDL-93 closer
+    `end entity;` (and `end;`) hid the entity: structural designs were not
+    flattened and their outputs stayed undriven. `ComponentDeclRe` now also
+    accepts a component declaration without the optional `is`. End-to-end
+    regression: `ElaborationRegressionTests` (Tests repo).
+*   **`--test-delta` runs to completion and is in CI.** It aborted at its third
+    test, hiding failures behind it. All were stale tests, not engine bugs —
+    each checked against GHDL 6.0.0 where behaviour was in question:
+    *   Concurrent `a <= b; b <= a;` and `a <= b; b <= c; c <= a;` are
+        combinational loops; GHDL stops them at 0 ms by `--stop-delta`. The
+        tests now require Kmila to report the delta-cycle limit (it does)
+        instead of a one-shot swap; the history-recording test uses a
+        settling assignment.
+    *   VCD header is `1ps` by design (bench Phase D fix), not `1ns`.
+    *   A combinational process now synthesizes to logic instead of
+        `BLACKBOX_PROCESS`.
+    *   IEEE-lowering / nested-call tests used undeclared carrier names
+        (`"dummy"`) that the v1.17 undeclared-identifier check rightly rejects.
+    *   The delta harness now records a throwing test as a failure and keeps
+        going. `.gitlab-ci.yml` runs `-- --test-delta` (exit code = failures).
+
+### Version 3.0.1 (2026-11-15)
+
+*   Dead code removed after a repo-wide caller check: `run_delta_tests.cs`,
+    `DataStructure.cs`, `ISYard.cs`, the `IControl` interface and
+    `ISControl.Syntetize(string[])` with their 18 `NotImplementedException`
+    stubs, plus unused members (`ExecuteLegacyAsync`, `EvaluateAttribute`,
+    `ToIntegerSigned`, `ScanDirectory`, `PrintReport`, …). `Tokenizer` is built
+    with its new parameterless constructor.
+
 
 ### Declared-range (to/downto + bounds) fix (2026-10-06, branch `v1.7.0`)
 

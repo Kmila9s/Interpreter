@@ -26,7 +26,7 @@ namespace Interpreter.Services;
 /// <item>Added SkipComponentInstantiation() for structural VHDL constructs</item>
 /// </list>
 /// </remarks>
-public class Architecture : ISControl, IControl
+public class Architecture : ISControl
 {
     /// <summary>
     /// Gets the name of the architecture.
@@ -65,7 +65,7 @@ public class Architecture : ISControl, IControl
     /// </summary>
     public TypeRegistry CustomTypes { get; private set; } = new();
 
-    private Tokenizer _tokenizer = new(string.Empty);
+    private Tokenizer _tokenizer = new();
     private TokenStream _streamer = default!;
     private readonly OperationDetector _detector = new();
 
@@ -156,17 +156,6 @@ public class Architecture : ISControl, IControl
     public HashSet<Variable> GetAllSignals()
     {
         return [.. _ports, .. _generics, .. _signals];
-    }
-
-    /// <summary>
-    /// Executes the architecture asynchronously using the legacy sequential executor.
-    /// Use this method when delta cycle semantics are not required.
-    /// </summary>
-    /// <returns>A task representing the asynchronous operation.</returns>
-    public async Task ExecuteLegacyAsync()
-    {
-        Executer executer = new(Tasks);
-        await executer.ExecuteAsync();
     }
 
     /// <summary>
@@ -302,10 +291,6 @@ public class Architecture : ISControl, IControl
         progress.ReportPhase(1f, $"Architecture complete ({Tasks.Count} tasks)", ProcessingPhase.ParsingArchitecture, Name);
     }
 
-    /// <summary>
-    /// Synthesizes the behavior of the architecture.
-    /// </summary>
-    public void SyntetizeBehaviour() => SyntetizeBehaviour(CancellationToken.None);
 
     /// <summary>
     /// Synthesizes the behavior of the architecture.
@@ -349,7 +334,7 @@ public class Architecture : ISControl, IControl
 
     /// <summary>
     /// Synthesizes exactly one concurrent statement at the current stream position
-    /// and appends it to <see cref="Tasks"/>. Shared by <see cref="SyntetizeBehaviour()"/>
+    /// and appends it to <see cref="Tasks"/>. Shared by <see cref="SyntetizeBehaviour(CancellationToken)"/>
     /// (the architecture body) and <see cref="HandleBlockStatement"/> (a block body),
     /// so both parse the same set of constructs identically — including nested blocks.
     /// The active scope is <see cref="_assignmentVariables"/> (== <c>comparators</c>,
@@ -1073,18 +1058,6 @@ public class Architecture : ISControl, IControl
     }
 
     /// <summary>
-    /// Synthesizes a process.
-    /// </summary>
-    public void SyntetizeProcess()
-    {
-        _streamer.Expect(KEYWORDS); // process
-        if (_streamer.Current?.Value == "(")
-        {
-            
-        }
-    }
-
-    /// <summary>
     /// Synthesizes the assignations.
     /// </summary>
     public void SyntetizeAssingations()
@@ -1291,9 +1264,4 @@ public class Architecture : ISControl, IControl
         }
     }
 
-    /// <summary>
-    /// Synthesizes the behavior of the architecture from raw data.
-    /// </summary>
-    /// <param name="Behaviour">The raw data of the behavior.</param>
-    public void SyntetizeBehaviour(string[] Behaviour) => throw new NotImplementedException();
 }

@@ -23,3 +23,6 @@ build-test:
     image: mcr.microsoft.com/dotnet/sdk:10.0
     script:
         - dotnet run -c Release -f net10.0 -p:TargetFrameworks=net10.0
+        # Engine unit suites (delta cycles, synthesis, IEEE, practice, strictness…).
+        # Exit code = failure count; it was not in CI and silently rotted until v3.0.4.
+        - dotnet run -c Release -f net10.0 -p:TargetFrameworks=net10.0 --no-build -- --test-delta

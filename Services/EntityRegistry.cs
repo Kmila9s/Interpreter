@@ -131,46 +131,6 @@ public class EntityRegistry
     public IReadOnlyDictionary<string, List<ComponentInstance>> ComponentInstances => _componentInstances;
 
     /// <summary>
-    /// Scans a directory for VHDL files and discovers entity definitions.
-    /// </summary>
-    /// <param name="directoryPath">The directory to scan.</param>
-    /// <param name="recursive">Whether to scan subdirectories.</param>
-    /// <returns>The number of entities discovered.</returns>
-    public int ScanDirectory(string directoryPath, bool recursive = false)
-    {
-        if (!Directory.Exists(directoryPath))
-        {
-            return 0;
-        }
-
-        var searchOption = recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
-        var vhdlFiles = Directory.GetFiles(directoryPath, "*.vhdl", searchOption)
-            .Concat(Directory.GetFiles(directoryPath, "*.vhd", searchOption))
-            .Distinct()
-            .ToList();
-
-        int entitiesFound = 0;
-
-        foreach (var filePath in vhdlFiles)
-        {
-            if (_scannedFiles.Contains(filePath))
-                continue;
-
-            try
-            {
-                int found = ScanFile(filePath);
-                entitiesFound += found;
-            }
-            catch
-            {
-                // Ignore scanning errors
-            }
-        }
-
-        return entitiesFound;
-    }
-
-    /// <summary>
     /// Scans a single VHDL file for entity definitions.
     /// </summary>
     /// <param name="filePath">The file to scan.</param>
@@ -186,7 +146,7 @@ public class EntityRegistry
         _scannedFiles.Add(filePath);
 
         string[] lines = File.ReadAllLines(filePath);
-        var tokenizer = new Tokenizer(string.Empty);
+        var tokenizer = new Tokenizer();
 
         // Tokenize each line
         foreach (var line in lines)
