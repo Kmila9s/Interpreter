@@ -5,7 +5,7 @@ using Parser.Models;
 namespace Interpreter.Tests;
 
 /// <summary>
-/// Walks the Practice catalog and drives each <c>solution.vhdl</c> through
+/// Walks the Practice catalog and drives each VHDL solution through
 /// the simulation engine, asserting the run completes without throwing.
 ///
 /// Regression net for the numeric_std runtime path: the 51 exercises
@@ -28,7 +28,7 @@ public static class PracticeExerciseTests
 
     /// <summary>
     /// Walks <c>App/Kmila/Kmila.Shared/wwwroot/Practice/manifest.json</c> and
-    /// runs each exercise's <c>solution.vhdl</c> through the simulator.
+    /// runs each exercise's VHDL solution through the simulator.
     /// Returns the failure count (0 = full pass) so it composes with the
     /// other <c>--test-delta</c> suites.
     /// </summary>
@@ -49,7 +49,7 @@ public static class PracticeExerciseTests
         }
 
         var manifestDir = Path.GetDirectoryName(manifestPath)!;
-        IReadOnlyList<(string Id, string Folder)> exercises;
+        IReadOnlyList<(string Id, string Solution)> exercises;
         try
         {
             exercises = ReadManifest(manifestPath);
@@ -69,9 +69,9 @@ public static class PracticeExerciseTests
         int passed = 0, missing = 0;
         var failures = new Dictionary<string, List<string>>();
 
-        foreach (var (id, folder) in exercises)
+        foreach (var (id, solution) in exercises)
         {
-            var solutionPath = Path.Combine(manifestDir, folder, "solution.vhdl");
+            var solutionPath = Path.Combine(manifestDir, solution);
             if (!File.Exists(solutionPath))
             {
                 Console.WriteLine($"  [MISSING] {id}");
@@ -274,10 +274,11 @@ public static class PracticeExerciseTests
     }
 
     /// <summary>
-    /// Pulls (id, folder) from manifest.json. Other fields are intentionally
-    /// ignored — the suite cares about file location only.
+    /// Reads (id, solution path relative to the manifest) for every exercise.
+    /// This engine suite only exercises VHDL, so it takes each exercise's
+    /// <c>variants.vhdl.solution</c> (manifest schema v2).
     /// </summary>
-    private static IReadOnlyList<(string Id, string Folder)> ReadManifest(string path)
+    private static IReadOnlyList<(string Id, string Solution)> ReadManifest(string path)
     {
         using var stream = File.OpenRead(path);
         using var doc = JsonDocument.Parse(stream);
@@ -290,8 +291,11 @@ public static class PracticeExerciseTests
         {
             string id     = ex.TryGetProperty("id",     out var idEl)     ? idEl.GetString()     ?? "" : "";
             string folder = ex.TryGetProperty("folder", out var folderEl) ? folderEl.GetString() ?? "" : "";
-            if (!string.IsNullOrEmpty(id) && !string.IsNullOrEmpty(folder))
-                list.Add((id, folder));
+            string solution = ex.TryGetProperty("variants", out var variants)
+                              && variants.TryGetProperty("vhdl", out var vhdl)
+                              && vhdl.TryGetProperty("solution", out var solEl) ? solEl.GetString() ?? "" : "";
+            if (!string.IsNullOrEmpty(id) && !string.IsNullOrEmpty(folder) && !string.IsNullOrEmpty(solution))
+                list.Add((id, Path.Combine(folder, solution)));
         }
         return list;
     }
