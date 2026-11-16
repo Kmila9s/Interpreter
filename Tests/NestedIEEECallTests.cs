@@ -159,7 +159,8 @@ public static class NestedIEEECallTests
         var ctx = new SynthesisContext("test_entity");
         ctx.AddPort(addr);
         var outNet = ctx.GetOrCreateNet("idx", NetKind.Bus, 32, NetOrigin.Signal);
-        var op = new Operation("dummy", new HashSet<Variable> { addr, idx });
+        // Carrier text references only declared names; items are injected below.
+        var op = new Operation(addr.Name, new HashSet<Variable> { addr, idx });
         InjectItems(op, new object[] { outer });
         ConcurrentAssignSynthesizer.SynthesizeInto(op, outNet, ctx);
         var nl = ctx.Build();
@@ -199,7 +200,7 @@ public static class NestedIEEECallTests
         var ctx = new SynthesisContext("test_entity");
         ctx.AddPort(addr);
         var outNet = ctx.GetOrCreateNet("widen", NetKind.Bus, 16, NetOrigin.Signal);
-        var op = new Operation("dummy", new HashSet<Variable> { addr });
+        var op = new Operation(addr.Name, new HashSet<Variable> { addr });
         InjectItems(op, new object[] { outer });
         ConcurrentAssignSynthesizer.SynthesizeInto(op, outNet, ctx);
         var nl = ctx.Build();

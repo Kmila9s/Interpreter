@@ -32,7 +32,7 @@ public static class SynthesisTests
             ("Conditional when/else", TestConditional),
             ("Selected with/select", TestSelected),
             ("Clocked process → DFF", TestDff),
-            ("Process with non-clocked body falls back to BLACKBOX", TestProcessBlackbox),
+            ("Combinational process body synthesizes as logic, not BLACKBOX", TestProcessBlackbox),
             ("Clocked process with sync reset → DFF + MUX", TestClockedSyncReset),
             ("Clocked process with elsif chain → MUX cascade + DFF", TestClockedElsifChain),
             ("Combinational process with if → MUX, no DFF", TestCombinationalIfMux),
@@ -364,8 +364,10 @@ public static class SynthesisTests
     }
 
     /// <summary>
-    /// A non-clocked process body should fall through to BLACKBOX_PROCESS
-    /// with a Diagnostic explaining why.
+    /// A non-clocked (combinational) process body is lowered to logic since
+    /// the combinational-process synthesis landed; it used to fall through to
+    /// BLACKBOX_PROCESS. <c>process(a) begin y &lt;= a; end process;</c> must
+    /// produce cells that drive <c>y</c> and no blackbox / diagnostic.
     /// </summary>
     private static bool TestProcessBlackbox()
     {
@@ -379,8 +381,8 @@ public static class SynthesisTests
         var net = Synthesizer.Synthesize(entity);
         bool blackbox = net.Cells.Any(c => c.Kind == CellKind.BLACKBOX_PROCESS);
         bool hasDiag = net.Diagnostics.Any(d => d.Kind == "BlackboxProcess");
-        Console.WriteLine($"  blackbox={blackbox} diag={hasDiag}");
-        return blackbox && hasDiag;
+        Console.WriteLine($"  blackbox={blackbox} diag={hasDiag} cells={string.Join(",", net.Cells.Select(c => c.Kind))}");
+        return !blackbox && !hasDiag && net.Cells.Count > 0;
     }
 
     /// <summary>

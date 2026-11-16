@@ -68,7 +68,9 @@ public static class IEEELoweringEndToEndTests
             inputWidth > 1 ? NetKind.Bus : NetKind.Wire,
             inputWidth, NetOrigin.Signal);
 
-        var op = new Operation("dummy_raw_data", new HashSet<Variable> { input, resultVar });
+        // Carrier text must only reference declared names (the undeclared-
+        // identifier check rejects anything else); its items are replaced below.
+        var op = new Operation(input.Name, new HashSet<Variable> { input, resultVar });
         // Bypass parsing — push the items directly. This is what the
         // expression parser would produce after my v3.1 change.
         SetItems(op, items);

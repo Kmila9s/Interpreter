@@ -10,102 +10,75 @@ namespace Interpreter.Tests;
 public class DeltaCycleEngineTests
 {
     /// <summary>
-    /// Tests that signal swap works correctly with delta cycle semantics.
-    /// In VHDL, "a gets b" and "b gets a" should swap values because both read old values.
-    /// Without delta cycles: a becomes 1, b becomes 1 (wrong - not a swap!)
-    /// With delta cycles: a becomes 1, b becomes 0 (correct swap)
+    /// Concurrent <c>a &lt;= b; b &lt;= a;</c> is a combinational loop: each
+    /// delta both signals change and re-trigger each other, so the design never
+    /// settles. GHDL stops it at tick 0 ("simulation stopped @0ms by
+    /// --stop-delta=5000"); Kmila must likewise report the delta-cycle limit
+    /// instead of pretending the pair swapped once. (A one-shot swap only
+    /// happens inside a clocked process — covered by the GHDL comparison test
+    /// against reference_delta_swap.vcd.)
     /// </summary>
     public static async Task<bool> TestDeltaSwapBehavior()
     {
-        Console.WriteLine("=== Test: Delta Swap Behavior ===");
+        Console.WriteLine("=== Test: Concurrent swap is a combinational loop ===");
 
-        // Create two signals with initial values
         Variable signalA = new("a", "0", DATATYPES.STD_LOGIC) { PortType = PortType.INOUT };
         Variable signalB = new("b", "1", DATATYPES.STD_LOGIC) { PortType = PortType.INOUT };
-
         HashSet<Variable> signals = [signalA, signalB];
 
-        // Create operations: a <= b and b <= a
-        Operation opAB = new("a <= b", signals);
-        Operation opBA = new("b <= a", signals);
+        List<object> tasks = [new Operation("a <= b", signals), new Operation("b <= a", signals)];
 
-        List<object> tasks = [opAB, opBA];
-
-        // Create and initialize the delta cycle engine
         DeltaCycleEngine engine = new();
         engine.Initialize(signals, tasks);
 
-        Console.WriteLine($"Initial values: a = {signalA.Value}, b = {signalB.Value}");
-
-        // Run one time step (all delta cycles)
-        await engine.RunTimeStepAsync();
-
-        Console.WriteLine($"After delta cycle: a = {signalA.Value}, b = {signalB.Value}");
-
-        // Verify: a should be 1, b should be 0 (proper swap)
-        bool aCorrect = signalA.Value?.ToString() == "1";
-        bool bCorrect = signalB.Value?.ToString() == "0";
-
-        if (aCorrect && bCorrect)
+        try
         {
-            Console.WriteLine("PASS: Delta swap works correctly!");
-            return true;
-        }
-        else
-        {
-            Console.WriteLine($"FAIL: Expected a=1, b=0 but got a={signalA.Value}, b={signalB.Value}");
+            await engine.RunTimeStepAsync();
+            Console.WriteLine($"FAIL: loop settled at a={signalA.Value}, b={signalB.Value}; GHDL never settles");
             return false;
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains("Delta cycle limit"))
+        {
+            Console.WriteLine($"PASS: combinational loop detected ({ex.Message})");
+            return true;
         }
     }
 
     /// <summary>
-    /// Tests a chain of assignments: a gets b, b gets c, c gets a.
-    /// Initial values: a is "00", b is "01", c is "10".
-    /// Expected result: a is "01", b is "10", c is "00" (circular shift using old values).
+    /// Concurrent rotation <c>a &lt;= b; b &lt;= c; c &lt;= a;</c> with three
+    /// distinct values never settles (every delta all three change), like the
+    /// two-signal swap. GHDL stops it at tick 0 by --stop-delta; Kmila must
+    /// report the delta-cycle limit.
     /// </summary>
     public static async Task<bool> TestDeltaChainAssignment()
     {
-        Console.WriteLine("\n=== Test: Delta Chain Assignment ===");
+        Console.WriteLine("\n=== Test: Concurrent rotation is a combinational loop ===");
 
-        // Create three signals
         Variable signalA = new("a", "00", DATATYPES.STD_LOGIC_VECTOR) { PortType = PortType.INOUT, Size = 2 };
         Variable signalB = new("b", "01", DATATYPES.STD_LOGIC_VECTOR) { PortType = PortType.INOUT, Size = 2 };
         Variable signalC = new("c", "10", DATATYPES.STD_LOGIC_VECTOR) { PortType = PortType.INOUT, Size = 2 };
-
         HashSet<Variable> signals = [signalA, signalB, signalC];
 
-        // Create operations: a <= b, b <= c, c <= a
-        Operation opAB = new("a <= b", signals);
-        Operation opBC = new("b <= c", signals);
-        Operation opCA = new("c <= a", signals);
+        List<object> tasks =
+        [
+            new Operation("a <= b", signals),
+            new Operation("b <= c", signals),
+            new Operation("c <= a", signals),
+        ];
 
-        List<object> tasks = [opAB, opBC, opCA];
-
-        // Create and initialize the delta cycle engine
         DeltaCycleEngine engine = new();
         engine.Initialize(signals, tasks);
 
-        Console.WriteLine($"Initial values: a = {signalA.Value}, b = {signalB.Value}, c = {signalC.Value}");
-
-        // Run one time step
-        await engine.RunTimeStepAsync();
-
-        Console.WriteLine($"After delta cycle: a = {signalA.Value}, b = {signalB.Value}, c = {signalC.Value}");
-
-        // Verify: circular shift
-        bool aCorrect = signalA.Value?.ToString() == "01";  // was b's value
-        bool bCorrect = signalB.Value?.ToString() == "10";  // was c's value
-        bool cCorrect = signalC.Value?.ToString() == "00";  // was a's value
-
-        if (aCorrect && bCorrect && cCorrect)
+        try
         {
-            Console.WriteLine("PASS: Delta chain assignment works correctly!");
-            return true;
-        }
-        else
-        {
-            Console.WriteLine($"FAIL: Expected a=01, b=10, c=00 but got a={signalA.Value}, b={signalB.Value}, c={signalC.Value}");
+            await engine.RunTimeStepAsync();
+            Console.WriteLine($"FAIL: loop settled at a={signalA.Value}, b={signalB.Value}, c={signalC.Value}; GHDL never settles");
             return false;
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains("Delta cycle limit"))
+        {
+            Console.WriteLine($"PASS: combinational loop detected ({ex.Message})");
+            return true;
         }
     }
 
@@ -249,11 +222,9 @@ public class DeltaCycleEngineTests
 
         HashSet<Variable> signals = [signalA, signalB];
 
-        // Create swap operations
-        Operation opAB = new("a <= b", signals);
-        Operation opBA = new("b <= a", signals);
-
-        List<object> tasks = [opAB, opBA];
+        // One settling assignment (a concurrent swap would be a combinational
+        // loop that never settles — see TestDeltaSwapBehavior).
+        List<object> tasks = [new Operation("a <= b", signals)];
 
         // Create and initialize the delta cycle engine
         DeltaCycleEngine engine = new();
@@ -288,9 +259,9 @@ public class DeltaCycleEngineTests
         bool hasInitialA = historyA.Any(h => h.Item1 == 0 && h.Item2?.ToString() == "0");
         bool hasFinalA = historyA.Any(h => h.Item2?.ToString() == "1");
         bool hasInitialB = historyB.Any(h => h.Item1 == 0 && h.Item2?.ToString() == "1");
-        bool hasFinalB = historyB.Any(h => h.Item2?.ToString() == "0");
+        bool bUnchanged = historyB.All(h => h.Item2?.ToString() == "1");
 
-        if (hasInitialA && hasFinalA && hasInitialB && hasFinalB)
+        if (hasInitialA && hasFinalA && hasInitialB && bUnchanged)
         {
             Console.WriteLine("PASS: Signal history recorded correctly!");
 
@@ -304,7 +275,7 @@ public class DeltaCycleEngineTests
         {
             Console.WriteLine($"FAIL: History not recorded correctly");
             Console.WriteLine($"  hasInitialA={hasInitialA}, hasFinalA={hasFinalA}");
-            Console.WriteLine($"  hasInitialB={hasInitialB}, hasFinalB={hasFinalB}");
+            Console.WriteLine($"  hasInitialB={hasInitialB}, bUnchanged={bUnchanged}");
             return false;
         }
     }
@@ -431,7 +402,9 @@ public class DeltaCycleEngineTests
         // Verify VCD format
         bool hasDate = vcd.Contains("$date");
         bool hasVersion = vcd.Contains("$version");
-        bool hasTimescale = vcd.Contains("$timescale") && vcd.Contains("1ns");
+        // Body times are tick*1000+delta, i.e. picoseconds, so the header is
+        // always 1ps (SignalHistory.ExportToVcd; bench Phase D fix).
+        bool hasTimescale = vcd.Contains("$timescale") && vcd.Contains("1ps");
         bool hasVariables = vcd.Contains("$var") && vcd.Contains("clk") && vcd.Contains("counter");
         bool hasDumpvars = vcd.Contains("$dumpvars");
         bool hasTimeChanges = vcd.Contains("#1000") || vcd.Contains("#2000");
@@ -474,41 +447,50 @@ public class DeltaCycleEngineTests
         int passed = 0;
         int failed = 0;
 
+        // A test that throws counts as a failure; it must not abort the suite
+        // and hide the results of the tests after it.
+        static async Task<bool> Run(Func<Task<bool>> test)
+        {
+            try { return await test(); }
+            catch (Exception ex) { Console.WriteLine($"FAIL: unhandled {ex.GetType().Name}: {ex.Message}"); return false; }
+        }
+        static Task<bool> RunSync(Func<bool> test) => Run(() => Task.FromResult(test()));
+
         // Test 1: Signal Scheduler
-        if (TestSignalScheduler()) passed++; else failed++;
+        if (await RunSync(TestSignalScheduler)) passed++; else failed++;
 
         // Test 2: Scheduled Operation
-        if (TestScheduledOperation()) passed++; else failed++;
+        if (await RunSync(TestScheduledOperation)) passed++; else failed++;
 
         // Test 3: Process Scheduler
-        if (TestProcessSchedulerSensitivity()) passed++; else failed++;
+        if (await RunSync(TestProcessSchedulerSensitivity)) passed++; else failed++;
 
         // Test 4: Delta Swap
-        if (await TestDeltaSwapBehavior()) passed++; else failed++;
+        if (await Run(TestDeltaSwapBehavior)) passed++; else failed++;
 
         // Test 5: Delta Chain
-        if (await TestDeltaChainAssignment()) passed++; else failed++;
+        if (await Run(TestDeltaChainAssignment)) passed++; else failed++;
 
         // Test 6: Signal History Recording
-        if (await TestSignalHistoryRecording()) passed++; else failed++;
+        if (await Run(TestSignalHistoryRecording)) passed++; else failed++;
 
         // Test 7: Signal History Multiple Steps
-        if (await TestSignalHistoryMultipleSteps()) passed++; else failed++;
+        if (await Run(TestSignalHistoryMultipleSteps)) passed++; else failed++;
 
         // Test 8: VCD Export
-        if (TestVcdExport()) passed++; else failed++;
+        if (await RunSync(TestVcdExport)) passed++; else failed++;
 
         // Test 9: GHDL Reference Comparison (Counter)
-        if (await TestGhdlReferenceComparison()) passed++; else failed++;
+        if (await Run(TestGhdlReferenceComparison)) passed++; else failed++;
 
         // Test 10: GHDL Delta Swap Comparison
-        if (TestGhdlDeltaSwapComparison()) passed++; else failed++;
+        if (await RunSync(TestGhdlDeltaSwapComparison)) passed++; else failed++;
 
         // Test 11: GHDL Combinational Logic Comparison
-        if (TestGhdlCombinationalComparison()) passed++; else failed++;
+        if (await RunSync(TestGhdlCombinationalComparison)) passed++; else failed++;
 
         // Test 12: GHDL Shift Register Comparison
-        if (TestGhdlShiftRegisterComparison()) passed++; else failed++;
+        if (await RunSync(TestGhdlShiftRegisterComparison)) passed++; else failed++;
 
         Console.WriteLine("\n========================================");
         Console.WriteLine($"Results: {passed} passed, {failed} failed");
