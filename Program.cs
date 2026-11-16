@@ -990,9 +990,7 @@ class Program
 
         foreach (var raw in rawLines)
         {
-            string codeOnly = raw;
-            int commentIdx = codeOnly.IndexOf("--", StringComparison.Ordinal);
-            if (commentIdx >= 0) codeOnly = codeOnly[..commentIdx];
+            string codeOnly = VhdlText.StripLineComment(raw);
             string trimmed = codeOnly.TrimEnd();
 
             if (trimmed.Length == 0)
@@ -1017,9 +1015,9 @@ class Program
             //   dir : in STD_LOGIC;  -- '1' = up, '0' = down
             //   q   : out STD_LOGIC_VECTOR(3 downto 0)
             // );)
-            // ends up inside the joined buffer; the tokenizer's
-            // `line.Split("--")[0]` then deletes the rest of the joined
-            // string — including subsequent ports and the closing `);` —
+            // ends up inside the joined buffer, and stripping the comment
+            // from the joined line then deletes the rest of it —
+            // including subsequent ports and the closing `);` —
             // and the streamer reports the next `end entity …` as an
             // unexpected keyword. Using `codeOnly` keeps the comment out
             // of the buffer entirely.

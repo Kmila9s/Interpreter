@@ -61,9 +61,9 @@ public static class PackageSubtypeScanner
         try { src = File.ReadAllText(filePath); }
         catch { return; }
 
-        // Strip line-comments -- they can hide inside package bodies and
-        // confuse the greedy match.
-        src = Regex.Replace(src, @"--[^\n]*", string.Empty);
+        // Strip line-comments (string-aware) -- they can hide inside package
+        // bodies and confuse the greedy match.
+        src = VhdlText.StripLineComments(src);
 
         var registry = PackageRegistry.Instance;
 
