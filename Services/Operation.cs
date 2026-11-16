@@ -99,6 +99,10 @@ public class Operation : IOperation {
     /// </summary>
     public int SourceLine { get; set; }
 
+    /// <summary>A validation error about this operation's target, located at its line and name.</summary>
+    private Parser.Models.ValidationException ResultError(string message) =>
+        new(message, SourceLine, 0, Result?.Name);
+
     /// <summary>
     /// When the assignment target is an indexed element of a vector signal
     /// (e.g. <c>output(0) &lt;= …</c>), this is the integer index. Null for
@@ -221,8 +225,7 @@ public class Operation : IOperation {
         if (isAssignmentStatement &&
             Result is { IsPort: true, PortType: Constants.PortType.IN })
         {
-            throw new Parser.Models.ValidationException(
-                $"cannot assign to input port \"{Result.Name}\"", SourceLine, 0);
+            throw ResultError($"cannot assign to input port \"{Result.Name}\"");
         }
 
         _data = tokenizer.TokenizeLineReturn(RawData);
@@ -600,7 +603,7 @@ public class Operation : IOperation {
                     else
                     {
                         throw new Parser.Models.ParserException(
-                            $"no declaration for \"{currentItem}\"", SourceLine, 0);
+                            $"no declaration for \"{currentItem}\"", SourceLine, 0, currentItem);
                     }
                 }
                 else
@@ -1241,9 +1244,7 @@ public class Operation : IOperation {
             {
                 string lhsClass = lhsScalar ? "std_logic" : "std_logic_vector";
                 string rhsClass = rhsScalar ? "std_logic" : "std_logic_vector";
-                throw new Parser.Models.ValidationException(
-                    $"type mismatch: cannot assign a {rhsClass} value to {lhsClass} signal \"{Result.Name}\"",
-                    SourceLine, 0);
+                throw ResultError($"type mismatch: cannot assign a {rhsClass} value to {lhsClass} signal \"{Result.Name}\"");
             }
 
             // C5 — width mismatch. Only on RELIABLE widths (HasDeclaredRange LHS,
@@ -1269,9 +1270,7 @@ public class Operation : IOperation {
                 rhsW ??= ExpressionWidthInference.TryComputeWidth(rawRhs, Variables);
 
                 if (rhsW is int w && lhsW != w)
-                    throw new Parser.Models.ValidationException(
-                        $"width mismatch: {lhsW}-bit signal \"{Result.Name}\" assigned a {w}-bit value",
-                        SourceLine, 0);
+                    throw ResultError($"width mismatch: {lhsW}-bit signal \"{Result.Name}\" assigned a {w}-bit value");
             }
             return;
         }
@@ -1282,18 +1281,14 @@ public class Operation : IOperation {
 
         // C4 — a concatenation is always an array, so it is illegal into a scalar target.
         if (lhsScalar && ExpressionWidthInference.HasTopLevelConcat(rawRhs))
-            throw new Parser.Models.ValidationException(
-                $"type mismatch: cannot assign a std_logic_vector value to std_logic signal \"{Result.Name}\"",
-                SourceLine, 0);
+            throw ResultError($"type mismatch: cannot assign a std_logic_vector value to std_logic signal \"{Result.Name}\"");
 
         // C5 — compare a fully-certain RHS width against a RELIABLE LHS width.
         if (lhsVector && Result.HasDeclaredRange && Result.Size > 0)
         {
             int? exprW = ExpressionWidthInference.TryComputeWidth(rawRhs, Variables);
             if (exprW is int ew && ew != Result.Size)
-                throw new Parser.Models.ValidationException(
-                    $"width mismatch: {Result.Size}-bit signal \"{Result.Name}\" assigned a {ew}-bit value",
-                    SourceLine, 0);
+                throw ResultError($"width mismatch: {Result.Size}-bit signal \"{Result.Name}\" assigned a {ew}-bit value");
         }
     }
 
@@ -1429,7 +1424,7 @@ public class Operation : IOperation {
         if (!knownCallable)
         {
             throw new Parser.Models.ParserException(
-                $"no declaration for \"{functionName}\"", SourceLine, 0);
+                $"no declaration for \"{functionName}\"", SourceLine, 0, functionName);
         }
 
         // Return a stub variable representing an unresolved function result
