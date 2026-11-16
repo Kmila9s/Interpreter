@@ -15,10 +15,4 @@ public interface ISControl {
     /// </summary>
     void Syntetize();
 
-    /// <summary>
-    /// Analyzes and prepares the control structure's behavior from a given set of raw data lines.
-    /// </summary>
-    /// <param name="RawData">An array of strings representing the lines of code that define the behavior.</param>
-    void Syntetize(string[] RawData);
-    
 }

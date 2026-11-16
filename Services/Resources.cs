@@ -879,42 +879,4 @@ public class Resources
         }
     }
 
-    /// <summary>
-    /// Generates a formatted resource report.
-    /// </summary>
-    /// <param name="targetFPGA">Target FPGA family (default: "Generic")</param>
-    /// <returns>Formatted string with resource usage</returns>
-    public string GetReport(string targetFPGA = "Generic")
-    {
-        return $@"
-╔══════════════════════════════════════════════════════╗
-║  Resource Estimation Report - {_entity.Name,-20} ║
-╠══════════════════════════════════════════════════════╣
-║  Target FPGA: {targetFPGA,-38} ║
-╠══════════════════════════════════════════════════════╣
-║  Flip-Flops:      {FlipFlops,8} (Accuracy: ~95%)     ║
-║  LUTs:            {LUTs,8} (Accuracy: ~70%)     ║
-║  DSP Slices:      {DSPSlices,8} (Accuracy: ~85%)     ║
-║  BRAM Blocks:     {BRAMBlocks,8:F1} (Accuracy: ~85%)     ║
-║  I/O Pins:        {IOPins,8} (Exact)            ║
-║  Clock Domains:   {ClockDomains,8} (Exact)            ║
-╠══════════════════════════════════════════════════════╣
-║  Clock Signals: {string.Join(", ", ClockSignals),-32} ║
-╚══════════════════════════════════════════════════════╝
-
-Note: Estimates are based on typical synthesis patterns.
-      Actual resource usage may vary ±20% depending on:
-      - Synthesis tool optimizations
-      - Target FPGA architecture
-      - Design constraints and directives
-";
-    }
-
-    /// <summary>
-    /// Prints the resource report to console.
-    /// </summary>
-    public void PrintReport(string targetFPGA = "Generic")
-    {
-        Console.WriteLine(GetReport(targetFPGA));
-    }
 }

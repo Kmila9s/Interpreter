@@ -10,7 +10,7 @@ namespace Interpreter.Services;
 /// <summary>
 /// Represents a VHDL process.
 /// </summary>
-public class Process : ISControl, IControl
+public class Process : ISControl
 {
     /// <summary>
     /// Gets the sensitive list of the process.
@@ -51,7 +51,7 @@ public class Process : ISControl, IControl
     /// <summary>
     /// F-G-13 MVP: true when this process's body contains any
     /// <see cref="Interpreter.Repositories.WaitForStatement"/>. Set during
-    /// <see cref="SyntetizeBehaviour()"/>. The engine uses this to decide
+    /// <see cref="SyntetizeBehaviour(CancellationToken)"/>. The engine uses this to decide
     /// whether the process is time-driven (F-G-13 path) or
     /// sensitivity-driven (legacy path via
     /// <see cref="ProcessScheduler"/>).
@@ -279,11 +279,6 @@ public class Process : ISControl, IControl
         return false;
     }
 
-    /// <summary>
-    /// Synthesizes the process from raw data.
-    /// </summary>
-    /// <param name="rawProcess">The raw data of the process.</param>
-    public void Syntetize(string[] rawProcess) => throw new NotImplementedException();
 
     /// <summary>
     /// Synthesizes the sensitive list of the process.
@@ -312,10 +307,6 @@ public class Process : ISControl, IControl
         }
     }
 
-    /// <summary>
-    /// Synthesizes the behavior of the process.
-    /// </summary>
-    public void SyntetizeBehaviour() => SyntetizeBehaviour(CancellationToken.None);
 
     /// <summary>
     /// Synthesizes the behavior of the process.
@@ -582,9 +573,4 @@ public class Process : ISControl, IControl
         }
     }
 
-    /// <summary>
-    /// Synthesizes the behavior of the process from raw data.
-    /// </summary>
-    /// <param name="strings">The raw data of the behavior.</param>
-    public void SyntetizeBehaviour(string[] strings) => throw new NotImplementedException();
 }

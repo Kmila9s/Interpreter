@@ -170,7 +170,4 @@ public sealed class AssertStatement : ISControl
         return false;
     }
 
-    /// <summary>Not supported for assert statements.</summary>
-    /// <param name="data">Unused.</param>
-    public void Syntetize(string[] data) => throw new NotImplementedException();
 }

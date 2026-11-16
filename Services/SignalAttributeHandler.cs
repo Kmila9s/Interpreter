@@ -263,48 +263,4 @@ public class SignalAttributeHandler
         _currentTimeMoment = 0;
         _tickResolutionNs = 1;
     }
-
-    /// <summary>Name-based dispatch used by <see cref="ParseAttributeExpression"/>.</summary>
-    public object EvaluateAttribute(string signalName, string attributeName, HashSet<Variable> variables)
-    {
-        var signal = variables.FirstOrDefault(v => v.Name.Equals(signalName, StringComparison.OrdinalIgnoreCase))
-                     ?? throw new InvalidOperationException($"Signal '{signalName}' not found for attribute evaluation");
-        return attributeName.ToLower() switch
-        {
-            "event"      => GetEvent(signal),
-            "last_value" => GetLastValue(signal),
-            "stable"     => GetStable(signal),
-            "active"     => GetActive(signal),
-            _            => throw new NotSupportedException($"Signal attribute '{attributeName}' is not supported")
-        };
-    }
-
-    /// <summary>
-    /// Parses and evaluates a source-string signal attribute expression like
-    /// "clk'event". Kept for legacy paths that arrive with raw strings; the
-    /// engine's hot loop now goes through the identity-keyed API above.
-    /// </summary>
-    public (bool isAttribute, string signalName, string attributeName, object value) ParseAttributeExpression(
-        string expression, HashSet<Variable> variables)
-    {
-        if (!expression.Contains("'")) return (false, "", "", null!);
-        int apostropheIndex = expression.IndexOf("'");
-        if (apostropheIndex == 0) return (false, "", "", null!);
-
-        string signalName = expression[..apostropheIndex].Trim();
-        string attributeName = expression[(apostropheIndex + 1)..].Trim();
-        string[] validAttributes = ["event", "last_value", "stable", "active", "left", "right", "high", "low", "length", "range"];
-        string baseAttribute = attributeName.Split(' ', '(', ')', '=')[0].ToLower();
-        if (!validAttributes.Contains(baseAttribute)) return (false, "", "", null!);
-
-        try
-        {
-            var value = EvaluateAttribute(signalName, baseAttribute, variables);
-            return (true, signalName, baseAttribute, value);
-        }
-        catch
-        {
-            return (false, "", "", null!);
-        }
-    }
 }

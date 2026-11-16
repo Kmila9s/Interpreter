@@ -132,43 +132,6 @@ public static class StandardFunctions
     }
 
     /// <summary>
-    /// Converts unsigned to integer.
-    /// Handles VHDL meta-values ('U', 'X', 'Z') by returning 0.
-    /// </summary>
-    public static int ToIntegerUnsigned(string slv)
-    {
-        string cleaned = slv.Replace("\"", "").Replace("'", "").Trim();
-        if (string.IsNullOrEmpty(cleaned)) return 0;
-        if (ContainsMetaValues(cleaned)) return 0;
-        try { return Convert.ToInt32(cleaned, 2); }
-        catch { return 0; }
-    }
-
-    /// <summary>
-    /// Converts signed to integer (2's complement).
-    /// Handles VHDL meta-values ('U', 'X', 'Z') by returning 0.
-    /// </summary>
-    public static int ToIntegerSigned(string slv)
-    {
-        string cleaned = slv.Replace("\"", "").Replace("'", "").Trim();
-        if (string.IsNullOrEmpty(cleaned)) return 0;
-        if (ContainsMetaValues(cleaned)) return 0;
-
-        try
-        {
-            // Check sign bit
-            if (cleaned[0] == '1')
-            {
-                // Negative number - 2's complement
-                int magnitude = Convert.ToInt32(cleaned, 2);
-                return magnitude - (1 << cleaned.Length);
-            }
-            return Convert.ToInt32(cleaned, 2);
-        }
-        catch { return 0; }
-    }
-
-    /// <summary>
     /// Resizes a std_logic_vector/unsigned/signed to new width.
     /// </summary>
     public static string Resize(string value, int newWidth)
@@ -185,22 +148,6 @@ public static class StandardFunctions
             // Extend with zeros (for unsigned) or sign extend (for signed)
             return cleaned.PadLeft(newWidth, '0');
         }
-    }
-
-    /// <summary>
-    /// Sign-extends a vector to new width.
-    /// </summary>
-    public static string SignExtend(string value, int newWidth)
-    {
-        string cleaned = value.Replace("\"", "").Replace("'", "");
-
-        if (cleaned.Length >= newWidth)
-        {
-            return cleaned.Substring(cleaned.Length - newWidth);
-        }
-
-        char signBit = cleaned.Length > 0 ? cleaned[0] : '0';
-        return cleaned.PadLeft(newWidth, signBit);
     }
 
     /// <summary>
@@ -223,20 +170,6 @@ public static class StandardFunctions
         if (amount >= cleaned.Length) return new string('0', cleaned.Length);
 
         return new string('0', amount) + cleaned.Substring(0, cleaned.Length - amount);
-    }
-
-    /// <summary>
-    /// Performs arithmetic shift right (preserves sign bit).
-    /// </summary>
-    public static string ShiftRightArithmetic(string value, int amount)
-    {
-        string cleaned = value.Replace("\"", "").Replace("'", "");
-        if (cleaned.Length == 0) return cleaned;
-
-        char signBit = cleaned[0];
-        if (amount >= cleaned.Length) return new string(signBit, cleaned.Length);
-
-        return new string(signBit, amount) + cleaned.Substring(0, cleaned.Length - amount);
     }
 
     /// <summary>

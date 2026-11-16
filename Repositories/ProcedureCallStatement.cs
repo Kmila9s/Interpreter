@@ -238,7 +238,7 @@ public class ProcedureCallStatement : ISControl
         // wait/report/assert/nested-call dispatch stays in sync between
         // registration-time synth (SynthesizeProcedureBody) and this
         // call-time resolve.
-        var tokenizer = new Parser.Repositories.Tokenizer(string.Empty);
+        var tokenizer = new Parser.Repositories.Tokenizer();
         foreach (var line in substituted.Split('\n'))
         {
             if (string.IsNullOrWhiteSpace(line)) continue;
@@ -307,7 +307,7 @@ public class ProcedureCallStatement : ISControl
 
         string substituted = SubstituteFormalsInBody(def.BodyRaw, renameMap);
 
-        var tokenizer = new Parser.Repositories.Tokenizer(string.Empty);
+        var tokenizer = new Parser.Repositories.Tokenizer();
         foreach (var line in substituted.Split('\n'))
         {
             if (!string.IsNullOrWhiteSpace(line))
@@ -482,51 +482,6 @@ public class ProcedureCallStatement : ISControl
         !string.IsNullOrEmpty(t) && (char.IsLetter(t[0]) || t[0] == '_');
 
     /// <summary>
-    /// F-G-12 (2026-07-18): renders the argument tokens as a printable
-    /// message. Mirrors <see cref="ReportStatement.ExecuteAsync"/>'s render
-    /// loop so nested-procedure and top-level reports produce the same
-    /// output shape (string literals unquoted, tokens joined with spaces).
-    /// </summary>
-    private static string RenderReport(List<string> tokens)
-    {
-        var sb = new StringBuilder();
-        bool needSpace = false;
-        void Append(string s)
-        {
-            if (s.Length == 0) return;
-            if (needSpace) sb.Append(' ');
-            sb.Append(s);
-            needSpace = true;
-        }
-        for (int i = 0; i < tokens.Count; i++)
-        {
-            var t = tokens[i];
-            if (t.Length >= 2 && t.StartsWith('"') && t.EndsWith('"'))
-            {
-                Append(t.Substring(1, t.Length - 2));
-                continue;
-            }
-            if (t.StartsWith('"'))
-            {
-                var frag = new StringBuilder(t.Substring(1));
-                while (++i < tokens.Count && !tokens[i].EndsWith('"'))
-                {
-                    frag.Append(' ').Append(tokens[i]);
-                }
-                if (i < tokens.Count)
-                {
-                    var last = tokens[i];
-                    frag.Append(' ').Append(last.Substring(0, last.Length - 1));
-                }
-                Append(frag.ToString());
-                continue;
-            }
-            Append(t);
-        }
-        return sb.ToString();
-    }
-
-    /// <summary>
     /// Synthesizes the procedure call from the token stream.
     /// </summary>
     public void Syntetize()
@@ -633,11 +588,6 @@ public class ProcedureCallStatement : ISControl
 #endif
     }
 
-    /// <summary>
-    /// Not implemented - use Syntetize() instead.
-    /// </summary>
-    /// <param name="data">The raw data for synthesis (unused).</param>
-    public void Syntetize(string[] data) => throw new NotImplementedException();
 
     /// <summary>
     /// Checks if a statement is a procedure call (identifier followed by '(' or ';').

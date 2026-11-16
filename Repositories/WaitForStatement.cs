@@ -241,7 +241,4 @@ public sealed class WaitForStatement : ISControl
     /// <returns>A completed task.</returns>
     public Task ExecuteAsync() => Task.CompletedTask; // Handled by the engine specially.
 
-    /// <summary>Not supported for wait statements.</summary>
-    /// <param name="data">Unused.</param>
-    public void Syntetize(string[] data) => throw new NotImplementedException();
 }
