@@ -23,14 +23,8 @@ internal static class ConditionalAssignSynthesizer
         if (ca.Target is null || ca.Branches.Count == 0) return;
 
         // Resolve LHS net.
-        var targetVar = ca.Target;
-        int targetWidth = targetVar.Type == Constants.DATATYPES.STD_LOGIC_VECTOR
-            ? Math.Max(1, targetVar.Size) : 1;
-        var outNet = ctx.GetOrCreateNet(
-            ca.TargetName,
-            targetWidth > 1 ? NetKind.Bus : NetKind.Wire,
-            targetWidth,
-            targetVar.IsPort ? NetOrigin.PortOut : NetOrigin.Signal);
+        var outNet = ConcurrentAssignSynthesizer.TargetNet(ca.Destination, ca.Target, ctx);
+        int targetWidth = outNet.Width;
         // Source-line key: a single rebuilt VHDL-like string covering
         // the whole when/else cascade. Used by the Naive view to group
         // every MUX in the cascade visually.

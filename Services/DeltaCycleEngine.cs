@@ -450,10 +450,10 @@ public class DeltaCycleEngine : IDisposable
                     break;
                 case Models.DynamicIndex dyni:
                     if (dyni.Source is not null) inputs.Add(dyni.Source);
-                    if (dyni.IndexSource is not null) inputs.Add(dyni.IndexSource);
+                    if (dyni.Index.Source is not null) inputs.Add(dyni.Index.Source);
                     // Expression-mode DynamicIndex may read any signal in
                     // its scope. Mark dynamic so we run unconditionally.
-                    if (dyni.IndexExpression != null) dynamic = true;
+                    if (dyni.Index.Expression != null) dynamic = true;
                     break;
                 case Models.DeferredFunction:
                     // User / deferred function args reach into call-time
@@ -1806,7 +1806,7 @@ public class DeltaCycleEngine : IDisposable
         Process process,
         Interpreter.Repositories.ProcedureCallStatement call)
     {
-        var tasks = call.ResolveBoundBody(_signalScheduler, out var outMap, out var boundScope);
+        var tasks = call.ResolveBoundBody(_signalScheduler, out var boundScope);
         if (tasks.Count == 0)
         {
             // Legacy fallback — procedure isn't registered in FunctionRegistry
@@ -1821,7 +1821,6 @@ public class DeltaCycleEngine : IDisposable
             Tasks = tasks,
             InnerPc = 0,
             CallRef = call,
-            OutMap = outMap,
             BoundScope = boundScope,
         };
         process.Frames.Push(frame);
@@ -1904,43 +1903,10 @@ public class DeltaCycleEngine : IDisposable
         catch (Interpreter.Models.ReturnException)
         {
             // Early `return;` inside the procedure — treat as normal
-            // completion so the write-back still fires and the frame pops.
+            // completion so the frame pops.
         }
 
-        ApplyProcedureWriteBack(frame);
         return false;
-    }
-
-    /// <summary>
-    /// Phase 3 (2026-07-22): copies final formal values back to
-    /// caller-side actuals for Out/InOut variable formals at procedure
-    /// completion (per VHDL LRM: write-back is visible only after the
-    /// procedure returns, never at intermediate suspend points).
-    /// Signal-class formals need no write-back — the textual rename in
-    /// <see cref="ProcedureCallStatement.ResolveBoundBody"/> routes
-    /// <c>&lt;=</c> in the body directly at the actual signal, so writes
-    /// already flow through <see cref="_signalScheduler"/> during
-    /// execution.
-    /// </summary>
-    private void ApplyProcedureWriteBack(Interpreter.Models.ProcedureFrame frame)
-    {
-        if (frame.OutMap.Count == 0) return;
-        foreach (var kv in frame.OutMap)
-        {
-            var param = kv.Key;
-            var actualVar = kv.Value;
-            if (param.Mode != Interpreter.Models.ParameterMode.Out
-                && param.Mode != Interpreter.Models.ParameterMode.InOut)
-                continue;
-            // The rebuilt Operations bound their assignment targets to the
-            // ACTUAL variable directly (thanks to textual rename during
-            // ResolveBoundBody), so :=-style variable writes have already
-            // landed on actualVar.Value at execution time. This loop is
-            // reserved for future variants where formal-scope isolation
-            // requires an explicit copy — currently a no-op guard.
-            _ = param;
-            _ = actualVar;
-        }
     }
 
     /// <summary>

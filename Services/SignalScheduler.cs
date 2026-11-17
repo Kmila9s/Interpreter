@@ -1,3 +1,4 @@
+using Interpreter.Models;
 using Parser.Models;
 
 namespace Interpreter.Services;
@@ -9,11 +10,13 @@ namespace Interpreter.Services;
 /// <param name="NewValue">The new value to assign.</param>
 /// <param name="Delay">Optional delay for "after X ns" syntax.</param>
 /// <param name="SourceLine">Source line number that produced this update.</param>
+/// <param name="Range">Indices (as written) of the part written, or null for the whole signal.</param>
 public record SignalUpdate(
     Variable Target,
     object NewValue,
     TimeSpan? Delay = null,
-    int SourceLine = 0
+    int SourceLine = 0,
+    (int Left, int Right)? Range = null
 );
 
 /// <summary>
@@ -58,17 +61,6 @@ public class SignalScheduler
     }
 
     /// <summary>
-    /// Pending per-bit writes for the current delta cycle, keyed by target
-    /// signal. Multiple per-bit assignments to the same vector merge here
-    /// (one entry per affected bit index) and are applied as a single
-    /// vector update at <see cref="ApplyCurrentUpdatesWithLines"/> time —
-    /// otherwise the queue's last-wins semantics would let one bit clobber
-    /// the seven others when an architecture does
-    /// <c>output(0) &lt;= …; output(1) &lt;= …; …</c>. Bench Phase E bug #5.
-    /// </summary>
-    private readonly Dictionary<Variable, Dictionary<int, (char bit, int sourceLine)>> _pendingBitWrites = new();
-
-    /// <summary>
     /// F-G-08 pass 2 (2026-07-16): reusable scratch buffer returned by
     /// <see cref="ApplyCurrentUpdatesWithLines"/>. The caller consumes the
     /// returned dictionary synchronously before the next apply call (see
@@ -85,29 +77,13 @@ public class SignalScheduler
     /// <param name="target">The target signal to update.</param>
     /// <param name="newValue">The new value to assign.</param>
     /// <param name="sourceLine">Source line number that produced this update.</param>
-    public void Schedule(Variable target, object newValue, int sourceLine = 0)
+    /// <param name="range">Indices of the part written (e.g. <c>v(3 downto 2)</c>), or null for the whole signal.
+    /// Part writes keep their statement order relative to every other write of the same delta.</param>
+    public void Schedule(Variable target, object newValue, int sourceLine = 0, (int Left, int Right)? range = null)
     {
         lock (_lock)
         {
-            _currentDeltaUpdates.Enqueue(new SignalUpdate(target, newValue, null, sourceLine));
-        }
-    }
-
-    /// <summary>
-    /// Schedules a single-bit update against an element of a vector signal.
-    /// Multiple bit writes to the same target within the same delta cycle
-    /// merge per index rather than clobbering each other. Bench bug #5 fix.
-    /// </summary>
-    public void ScheduleBitWrite(Variable target, int bitIndex, char bitValue, int sourceLine = 0)
-    {
-        lock (_lock)
-        {
-            if (!_pendingBitWrites.TryGetValue(target, out var bits))
-            {
-                bits = new Dictionary<int, (char, int)>();
-                _pendingBitWrites[target] = bits;
-            }
-            bits[bitIndex] = (bitValue, sourceLine);
+            _currentDeltaUpdates.Enqueue(new SignalUpdate(target, newValue, null, sourceLine, range));
         }
     }
 
@@ -117,7 +93,7 @@ public class SignalScheduler
     /// `TimeSpan` so sub-100ns delays (1 ns, 10 ns) round correctly.
     /// Bench bug #8 fix.
     /// </summary>
-    public void ScheduleAfterNs(Variable target, object newValue, long delayNs, int sourceLine = 0)
+    public void ScheduleAfterNs(Variable target, object newValue, long delayNs, int sourceLine = 0, (int Left, int Right)? range = null)
     {
         lock (_lock)
         {
@@ -129,34 +105,7 @@ public class SignalScheduler
                 queue = new Queue<SignalUpdate>();
                 _futureUpdates[futureTick] = queue;
             }
-            queue.Enqueue(new SignalUpdate(target, newValue, TimeSpan.FromTicks(delayNs * 10), sourceLine));
-        }
-    }
-
-    /// <summary>
-    /// Schedules a signal update for a future time.
-    /// Used for "signal &lt;= value after X ns" syntax.
-    /// </summary>
-    /// <param name="target">The target signal to update.</param>
-    /// <param name="newValue">The new value to assign.</param>
-    /// <param name="delay">The delay before the assignment takes effect.</param>
-    /// <param name="currentTick">The current simulation tick.</param>
-    /// <param name="tickResolutionNs">The resolution of a single tick in nanoseconds.</param>
-    public void ScheduleAfter(Variable target, object newValue, TimeSpan delay, ulong currentTick, int tickResolutionNs = 10)
-    {
-        lock (_lock)
-        {
-            // Calculate the future tick when this update should be applied
-            ulong delayTicks = (ulong)(delay.TotalSeconds * 1_000_000_000.0 / tickResolutionNs);
-            ulong futureTick = currentTick + delayTicks;
-
-            if (!_futureUpdates.TryGetValue(futureTick, out var queue))
-            {
-                queue = new Queue<SignalUpdate>();
-                _futureUpdates[futureTick] = queue;
-            }
-
-            queue.Enqueue(new SignalUpdate(target, newValue, delay));
+            queue.Enqueue(new SignalUpdate(target, newValue, TimeSpan.FromTicks(delayNs * 10), sourceLine, range));
         }
     }
 
@@ -185,20 +134,9 @@ public class SignalScheduler
     /// </summary>
     private static object ExpandAggregateMarker(object newValue, Variable target)
     {
-        if (newValue is string s
-            && target.Size > 0
-            && s.StartsWith("(others=>", StringComparison.Ordinal))
-        {
-            int arrow = s.IndexOf("=>", StringComparison.Ordinal);
-            int close = s.IndexOf(')', arrow);
-            if (arrow >= 0 && close > arrow + 2)
-            {
-                string inner = s.Substring(arrow + 2, close - arrow - 2).Trim();
-                char fill = inner.Length > 0 ? inner[0] : '0';
-                return new string(fill, target.Size);
-            }
-        }
-        return newValue;
+        return target.Size > 0 && HdlLiteral.TryOthersFill(newValue as string, out char fill)
+            ? new string(fill, target.Size)
+            : newValue;
     }
 
     /// <summary>
@@ -240,7 +178,10 @@ public class SignalScheduler
             {
                 var update = _currentDeltaUpdates.Dequeue();
                 object? oldValue = update.Target.Value;
-                update.Target.Value = ExpandAggregateMarker(update.NewValue, update.Target);
+                update.Target.Value = update.Range is { } part
+                    ? VectorIndexing.Write(update.Target, oldValue?.ToString() ?? string.Empty,
+                                           part.Left, part.Right, update.NewValue?.ToString() ?? string.Empty)
+                    : ExpandAggregateMarker(update.NewValue, update.Target);
                 if (!Equals(oldValue, update.Target.Value))
                 {
                     changed[update.Target] = update.SourceLine;
@@ -253,40 +194,6 @@ public class SignalScheduler
                         oldValues[update.Target] = oldValue;
                 }
             }
-
-            // Apply per-bit writes by splicing each pending bit into the
-            // target's current value, then committing a single merged
-            // vector. Bench bug #5 — keeps `output(0) <= …; output(1) <= …;`
-            // from clobbering each other.
-            foreach (var (target, bits) in _pendingBitWrites)
-            {
-                string current = target.Value as string ?? string.Empty;
-                int width = Math.Max(target.Size, current.Length);
-                if (width == 0) width = bits.Keys.Max() + 1;
-                if (current.Length < width) current = current.PadLeft(width, '0');
-                var chars = current.ToCharArray();
-                int lastLine = 0;
-                foreach (var (idx, val) in bits)
-                {
-                    // Range-aware write: map the VHDL bit index to a storage
-                    // position via the target's declared range (falls back to
-                    // width-1-idx for the conventional downto-0 form).
-                    int pos = target.IndexToOffset(idx, width);
-                    if (pos < 0 || pos >= chars.Length) continue;
-                    chars[pos] = val.bit;
-                    lastLine = val.sourceLine != 0 ? val.sourceLine : lastLine;
-                }
-                string merged = new string(chars);
-                object? oldValue = target.Value;
-                target.Value = merged;
-                if (!Equals(oldValue, target.Value))
-                {
-                    changed[target] = lastLine;
-                    if (!oldValues.ContainsKey(target))
-                        oldValues[target] = oldValue;
-                }
-            }
-            _pendingBitWrites.Clear();
         }
         return (changed, oldValues);
     }
@@ -328,7 +235,7 @@ public class SignalScheduler
         {
             lock (_lock)
             {
-                return _currentDeltaUpdates.Count > 0 || _pendingBitWrites.Count > 0;
+                return _currentDeltaUpdates.Count > 0;
             }
         }
     }

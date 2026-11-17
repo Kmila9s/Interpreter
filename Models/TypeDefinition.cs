@@ -133,6 +133,21 @@ public class TypeDefinition
     /// </summary>
     public int ArrayLength => ArrayBounds.High - ArrayBounds.Low + 1;
 
+    /// <summary>The array's bounds as written: <c>(0 to 3)</c> → (0, 3), <c>(7 downto 0)</c> → (7, 0).</summary>
+    public (int Left, int Right) DeclaredRange =>
+        IsDownto ? (ArrayBounds.High, ArrayBounds.Low) : (ArrayBounds.Low, ArrayBounds.High);
+
+    /// <summary>
+    /// Storage slot of element <paramref name="index"/> (slot 0 is the leftmost
+    /// element, as <see cref="Variable.IndexToOffset"/> maps it), or -1 when the
+    /// index is outside the array.
+    /// </summary>
+    public int SlotOf(int index)
+    {
+        int slot = Variable.OffsetInRange(DeclaredRange.Left, IsDownto, index);
+        return slot >= 0 && slot < ArrayLength ? slot : -1;
+    }
+
     /// <summary>
     /// Creates a default value for this type.
     /// </summary>

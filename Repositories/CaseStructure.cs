@@ -138,30 +138,9 @@ public class CaseStructure : ISControl
     {
         string a = choice.Replace("\"", "").Replace("'", "").Trim();
         string b = selector.Replace("\"", "").Replace("'", "").Trim();
-        if (TryParseChoiceInt(a, out long ai) && TryParseChoiceInt(b, out long bi))
+        if (HdlLiteral.TryParseInt(a, out long ai) && HdlLiteral.TryParseInt(b, out long bi))
             return ai == bi;
         return a.Equals(b, StringComparison.OrdinalIgnoreCase);
-    }
-
-    /// <summary>Parse decimal, binary bit-string, or hex into a long; false when not numeric.</summary>
-    private static bool TryParseChoiceInt(string s, out long value)
-    {
-        value = 0;
-        if (string.IsNullOrEmpty(s)) return false;
-        if (s.All(c => c == '0' || c == '1'))
-        {
-            try { value = Convert.ToInt64(s, 2); return true; }
-            catch { /* fall through */ }
-        }
-        if (long.TryParse(s, System.Globalization.NumberStyles.Integer,
-                          System.Globalization.CultureInfo.InvariantCulture, out value))
-            return true;
-        string h = s;
-        if (h.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) h = h.Substring(2);
-        else if (h.StartsWith("x", StringComparison.OrdinalIgnoreCase)) h = h.Substring(1);
-        else return false;
-        return long.TryParse(h, System.Globalization.NumberStyles.HexNumber,
-                             System.Globalization.CultureInfo.InvariantCulture, out value);
     }
 
     /// <summary>

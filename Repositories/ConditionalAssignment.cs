@@ -27,6 +27,9 @@ public class ConditionalBranch
     /// Gets or sets whether this is the default (else) branch.
     /// </summary>
     public bool IsDefault { get; set; } = false;
+
+    /// <summary>The condition, parsed on first use and re-evaluated against live values.</summary>
+    internal Operation? Condition;
 }
 
 /// <summary>
@@ -51,16 +54,21 @@ public class ConditionalAssignment : ISControl
     private readonly HashSet<Variable> _variables;
     /// <summary>The token stream used for parsing the conditional assignment, or null if constructed explicitly.</summary>
     private readonly TokenStream? _streamer;
+    /// <summary>The target and each branch's assignment.</summary>
+    private readonly BranchTarget<ConditionalBranch> _target;
 
     /// <summary>
     /// Gets the target signal name.
     /// </summary>
-    public string TargetName { get; private set; } = string.Empty;
+    public string TargetName => Target?.Name ?? _target.Text;
 
     /// <summary>
     /// Gets the target variable.
     /// </summary>
-    public Variable? Target { get; private set; }
+    public Variable? Target => _target.Destination?.Base;
+
+    /// <summary>The written target resolved (whole, or the bit/range written); null when undeclared.</summary>
+    public AssignmentTarget? Destination => _target.Destination;
 
     /// <summary>
     /// Gets the list of conditional branches.
@@ -76,19 +84,21 @@ public class ConditionalAssignment : ISControl
     {
         _variables = variables;
         _streamer = streamer;
+        _target = new BranchTarget<ConditionalBranch>(variables);
     }
 
     /// <summary>
-    /// Initializes a new instance with explicit target.
+    /// Initializes a new instance with an explicit target, whole (<c>y</c>) or
+    /// part (<c>y(0)</c>, <c>v(3 downto 2)</c>).
     /// </summary>
     /// <param name="variables">The variables in scope.</param>
-    /// <param name="targetName">The target signal name.</param>
-    public ConditionalAssignment(HashSet<Variable> variables, string targetName)
+    /// <param name="target">The target as written.</param>
+    public ConditionalAssignment(HashSet<Variable> variables, string target)
     {
         _variables = variables;
         _streamer = null;
-        TargetName = targetName;
-        Target = variables.FirstOrDefault(v => v.Name.Equals(targetName, StringComparison.OrdinalIgnoreCase));
+        _target = new BranchTarget<ConditionalBranch>(variables);
+        _target.Set(target);
     }
 
     /// <summary>
@@ -111,44 +121,22 @@ public class ConditionalAssignment : ISControl
         {
             if (branch.IsDefault)
             {
-                AssignValue(branch.ValueExpression, scheduler);
+                _target.Assign(branch, branch.ValueExpression, scheduler);
                 return Task.CompletedTask;
             }
 
             if (string.IsNullOrEmpty(branch.ConditionExpression))
                 continue;
 
-            Operation condOp = new(branch.ConditionExpression, _variables);
-            var result = condOp.Execute();
-
-            if (EvaluateConditionResult(result))
+            branch.Condition ??= new Operation(branch.ConditionExpression, _variables);
+            if (EvaluateConditionResult(branch.Condition.Evaluate()))
             {
-                AssignValue(branch.ValueExpression, scheduler);
+                _target.Assign(branch, branch.ValueExpression, scheduler);
                 return Task.CompletedTask;
             }
         }
 
         return Task.CompletedTask;
-    }
-
-    /// <summary>
-    /// Assigns a value to the target signal.
-    /// </summary>
-    /// <param name="valueExpression">The expression to evaluate and assign.</param>
-    /// <param name="scheduler">Optional signal scheduler used to queue the assignment; null for immediate.</param>
-    private void AssignValue(string valueExpression, Services.SignalScheduler? scheduler = null)
-    {
-        if (Target is null)
-            return;
-
-        Operation valueOp = new(valueExpression, _variables);
-        var result = valueOp.Execute();
-        object value = (result is Variable varResult) ? varResult.Value : result!;
-
-        if (scheduler != null)
-            scheduler.Schedule(Target, value);
-        else
-            Target.Value = value;
     }
 
     /// <summary>
@@ -176,19 +164,7 @@ public class ConditionalAssignment : ISControl
     {
         if (_streamer == null) return;
 
-        // Parse target
-        if (_streamer.Current?.Type == IDENTIFIERS)
-        {
-            TargetName = _streamer.Current.Value;
-            Target = _variables.FirstOrDefault(v => v.Name.Equals(TargetName, StringComparison.OrdinalIgnoreCase));
-            _streamer.MoveNext();
-        }
-
-        // Skip array indexing if present
-        if (_streamer.Current?.Value == "(")
-        {
-            SkipIndexing();
-        }
+        _target.Read(_streamer);
 
         // Expect '<='
         if (_streamer.Current?.Value == "<=")
@@ -198,29 +174,6 @@ public class ConditionalAssignment : ISControl
 
         // Parse branches
         ParseBranches();
-    }
-
-    /// <summary>
-    /// Skips array indexing like (7 downto 0).
-    /// </summary>
-    private void SkipIndexing()
-    {
-        int depth = 0;
-        while (_streamer != null && _streamer.Current != null)
-        {
-            if (_streamer.Current.Value == "(")
-                depth++;
-            else if (_streamer.Current.Value == ")")
-            {
-                depth--;
-                if (depth == 0)
-                {
-                    _streamer.MoveNext();
-                    break;
-                }
-            }
-            _streamer.MoveNext();
-        }
     }
 
     /// <summary>
@@ -325,54 +278,17 @@ public class ConditionalAssignment : ISControl
         string valuePart = operation[(assignIndex + 2)..].Trim();
 
         var assignment = new ConditionalAssignment(variables, targetPart);
-        if (assignment.Target is null)
-        {
-            // Try to create stub target
-            assignment.Target = new Variable(targetPart, "0", Constants.DATATYPES.STD_LOGIC_VECTOR);
-        }
 
         // Parse branches from value part
         ParseBranchesFromString(assignment, valuePart);
 
         // v1.22.0 (item 3): extend the input-port (C8) and type/width (C4/C5)
-        // checks to this conditional (when…else) form.
-        assignment.ValidateBranchAssignments(targetPart, sourceLine);
+        // checks to this conditional (when…else) form. Only branch values are
+        // validated, never a `when` condition (it may use `<=` as a comparison).
+        foreach (var branch in assignment.Branches)
+            assignment._target.Validate(branch, branch.ValueExpression, sourceLine);
 
         return assignment;
-    }
-
-    /// <summary>
-    /// Runs the same input-port (C8) and type/width (C4/C5) validation that a
-    /// plain concurrent assignment gets, by constructing a <em>gated,
-    /// validation-only</em> <see cref="Services.Operation"/>
-    /// (<c>"target &lt;= value"</c>, <c>isAssignmentStatement: true</c>) for each
-    /// branch value and discarding it. The ctor resolves the real target from
-    /// <see cref="_variables"/> and throws a <see cref="ParserException"/> on a
-    /// violation. Only that intended rejection escapes — any other ctor failure
-    /// on an unusual-but-valid value expression is swallowed, so a valid design
-    /// is never destabilised. Only branch <em>values</em> are validated, never a
-    /// <c>when</c> condition (a condition legitimately uses <c>&lt;=</c> as a
-    /// comparison). <paramref name="targetPart"/> is the raw LHS and preserves
-    /// any index, so an indexed write skips the width check.
-    /// </summary>
-    private void ValidateBranchAssignments(string targetPart, int sourceLine)
-    {
-        if (string.IsNullOrWhiteSpace(targetPart))
-            return;
-
-        foreach (var branch in Branches)
-        {
-            if (string.IsNullOrWhiteSpace(branch.ValueExpression))
-                continue;
-
-            try
-            {
-                _ = new Operation($"{targetPart} <= {branch.ValueExpression}",
-                                  _variables, sourceLine, isAssignmentStatement: true);
-            }
-            catch (ParserException) { throw; }
-            catch { /* never destabilise a valid design on an unexpected ctor failure */ }
-        }
     }
 
     /// <summary>

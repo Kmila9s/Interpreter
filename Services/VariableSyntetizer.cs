@@ -26,13 +26,12 @@ public class VariableSyntetizer : ISControl
     private TokenStream _streamer;
     private TypeRegistry? _typeRegistry;
 
-    // Bench bug #19 follow-up: per-element width + slot count of the array
-    // type currently being initialized. Set right before the := initializer
-    // is parsed and cleared right after, so the named-association aggregate
-    // parser can build a slot-correct bitstring without each call site
-    // having to plumb the array type through.
-    private int _currentArrayElementSize = 0;
-    private int _currentArrayLength = 0;
+    // Bench bug #19 follow-up: the array-of-vectors type currently being
+    // initialized (element width, bounds, direction). Set right before the :=
+    // initializer is parsed and cleared right after, so the named-association
+    // aggregate parser can build a slot-correct bitstring without each call
+    // site having to plumb the array type through.
+    private TypeDefinition? _currentArray;
 
     /// <summary>
     /// F-G-08 pass 4 (2026-07-17): cancellation token in effect for the
@@ -655,24 +654,12 @@ public class VariableSyntetizer : ISControl
                 // aggregate parser so it can place each named-association
                 // value at the right slot offset. Reset after parsing so
                 // unrelated initializers fall back to the scalar code path.
-                int prevElemSize = _currentArrayElementSize;
-                int prevArrayLen = _currentArrayLength;
-                if (customTypeDef != null && customTypeDef.Kind == TypeKind.Array
-                    && customTypeDef.ElementSize > 1)
-                {
-                    _currentArrayElementSize = customTypeDef.ElementSize;
-                    _currentArrayLength = customTypeDef.ArrayLength;
-                }
-                else
-                {
-                    _currentArrayElementSize = 0;
-                    _currentArrayLength = 0;
-                }
+                var prevArray = _currentArray;
+                _currentArray = customTypeDef is { Kind: TypeKind.Array, ElementSize: > 1 } ? customTypeDef : null;
 
                 value = ParseInitializationValue();
 
-                _currentArrayElementSize = prevElemSize;
-                _currentArrayLength = prevArrayLen;
+                _currentArray = prevArray;
             }
             // Handle "after" clause (skip it for now - temporal simulation not implemented)
             if (_streamer.Current?.Value?.ToLower() == "after")
@@ -702,17 +689,9 @@ public class VariableSyntetizer : ISControl
                 // vector-only in VHDL, so VectorSize>0 + marker pattern suffices.
                 if (!_isPort
                     && VectorSize > 0
-                    && initValue is string initMarker
-                    && initMarker.StartsWith("(others=>", StringComparison.Ordinal))
+                    && HdlLiteral.TryOthersFill(initValue as string, out char fill))
                 {
-                    int arrow = initMarker.IndexOf("=>", StringComparison.Ordinal);
-                    int close = initMarker.IndexOf(')', arrow);
-                    if (arrow >= 0 && close > arrow + 2)
-                    {
-                        string inner = initMarker.Substring(arrow + 2, close - arrow - 2).Trim();
-                        char fill = inner.Length > 0 ? inner[0] : '0';
-                        initValue = new string(fill, VectorSize);
-                    }
+                    initValue = new string(fill, VectorSize);
                 }
                 var newVar = new Variable()
                 {
@@ -722,7 +701,8 @@ public class VariableSyntetizer : ISControl
                     PortType = portType,
                     // Mark arch-local constants so downstream (VCD exporter etc.)
                     // can distinguish them from signals. Audit F-G-03 (2026-07-09).
-                    IsConstant = varType.Equals("constant", StringComparison.OrdinalIgnoreCase),
+                    // Generics are constants too (fixed at elaboration).
+                    IsConstant = _isGeneric || varType.Equals("constant", StringComparison.OrdinalIgnoreCase),
                     Size = VectorSize,  // Set Size BEFORE Value to avoid Size setter issues
                     Value = !_isPort ? initValue : null!,
                 };
@@ -747,6 +727,13 @@ public class VariableSyntetizer : ISControl
                 {
                     newVar.ElementSize = customTypeDef.ElementSize;
                     newVar.ArrayLength = customTypeDef.ArrayLength;
+                    // Index → slot follows the declared bounds and direction
+                    // (`array (1 to N)`, `array (7 downto 0)`), like the aggregates.
+                    if (!customTypeDef.IsUnconstrained)
+                    {
+                        var (left, right) = customTypeDef.DeclaredRange;
+                        newVar.SetDeclaredRange(left, right, customTypeDef.IsDownto);
+                    }
                     if (string.IsNullOrEmpty(newVar.CustomTypeName))
                         newVar.CustomTypeName = customTypeDef.Name;
                 }
@@ -1258,9 +1245,19 @@ public class VariableSyntetizer : ISControl
             {
                 _streamer.MoveNext(); // consume '=>'
             }
-            // Get the default value
-            string defaultValue = _streamer.Current?.Value?.Replace("'", "").Replace("\"", "") ?? "0";
-            _streamer.MoveNext(); // consume the value
+            // Get the default value. A nested aggregate (`others => (others => '0')`,
+            // an array of vectors) fills every element, so its fill is the outer one.
+            string defaultValue;
+            if (_streamer.Current?.Value == "(")
+            {
+                string inner = ParseAggregateOrExpression()?.ToString() ?? "0";
+                defaultValue = HdlLiteral.TryOthersFill(inner, out char innerFill) ? innerFill.ToString() : inner;
+            }
+            else
+            {
+                defaultValue = _streamer.Current?.Value?.Replace("'", "").Replace("\"", "") ?? "0";
+                _streamer.MoveNext(); // consume the value
+            }
             _streamer.MoveNext(); // consume ')'
 
             // Return a special aggregate marker
@@ -1270,12 +1267,9 @@ public class VariableSyntetizer : ISControl
         // Bench bug #19 follow-up: named-association aggregate path —
         // `( key => value, key => value, ..., others => fallback )`. Used by
         // ROM tables that initialise per-address with a function-call value.
-        // Requires the caller to have set _currentArrayElementSize +
-        // _currentArrayLength (done in the := initializer block) so we know
-        // each slot's width and how many slots to allocate.
-        if (_currentArrayElementSize > 0
-            && _currentArrayLength > 0
-            && TryParseNamedAggregate(out string? namedBits))
+        // Requires the caller to have set _currentArray (done in the :=
+        // initializer block) so we know each slot's width, count and order.
+        if (TryParseNamedAggregate(out string? namedBits))
         {
             return namedBits!;
         }
@@ -1385,8 +1379,8 @@ public class VariableSyntetizer : ISControl
     /// <c>(0 =&gt; pack(170), 1 =&gt; pack(187), ..., others =&gt; (others =&gt; '0'))</c>
     /// at the current stream position (past the opening '('). On success the
     /// stream is advanced past the matching ')' and a contiguous bitstring of
-    /// <c>_currentArrayElementSize × _currentArrayLength</c> bits is returned,
-    /// with each value placed at its slot offset and any unspecified slots
+    /// <c>ElementSize × ArrayLength</c> bits of <c>_currentArray</c> is returned,
+    /// with each value placed at its slot (<see cref="TypeDefinition.SlotOf"/>) and any unspecified slots
     /// filled by the <c>others</c> fallback (defaults to all-'0' when
     /// absent). Value expressions are evaluated through the shared
     /// <see cref="Operation"/> pipeline so user-defined functions, based
@@ -1399,9 +1393,9 @@ public class VariableSyntetizer : ISControl
         bitstring = null;
         _streamer.SetRollBack();
 
-        int elementSize = _currentArrayElementSize;
-        int slots       = _currentArrayLength;
-        if (elementSize <= 0 || slots <= 0) { _streamer.RollBack(); return false; }
+        if (_currentArray is not { } array || array.ArrayLength <= 0) { _streamer.RollBack(); return false; }
+        int elementSize = array.ElementSize;
+        int slots       = array.ArrayLength;
 
         // Quick pre-scan: the first chunk's syntax must include `=>` at
         // depth 1 before we hit the closing ')'. Without this we'd grab
@@ -1459,7 +1453,7 @@ public class VariableSyntetizer : ISControl
             string slotBits = EvaluateAggregateValue(valueExpr, elementSize);
 
             if (isOthers) othersFill = slotBits;
-            else if (keyIndex >= 0 && keyIndex < slots) slotValues[keyIndex] = slotBits;
+            else if (array.SlotOf(keyIndex) is int slot and >= 0) slotValues[slot] = slotBits;
             sawAny = true;
 
             // Consume the separator. ',' → next chunk; ')' → done.

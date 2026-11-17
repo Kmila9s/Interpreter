@@ -22,7 +22,7 @@ internal static class ConcurrentAssignSynthesizer
     /// </summary>
     public static Net Synthesize(Operation op, SynthesisContext ctx)
     {
-        var resultNet = NetForVariable(op.Result, ctx);
+        var resultNet = TargetNet(op.Target, op.Result, ctx);
         SynthesizeInto(op, resultNet, ctx);
         return resultNet;
     }
@@ -147,10 +147,10 @@ internal static class ConcurrentAssignSynthesizer
                     // parseable integer Value (ForLoop unroll case), emit
                     // a static-index tap {source}_idx_{k} so per-iteration
                     // reads collapse to distinct nets.
-                    if (dyni.IndexSource?.Value is object idxRaw
+                    if (dyni.Index.Source?.Value is object idxRaw
                         && int.TryParse(idxRaw.ToString(), out int idxK))
                     {
-                        string idxTapName = $"{dyni.Source.Name}_idx_{idxK}";
+                        string idxTapName = VectorIndexing.PartName(dyni.Source.Name, idxK);
                         var idxTapNet = ctx.GetOrCreateNet(idxTapName,
                             dynElemWidth > 1 ? NetKind.Bus : NetKind.Wire,
                             dynElemWidth, NetOrigin.Internal, sourceLine);
@@ -181,33 +181,9 @@ internal static class ConcurrentAssignSynthesizer
                     {
                         int n = sourceValue.Length / elemSize;
 
-                        // Build the selector net. If we have an
-                        // IndexExpression + scope, synthesise it as a
-                        // sub-Operation; else use the IndexSource
-                        // directly. Otherwise fall back to a placeholder
-                        // constant so the cell wires up even in the
-                        // degenerate case.
-                        Net selNet;
-                        if (!string.IsNullOrEmpty(dyni.IndexExpression)
-                            && dyni.ExpressionScope != null)
-                        {
-                            try
-                            {
-                                var selOp = new Operation(dyni.IndexExpression!, dyni.ExpressionScope);
-                                var selOut = ctx.NewInternal(1, sourceLine);
-                                SynthesizeInto(selOp, selOut, ctx);
-                                selNet = selOut;
-                            }
-                            catch { selNet = ctx.Constant("@rom_sel", 1); }
-                        }
-                        else if (dyni.IndexSource is not null)
-                        {
-                            selNet = NetForVariable(dyni.IndexSource, ctx);
-                        }
-                        else
-                        {
-                            selNet = ctx.Constant("@rom_sel", 1);
-                        }
+                        // The selector net; a placeholder constant keeps the
+                        // cell wired up in the degenerate case.
+                        Net selNet = SelectorNet(dyni.Index, ctx, sourceLine) ?? ctx.Constant("@rom_sel", 1);
 
                         // Emit N constant data pins. MSB-first storage
                         // matches DynamicIndex.Evaluate at line 74:
@@ -247,27 +223,7 @@ internal static class ConcurrentAssignSynthesizer
                     if (elemSize > 0 && !dyni.Source.IsConstant)
                     {
                         // Selector (same synthesise path as ROM_LOOKUP).
-                        Net ramSelNet;
-                        if (!string.IsNullOrEmpty(dyni.IndexExpression)
-                            && dyni.ExpressionScope != null)
-                        {
-                            try
-                            {
-                                var selOp = new Operation(dyni.IndexExpression!, dyni.ExpressionScope);
-                                var selOut = ctx.NewInternal(1, sourceLine);
-                                SynthesizeInto(selOp, selOut, ctx);
-                                ramSelNet = selOut;
-                            }
-                            catch { ramSelNet = ctx.Constant("@ram_sel", 1); }
-                        }
-                        else if (dyni.IndexSource is not null)
-                        {
-                            ramSelNet = NetForVariable(dyni.IndexSource, ctx);
-                        }
-                        else
-                        {
-                            ramSelNet = ctx.Constant("@ram_sel", 1);
-                        }
+                        Net ramSelNet = SelectorNet(dyni.Index, ctx, sourceLine) ?? ctx.Constant("@ram_sel", 1);
 
                         // Source signal net. For a signal-typed array,
                         // NetForVariable creates a bus net of Source.Size
@@ -304,7 +260,7 @@ internal static class ConcurrentAssignSynthesizer
                     // Fallback (unusual shape — no ElementSize, or scalar
                     // bit-vector indexed dynamically): labeled tap-net
                     // (pass 7 behavior).
-                    string dynDisambig = dyni.IndexSource?.Name ?? "expr";
+                    string dynDisambig = dyni.Index.Source?.Name ?? "expr";
                     string dynTapName = $"{dyni.Source.Name}_dyn_{dynDisambig}";
                     var dynTapNet = ctx.GetOrCreateNet(dynTapName,
                         dynElemWidth > 1 ? NetKind.Bus : NetKind.Wire,
@@ -322,9 +278,7 @@ internal static class ConcurrentAssignSynthesizer
                     // already recognises for name-based bit taps — the
                     // renderer draws the tap on its own without an explicit
                     // BUF cell. Width follows IsSlice.
-                    string tapName = di.IsSlice
-                        ? $"{di.Source.Name}_idx_{di.High}_{di.Low}"
-                        : $"{di.Source.Name}_idx_{di.High}";
+                    string tapName = VectorIndexing.PartName(di.Source.Name, di.High, di.IsSlice ? di.Low : null);
                     int tapWidth = di.IsSlice
                         ? Math.Max(1, di.High - di.Low + 1)
                         : 1;
@@ -648,6 +602,44 @@ internal static class ConcurrentAssignSynthesizer
     }
 
     /// <summary>
+    /// The net carrying a run-time index: the index variable's own net, or
+    /// the index expression synthesised into a new net; null when it cannot
+    /// be built. Shared by ROM/RAM reads and RAM writes.
+    /// </summary>
+    internal static Net? SelectorNet(IndexValue index, SynthesisContext ctx, string? sourceLine)
+    {
+        if (index.Source is not null) return NetForVariable(index.Source, ctx);
+        if (string.IsNullOrEmpty(index.Expression) || index.Scope is null) return null;
+        try
+        {
+            var selOut = ctx.NewInternal(1, sourceLine);
+            SynthesizeInto(new Operation(index.Expression, index.Scope), selOut, ctx);
+            return selOut;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>The net an assignment to <paramref name="target"/> drives: its bit-select net for a literal part, else the whole <paramref name="whole"/>.</summary>
+    internal static Net TargetNet(AssignmentTarget? target, Variable whole, SynthesisContext ctx) =>
+        PartTargetNet(target, ctx) ?? NetForVariable(whole, ctx);
+
+    /// <summary>
+    /// The bit-select net a part target with literal indices (<c>c(4)</c>,
+    /// <c>v(3 downto 2)</c>) of an internal signal drives; null for a whole
+    /// target, a run-time index or a port (ports stay whole, like component
+    /// actuals in <c>ComponentSynthesizer.ResolveActualNet</c>).
+    /// </summary>
+    internal static Net? PartTargetNet(AssignmentTarget? target, SynthesisContext ctx)
+    {
+        if (target is not { IsPartial: true, StaticIndices: { } ix } || target.Base.IsPort) return null;
+        int high = Math.Max(ix.Left, ix.Right), low = Math.Min(ix.Left, ix.Right);
+        int width = VectorIndexing.RangeWidth(target.Base, ix.Left, ix.Right);
+        return ctx.GetOrCreateNet(
+            VectorIndexing.PartName(target.Base.Name, high, target.Right is null ? null : low),
+            width > 1 ? NetKind.Bus : NetKind.Wire, width, NetOrigin.Signal);
+    }
+
+    /// <summary>
     /// Resolves a parsed <see cref="Variable"/> to its corresponding net.
     /// Literals get a CONST net (with the literal value embedded in the
     /// name so the renderer can stamp it on the wire). Indexed accesses
@@ -894,7 +886,7 @@ internal static class ConcurrentAssignSynthesizer
                             HashSet<Variable>? boundScope;
                             try
                             {
-                                bound = pcall.ResolveBoundBody(null, out _, out boundScope);
+                                bound = pcall.ResolveBoundBody(null, out boundScope);
                             }
                             catch { return null; }
                             if (bound == null || bound.Count == 0 || boundScope == null) continue;

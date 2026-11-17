@@ -18,14 +18,8 @@ internal static class SelectedAssignSynthesizer
         // need to be sidestepped via pattern matching.
         if (sa.Target is null || sa.Choices.Count == 0) return;
 
-        var target = sa.Target;
-        int width = target.Type == Constants.DATATYPES.STD_LOGIC_VECTOR
-            ? Math.Max(1, target.Size) : 1;
-        var outNet = ctx.GetOrCreateNet(
-            sa.TargetName,
-            width > 1 ? NetKind.Bus : NetKind.Wire,
-            width,
-            target.IsPort ? NetOrigin.PortOut : NetOrigin.Signal);
+        var outNet = ConcurrentAssignSynthesizer.TargetNet(sa.Destination, sa.Target, ctx);
+        int width = outNet.Width;
         // Source-line key for Naive view: the full with/select line.
         string sourceLine = $"with {sa.SelectorExpression} select " + sa.TargetName + " <= "
             + string.Join(", ", sa.Choices.Select(c => c.IsOthers
