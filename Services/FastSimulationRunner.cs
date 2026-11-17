@@ -68,6 +68,9 @@ public class FastSimulationRunner : IDisposable, ISimulationRunner
     /// <summary>Fired on error during simulation.</summary>
     public event Action<string>? OnError;
 
+    /// <inheritdoc />
+    public string? Error { get; private set; }
+
     /// <summary>
     /// Fires once per <see cref="RunAsync"/> right after the engine is
     /// constructed + initialised (mirror of
@@ -89,6 +92,7 @@ public class FastSimulationRunner : IDisposable, ISimulationRunner
             throw new InvalidOperationException("Simulation is already running.");
 
         _isRunning = true;
+        Error = null;
         _isPaused = false;
         _cts = new CancellationTokenSource();
 
@@ -267,9 +271,8 @@ public class FastSimulationRunner : IDisposable, ISimulationRunner
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            var st = ex.StackTrace ?? string.Empty;
-            var firstFrame = st.Split('\n').FirstOrDefault()?.Trim() ?? string.Empty;
-            OnError?.Invoke($"{ex.GetType().Name}: {ex.Message} | {firstFrame}");
+            Error = SimulationRunner.DescribeFailure(ex);
+            OnError?.Invoke(Error);
             OnSimulationEnded?.Invoke(false);
         }
         finally

@@ -32,6 +32,13 @@ public interface ISimulationRunner : IDisposable
     /// <summary>Fired on error during simulation.</summary>
     event Action<string>? OnError;
 
+    /// <summary>
+    /// The error that aborted the last <c>RunAsync</c>, or null when it
+    /// completed or was stopped. Cleared when a run starts; the same text
+    /// <see cref="OnError"/> carries.
+    /// </summary>
+    string? Error { get; }
+
     /// <summary>Fired once the engine is constructed + initialised.</summary>
     event Action<DeltaCycleEngine>? OnEngineReady;
 

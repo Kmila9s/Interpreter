@@ -45,6 +45,20 @@ public class SimulationRunner : IDisposable, ISimulationRunner
     /// </summary>
     public event Action<string>? OnError;
 
+    /// <inheritdoc />
+    public string? Error { get; private set; }
+
+    /// <summary>
+    /// One-line description of a run failure: type, message and the first
+    /// stack frame, so headless callers can pinpoint it rather than just see
+    /// a generic "Object reference not set". Shared by both runners.
+    /// </summary>
+    internal static string DescribeFailure(Exception ex)
+    {
+        var firstFrame = (ex.StackTrace ?? string.Empty).Split('\n').FirstOrDefault()?.Trim() ?? string.Empty;
+        return $"{ex.GetType().Name}: {ex.Message} | {firstFrame}";
+    }
+
     /// <summary>
     /// Phase B (2026-05-19): fires once per <see cref="RunAsync"/> right
     /// after <see cref="_engine"/> is constructed + initialised. Lets the UI
@@ -76,6 +90,7 @@ public class SimulationRunner : IDisposable, ISimulationRunner
             throw new InvalidOperationException("Simulation is already running.");
 
         _isRunning = true;
+        Error = null;
         _isPaused = false;
         _cts = new CancellationTokenSource();
 
@@ -296,12 +311,8 @@ public class SimulationRunner : IDisposable, ISimulationRunner
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // Include the stack trace's first usable frames so headless callers
-            // can pinpoint the failure rather than just see the generic
-            // "Object reference not set" string.
-            var st = ex.StackTrace ?? string.Empty;
-            var firstFrame = st.Split('\n').FirstOrDefault()?.Trim() ?? string.Empty;
-            OnError?.Invoke($"{ex.GetType().Name}: {ex.Message} | {firstFrame}");
+            Error = DescribeFailure(ex);
+            OnError?.Invoke(Error);
             OnSimulationEnded?.Invoke(false);
         }
         finally

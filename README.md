@@ -1425,6 +1425,13 @@ while (_streamer.Current != null)
 
 ## 10. Changelog
 
+### Version 3.1.0 (2026-11-16)
+
+*   `ISimulationRunner.Error`: the error that aborted the last run (or null),
+    set in both runners' `catch` through one shared `DescribeFailure`.
+*   `Operation`'s validation errors carry the offending name as context, so
+    the diagnostic points at its real column.
+
 ### Version 3.0.6 (2026-11-16)
 
 *   `SourceElaborator` (comments and string masking), `PackageSubtypeScanner`
