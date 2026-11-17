@@ -829,8 +829,7 @@ class Program
                 {
                     // Hex literal
                     string hex = valueStr.Substring(2, valueStr.Length - 3);
-                    value = string.Join("", hex.Select(c =>
-                        Convert.ToString(Convert.ToInt32(c.ToString(), 16), 2).PadLeft(4, '0')));
+                    value = Interpreter.Models.HdlLiteral.HexBits(hex);
                 }
                 else if (StandardFunctions.IsStandardFunction(valueStr.Split('(')[0].Trim()))
                 {

@@ -68,4 +68,16 @@ public class StimulusEvent
     /// The value to set (as string, matching VHDL signal assignment format).
     /// </summary>
     public required string Value { get; init; }
+
+    /// <summary>
+    /// Part of <see cref="Signal"/> driven (<c>p.lo</c>, <c>v(3)</c>), or null for the whole port.
+    /// </summary>
+    public AssignmentTarget? Target { get; init; }
+
+    /// <summary>Applies the stimulus to its signal (or to the selected part of it).</summary>
+    public void Apply()
+    {
+        if (Target is { } part) part.WriteNow(Value);
+        else Signal.Value = Value;
+    }
 }

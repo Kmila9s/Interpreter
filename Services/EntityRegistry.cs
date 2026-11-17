@@ -145,19 +145,7 @@ public class EntityRegistry
 
         _scannedFiles.Add(filePath);
 
-        string[] lines = File.ReadAllLines(filePath);
-        var tokenizer = new Tokenizer();
-
-        // Tokenize each line
-        foreach (var line in lines)
-        {
-            if (!string.IsNullOrWhiteSpace(line))
-                tokenizer.TokenizeLine(line);
-        }
-        tokenizer.Evaluate();
-
-        var tokens = tokenizer.GetDictionaryType();
-        var stream = new TokenStream(tokens);
+        var stream = TokenStream.FromLines(File.ReadAllLines(filePath));
 
         int entitiesFound = 0;
 

@@ -26,12 +26,12 @@ public class VariableSyntetizer : ISControl
     private TokenStream _streamer;
     private TypeRegistry? _typeRegistry;
 
-    // Bench bug #19 follow-up: the array-of-vectors type currently being
-    // initialized (element width, bounds, direction). Set right before the :=
-    // initializer is parsed and cleared right after, so the named-association
-    // aggregate parser can build a slot-correct bitstring without each call
-    // site having to plumb the array type through.
-    private TypeDefinition? _currentArray;
+    /// <summary>
+    /// Shape of the object whose initializer is being parsed, so an aggregate
+    /// (<c>:= (lo =&gt; '0', hi =&gt; '1')</c>, ROM tables) packs against its
+    /// record layout or array geometry. Null outside an object initializer.
+    /// </summary>
+    private Variable? _currentShape;
 
     /// <summary>
     /// F-G-08 pass 4 (2026-07-17): cancellation token in effect for the
@@ -260,33 +260,9 @@ public class VariableSyntetizer : ISControl
                 portType = Constants.PortType.IN;
             }
 
-            var dataType = Variable.GetDatatype(_streamer.Current?.Value ?? string.Empty);
-            string dataTypeStr = _streamer.Current?.Value?.ToLower() ?? string.Empty;
-
-            // Check if it's a custom type in the registry
-            TypeDefinition? customTypeDef = null;
-            if (dataType == Constants.DATATYPES.UNKNOWN)
-            {
-                // Try to resolve from type registry (local scope first, then
-                // this parser instance's parsed-types table). F-G-04 follow-up
-                // (2026-07-09): finally consult `PackageRegistry` for
-                // cross-file package-declared subtypes seeded by
-                // `PackageSubtypeScanner` at project scan time. When a hit
-                // lands here, `dataType` gets promoted to the base numeric
-                // type (STD_LOGIC_VECTOR) and `VectorSize` is derived from
-                // the subtype's high/low bounds — so `a : in q16_t` is
-                // treated indistinguishably from `a : in signed(31 downto 0)`
-                // downstream.
-                customTypeDef = _typeRegistry?.Get(dataTypeStr)
-                             ?? ParsedTypes.Get(dataTypeStr)
-                             ?? PackageSubtypeScanner.LookupGlobally(dataTypeStr);
-                if (customTypeDef != null)
-                {
-#if DEBUG
-                    Console.WriteLine($"[VariableSyntetizer] Resolved custom type '{dataTypeStr}' -> {customTypeDef.Kind}, Size={customTypeDef.TotalSize}");
-#endif
-                }
-            }
+            var mark = PeekTypeMark();
+            var dataType = mark.Type;
+            TypeDefinition? customTypeDef = mark.Custom;
 
             // If datatype is UNKNOWN and NOT in registry, skip this declaration
             if (dataType == Constants.DATATYPES.UNKNOWN && customTypeDef == null && !_isPort && !_isGeneric)
@@ -384,258 +360,9 @@ public class VariableSyntetizer : ISControl
                     _streamer.MoveNext();
                 continue;
             }
-            // v0.13.0: Handle custom types - they are IDENTIFIERS not KEYWORDS
-            // For custom types found in the registry, consume the type identifier directly
-            if (customTypeDef != null)
-            {
-                _streamer.Expect(IDENTIFIERS); // consume custom type name (e.g., 'reg_array_t')
-            }
-            else
-            {
-                _streamer.Expect(KEYWORDS); // consume standard type keyword (e.g., 'std_logic')
-            }
-            int VectorSize = 0;
-
-            // Declared vector range (VHDL 'left/'right/direction), captured here
-            // and applied to the created Variable below so index/slice/attribute
-            // resolution honours to/downto and non-zero low bounds. Null => no
-            // range recorded => conventional (Size-1 downto 0) fallback.
-            int? declLeft = null;
-            int? declRight = null;
-            bool declIsDownto = true;
-
-            // Set default size for single-bit types
-            if (dataType == Constants.DATATYPES.STD_LOGIC || dataType == Constants.DATATYPES.BIT)
-            {
-                VectorSize = 1;
-            }
-
-            // Handle vector types with parentheses (std_logic_vector, bit_vector, signed, unsigned, etc.)
-            if (dataType == Constants.DATATYPES.STD_LOGIC_VECTOR ||
-                dataTypeStr == "bit_vector" || dataTypeStr == "signed" || dataTypeStr == "unsigned" ||
-                dataTypeStr == "std_ulogic_vector" || dataTypeStr == "boolean_vector" || dataTypeStr == "integer_vector")
-            {
-                if (_streamer.Current?.Value == "(")
-                {
-                    // Parse vector range (7 downto 0) or (0 to 7)
-                    // v0.13.0: For ports/generics, check if expression is complex before evaluating
-                    _streamer.Expect(PARENTHESIS); // consume '('
-
-                    // Check if this is a complex expression (contains operators, nested parens, or function calls)
-                    bool isComplexExpression = false;
-                    {
-                        _streamer.SetRollBack();
-                        // Peek ahead to see if expression contains operators, nested parens, or function calls
-                        bool prevWasIdentifier = false;
-                        while (_streamer.Current != null && _streamer.Current.Value != ")")
-                        {
-                            if (_streamer.Current.Value == "(")
-                            {
-                                // Nested paren - could be function call or complex expression
-                                isComplexExpression = true;
-                                break;
-                            }
-                            string[] operators = { "+", "-", "*", "**", "/" };
-                            if (operators.Contains(_streamer.Current.Value))
-                            {
-                                isComplexExpression = true;
-                                break;
-                            }
-                            // Check for function call pattern: identifier followed by '('
-                            if (prevWasIdentifier && _streamer.Current.Value == "(")
-                            {
-                                isComplexExpression = true;
-                                break;
-                            }
-                            prevWasIdentifier = _streamer.Current.Type == IDENTIFIERS;
-                            _streamer.MoveNext();
-                        }
-                        _streamer.RollBack();
-                    }
-
-                    if (isComplexExpression)
-                    {
-                        // F-G-01 fix (session 8, 2026-07-09): try to fold the
-                        // range expression using PackageRegistry-loaded
-                        // constants before giving up. Common capstone
-                        // patterns like `std_logic_vector(LED_ROWS*LED_COLS - 1 downto 0)`
-                        // (LED_ROWS=LED_COLS=3 → high=8) now resolve to 9-bit
-                        // vectors instead of defaulting to 8. Handles:
-                        //   * bare integer / constant refs
-                        //   * two-operand +, -, *, /
-                        //   * three-operand `A op B op C` (typical `W-1`, `A*B-1`, …)
-                        // Multiplication / addition chains beyond three tokens
-                        // still fall back to the default. On any resolution
-                        // failure, existing default-8 behaviour is preserved.
-                        int? hiEval = null;
-                        string? dirTok = null;
-                        int? loEval = null;
-                        {
-                            var expr = new List<string>();
-                            int depth = 1;
-                            _streamer.SetRollBack();
-                            while (_streamer.Current != null && depth > 0)
-                            {
-                                var val = _streamer.Current.Value;
-                                if (val == "(") depth++;
-                                else if (val == ")") { depth--; if (depth == 0) break; }
-                                expr.Add(val);
-                                _streamer.MoveNext();
-                            }
-                            _streamer.RollBack();
-
-                            // Split around "downto" or "to".
-                            int splitIdx = -1;
-                            for (int i = 0; i < expr.Count; i++)
-                            {
-                                var t = expr[i].ToLowerInvariant();
-                                if (t == "downto" || t == "to")
-                                {
-                                    splitIdx = i;
-                                    dirTok = t;
-                                    break;
-                                }
-                            }
-                            if (splitIdx > 0 && dirTok != null)
-                            {
-                                hiEval = FoldSimpleExpr(expr.GetRange(0, splitIdx));
-                                loEval = FoldSimpleExpr(expr.GetRange(splitIdx + 1, expr.Count - splitIdx - 1));
-                            }
-                        }
-
-                        // Skip the complex expression tokens.
-                        int parenDepth = 1;
-                        while (_streamer.Current != null && parenDepth > 0)
-                        {
-                            if (_streamer.Current.Value == "(")
-                                parenDepth++;
-                            else if (_streamer.Current.Value == ")")
-                                parenDepth--;
-                            if (parenDepth > 0)
-                                _streamer.MoveNext();
-                        }
-                        if (_streamer.Current?.Value == ")")
-                            _streamer.MoveNext(); // consume final ')'
-
-                        if (hiEval.HasValue && loEval.HasValue && dirTok != null)
-                        {
-                            int hi = hiEval.Value;
-                            int lo = loEval.Value;
-                            int width = dirTok == "downto" ? hi - lo + 1 : lo - hi + 1;
-                            VectorSize = width > 0 ? width : 8;
-                            // hiEval is the bound written left of to/downto, loEval
-                            // the one to its right: that IS 'left/'right as written.
-                            declLeft = hi;
-                            declRight = lo;
-                            declIsDownto = dirTok == "downto";
-#if DEBUG
-                            Console.WriteLine($"[VariableSyntetizer] F-G-01 folded range: {hi} {dirTok} {lo} → width {VectorSize}");
-#endif
-                        }
-                        else
-                        {
-#if DEBUG
-                            Console.WriteLine($"[VariableSyntetizer] Complex vector expression detected, using default size");
-#endif
-                            VectorSize = 8; // Default size for complex expressions
-                        }
-                    }
-                    else
-                    {
-                        // Simple expression: evaluate normally
-                        object varValue = GetVariableValue();
-                        int initial = Convert.ToInt32(varValue);
-                        string vecType = _streamer.Current?.Value ?? string.Empty;
-                        _streamer.Expect(KEYWORDS); // consume 'downto' or 'to'
-                        varValue = GetVariableValue();
-                        int end = Convert.ToInt32(varValue);
-                        _streamer.Expect(PARENTHESIS); // consume ')'
-                        VectorSize = vecType.ToLower() == "downto" ? initial - end + 1 : end - initial + 1;
-                        // `initial` is the bound left of to/downto, `end` the one
-                        // to its right: 'left/'right exactly as written.
-                        declLeft = initial;
-                        declRight = end;
-                        declIsDownto = vecType.ToLower() == "downto";
-#if DEBUG
-                        Console.WriteLine($"[VariableSyntetizer] Simple vector range: {initial} {vecType} {end} = Size {VectorSize}");
-#endif
-                    }
-                }
-            }
-            // Handle integer/natural/positive with optional range constraint
-            else if (dataType == Constants.DATATYPES.INTEGER || dataType == Constants.DATATYPES.NATURAL ||
-                     dataTypeStr == "positive")
-            {
-                if (_streamer.Current?.Value?.ToLower() == "range")
-                {
-                    _streamer.Expect(KEYWORDS); // consume "range"
-                    // F-G-02 fix (session 8, 2026-07-09): scoped
-                    // PackageRegistry lookup for range bounds. Prior code
-                    // called GetVariableValue which registers a placeholder
-                    // (Value=0) for any identifier not in local scope, so
-                    // `range 0 to BUZ_LONG_TICKS` collapsed to `0 to 0` and
-                    // yielded width 1. Now, if the current token is an
-                    // identifier that resolves in PackageRegistry, use that
-                    // constant's value directly and advance the stream —
-                    // otherwise fall back to GetVariableValue's legacy
-                    // behaviour. Keeping the PackageRegistry lookup ONLY in
-                    // this branch (not in GetVariableValue itself) avoids
-                    // disturbing initializer / expression paths that read
-                    // signals whose *names* happen to shadow constants.
-                    int initial = ReadRangeBound();
-                    _streamer.Expect(KEYWORDS); // consume "to"
-                    int end = ReadRangeBound();
-                    VectorSize = RangeToBitWidth(initial, end);
-                }
-            }
-            // Handle time type - will be handled in initialization
-            // Handle real type - will be handled in initialization
-            // Handle RANGE standalone type
-            else if (dataType == Constants.DATATYPES.RANGE)
-            {
-                object varValue = GetVariableValue();
-                int initial = Convert.ToInt32(varValue);
-                _streamer.Expect(KEYWORDS);
-                varValue = GetVariableValue();
-                int end = Convert.ToInt32(varValue);
-                VectorSize = Math.Abs(end - initial);
-            }
-            // Handle custom types from registry
-            else if (customTypeDef != null)
-            {
-                VectorSize = customTypeDef.TotalSize;
-                // For custom types, use base type if available (for arrays/subtypes)
-                if (customTypeDef.Kind == TypeKind.Array)
-                {
-                    dataType = customTypeDef.BaseType != Constants.DATATYPES.UNKNOWN
-                        ? customTypeDef.BaseType
-                        : Constants.DATATYPES.STD_LOGIC_VECTOR;
-                }
-                else if (customTypeDef.Kind == TypeKind.Enumeration)
-                {
-                    // Enum types can be stored as integers representing enum index
-                    dataType = Constants.DATATYPES.INTEGER;
-                }
-                else if (customTypeDef.Kind == TypeKind.Subtype)
-                {
-                    dataType = customTypeDef.BaseType;
-                    // Inherit the subtype's declared range so signals of a
-                    // subtype like `byte is std_logic_vector(7 downto 0)` index
-                    // correctly. SubtypeRange is stored (High=max, Low=min).
-                    if (customTypeDef.BaseType == Constants.DATATYPES.STD_LOGIC_VECTOR)
-                    {
-                        declLeft = customTypeDef.IsDownto ? customTypeDef.SubtypeRange.High : customTypeDef.SubtypeRange.Low;
-                        declRight = customTypeDef.IsDownto ? customTypeDef.SubtypeRange.Low : customTypeDef.SubtypeRange.High;
-                        declIsDownto = customTypeDef.IsDownto;
-                    }
-                }
-                // For records, use STD_LOGIC_VECTOR as storage type
-                else if (customTypeDef.Kind == TypeKind.Record)
-                {
-                    dataType = Constants.DATATYPES.STD_LOGIC_VECTOR;
-                }
-                // v0.13.0: Type name already consumed at lines 231-240, no need to Expect again
-            }
+            var subtype = ParseSubtypeIndication(mark);
+            dataType = subtype.Type;
+            int VectorSize = subtype.Width;
 
             // v0.13.0: Handle 'bus' keyword for guarded signals (e.g., signal x : std_logic_vector bus := ...)
             // The 'bus' keyword appears after the type to indicate a guarded/resolved signal
@@ -645,21 +372,21 @@ public class VariableSyntetizer : ISControl
             }
 
             object value = new();
+            bool hasInitializer = false;
             // Handle initialization with :=
             if (!_isPort && _streamer.Current?.Value == ":=")
             {
+                hasInitializer = true;
                 _streamer.Expect(OPERATORS); // consume ":="
 
-                // Bench bug #19 follow-up: pass array element width into the
-                // aggregate parser so it can place each named-association
-                // value at the right slot offset. Reset after parsing so
-                // unrelated initializers fall back to the scalar code path.
-                var prevArray = _currentArray;
-                _currentArray = customTypeDef is { Kind: TypeKind.Array, ElementSize: > 1 } ? customTypeDef : null;
+                // The declared object's shape, so an aggregate initializer packs
+                // against its record layout / array geometry; restored after.
+                var prevShape = _currentShape;
+                _currentShape = ShapeOf(subtype);
 
                 value = ParseInitializationValue();
 
-                _currentArray = prevArray;
+                _currentShape = prevShape;
             }
             // Handle "after" clause (skip it for now - temporal simulation not implemented)
             if (_streamer.Current?.Value?.ToLower() == "after")
@@ -674,7 +401,11 @@ public class VariableSyntetizer : ISControl
 #endif
                 // Determine initial value - use custom type default if applicable
                 object initValue = value;
-                if (!_isPort && customTypeDef != null && (value is null || value.Equals(new object())))
+                // Packed composites (records, arrays of records) start from their
+                // field defaults; other types keep today's seeding until the LRM
+                // initial-value policy (v3.1.5).
+                if (!_isPort && !hasInitializer
+                    && (customTypeDef?.Kind == TypeKind.Record || customTypeDef?.ElementShape?.Layout != null))
                 {
                     initValue = customTypeDef.GetDefaultValue();
                 }
@@ -707,51 +438,9 @@ public class VariableSyntetizer : ISControl
                     Value = !_isPort ? initValue : null!,
                 };
 
-                // Record the declared range (to/downto + bounds) so index/slice/
-                // attribute resolution is range-aware. Only when an explicit range
-                // was parsed; otherwise the Variable keeps the (Size-1 downto 0)
-                // fallback and behaves exactly as before.
-                if (declLeft.HasValue && declRight.HasValue)
-                {
-                    newVar.SetDeclaredRange(declLeft.Value, declRight.Value, declIsDownto);
-                }
-
-                // Bench bug #19: when the variable is typed by a user-defined
-                // array (e.g. `rom_t = array(0 to 7) of std_logic_vector(7 downto 0)`),
-                // carry the per-element width into the Variable so DynamicIndex /
-                // DeferredIndex can slice element-wise on `signal(N)` access.
-                // Without this, the indexer falls back to single-bit reads and
-                // returns garbage / 'x' for every lookup into a constant array.
-                if (customTypeDef != null && customTypeDef.Kind == TypeKind.Array
-                    && customTypeDef.ElementSize > 1)
-                {
-                    newVar.ElementSize = customTypeDef.ElementSize;
-                    newVar.ArrayLength = customTypeDef.ArrayLength;
-                    // Index → slot follows the declared bounds and direction
-                    // (`array (1 to N)`, `array (7 downto 0)`), like the aggregates.
-                    if (!customTypeDef.IsUnconstrained)
-                    {
-                        var (left, right) = customTypeDef.DeclaredRange;
-                        newVar.SetDeclaredRange(left, right, customTypeDef.IsDownto);
-                    }
-                    if (string.IsNullOrEmpty(newVar.CustomTypeName))
-                        newVar.CustomTypeName = customTypeDef.Name;
-                }
-
-                // Store custom type name reference for debugging/analysis
-                if (customTypeDef != null)
-                {
-                    // Record the enum type name (precise-C10). Kept separate from
-                    // CustomTypeName so the case numeric/exhaustiveness gates that
-                    // key on CustomTypeName are unaffected.
-                    if (customTypeDef.Kind == TypeKind.Enumeration)
-                        newVar.EnumTypeName = customTypeDef.Name;
+                ApplyShape(newVar, subtype);
 #if DEBUG
-                    Console.WriteLine($"[VariableSyntetizer] Created '{newVar.Name}' with custom type '{customTypeDef.Name}', Size={newVar.Size}");
-#endif
-                }
-#if DEBUG
-                else if (_isPort && dataType == Constants.DATATYPES.STD_LOGIC_VECTOR)
+                if (_isPort && dataType == Constants.DATATYPES.STD_LOGIC_VECTOR)
                     Console.WriteLine($"[VariableSyntetizer] Created port '{newVar.Name}' actual Size={newVar.Size}");
 #endif
                 Variables.Add(newVar);
@@ -986,6 +675,28 @@ public class VariableSyntetizer : ISControl
         {
             value = _streamer.Current.Value?.ToLower() == "true";
             _streamer.MoveNext();
+        }
+        // Function call (`init_matrix(ROWS, COLS, x)`, `to_signed(0, W)`): evaluated
+        // now when it can be; otherwise the object keeps its default value.
+        else if (_streamer.Current?.Type == IDENTIFIERS && _streamer.Peek()?.Value == "(")
+        {
+            string call = _streamer.Current.Value;
+            _streamer.MoveNext();
+            string args = string.Join(" ", ReadParenthesized());
+            try
+            {
+                var scope = new HashSet<Variable>(_comparator);
+                scope.UnionWith(Variables);
+                value = new Operation($"{call} ( {args} )", scope).Evaluate() switch
+                {
+                    Variable v => v.Value,
+                    var other => other ?? new object(),
+                };
+            }
+            catch (Exception) when (!ParseTrace.Enabled)
+            {
+                value = new object();
+            }
         }
         // Check for identifier reference
         else if (_streamer.Current?.Type == IDENTIFIERS)
@@ -1235,11 +946,10 @@ public class VariableSyntetizer : ISControl
     /// </summary>
     private object ParseAggregateOrExpression()
     {
-        _streamer.MoveNext(); // consume '('
-
         // Check for 'others' keyword
-        if (_streamer.Current?.Value?.ToLower() == "others")
+        if (_streamer.Peek()?.Value?.ToLower() == "others")
         {
+            _streamer.MoveNext(); // consume '('
             _streamer.MoveNext(); // consume 'others'
             if (_streamer.Current?.Value == "=>")
             {
@@ -1264,336 +974,21 @@ public class VariableSyntetizer : ISControl
             return $"(others=>{defaultValue})";
         }
 
-        // Bench bug #19 follow-up: named-association aggregate path —
-        // `( key => value, key => value, ..., others => fallback )`. Used by
-        // ROM tables that initialise per-address with a function-call value.
-        // Requires the caller to have set _currentArray (done in the :=
-        // initializer block) so we know each slot's width, count and order.
-        if (TryParseNamedAggregate(out string? namedBits))
-        {
-            return namedBits!;
-        }
+        var tokens = ReadParenthesized();
 
-        // Try the positional-aggregate path. Snapshot the stream, walk
-        // through the comma-separated element list; if every element is a
-        // recognisable bitstring literal, concatenate and return. Any
-        // unrecognised token / nested expression aborts the attempt and we
-        // fall back to the legacy stringify behaviour.
-        if (TryParsePositionalAggregate(out string? bitstring))
-        {
-            return bitstring!;
-        }
-
-        // It's a regular parenthesized expression - skip until closing paren
-        int depth = 1;
-        string expr = "(";
-        while (depth > 0 && _streamer.Current != null)
-        {
-            if (_streamer.Current.Value == "(") depth++;
-            else if (_streamer.Current.Value == ")") depth--;
-
-            if (depth > 0)
-            {
-                expr += _streamer.Current.Value + " ";
-                _streamer.MoveNext();
-            }
-        }
-        expr += ")";
-        _streamer.MoveNext(); // consume final ')'
-        return expr.Trim();
-    }
-
-    /// <summary>
-    /// Tries to read a positional aggregate of the form
-    /// <c>("10101010", "11001100", ..., x"AB")</c> from the current stream
-    /// position (which must already be past the opening '('). On success
-    /// the stream is advanced past the matching ')' and the per-element
-    /// bitstrings are concatenated in declaration order (element 0 first,
-    /// MSB-first within each element). Returns false and rolls back the
-    /// stream when any element fails to convert to a bitstring, so the
-    /// caller can fall back to the legacy expression path.
-    /// </summary>
-    private bool TryParsePositionalAggregate(out string? bitstring)
-    {
-        bitstring = null;
-        _streamer.SetRollBack();
-
-        var elements = new List<string>();
-        int depth = 1;
-        bool first = true;
-
-        while (_streamer.Current != null && depth > 0)
-        {
-            string tok = _streamer.Current.Value ?? string.Empty;
-
-            if (tok == "(") { depth++; _streamer.MoveNext(); continue; }
-            if (tok == ")")
-            {
-                depth--;
-                if (depth == 0) { _streamer.MoveNext(); break; }
-                _streamer.MoveNext();
-                continue;
-            }
-
-            if (tok == ",") { _streamer.MoveNext(); continue; }
-
-            // First non-trivial token decides whether this aggregate is
-            // positional. If the very first thing is an operator or
-            // identifier-followed-by `(`, we bail so a generic expression
-            // like `(A + 1)` still reaches the legacy fallback.
-            string? bits = null;
-            if (tok.Length >= 2 && tok[0] == '"' && tok[^1] == '"')
-            {
-                bits = tok.Substring(1, tok.Length - 2);
-            }
-            else if (tok.Length >= 3 && (tok[0] == 'x' || tok[0] == 'X') && tok[1] == '"' && tok[^1] == '"')
-            {
-                bits = ParseHexLiteral(tok);
-            }
-            else
-            {
-                if (first) { _streamer.RollBack(); return false; }
-                // Mid-aggregate non-literal — also bail; the legacy path
-                // can deal with it (we don't try to evaluate identifiers
-                // here to avoid order-of-declaration surprises).
-                _streamer.RollBack();
-                return false;
-            }
-
-            if (bits != null)
-            {
-                elements.Add(bits);
-                first = false;
-            }
-            _streamer.MoveNext();
-        }
-
-        if (elements.Count == 0) { _streamer.RollBack(); return false; }
-
-        bitstring = string.Concat(elements);
-        return true;
-    }
-
-    /// <summary>
-    /// Tries to read a named-association aggregate of the form
-    /// <c>(0 =&gt; pack(170), 1 =&gt; pack(187), ..., others =&gt; (others =&gt; '0'))</c>
-    /// at the current stream position (past the opening '('). On success the
-    /// stream is advanced past the matching ')' and a contiguous bitstring of
-    /// <c>ElementSize × ArrayLength</c> bits of <c>_currentArray</c> is returned,
-    /// with each value placed at its slot (<see cref="TypeDefinition.SlotOf"/>) and any unspecified slots
-    /// filled by the <c>others</c> fallback (defaults to all-'0' when
-    /// absent). Value expressions are evaluated through the shared
-    /// <see cref="Operation"/> pipeline so user-defined functions, based
-    /// literals, and concatenations all work.
-    /// Returns false (and rolls the stream back) when the aggregate doesn't
-    /// match this shape so the caller can fall through to the legacy path.
-    /// </summary>
-    private bool TryParseNamedAggregate(out string? bitstring)
-    {
-        bitstring = null;
-        _streamer.SetRollBack();
-
-        if (_currentArray is not { } array || array.ArrayLength <= 0) { _streamer.RollBack(); return false; }
-        int elementSize = array.ElementSize;
-        int slots       = array.ArrayLength;
-
-        // Quick pre-scan: the first chunk's syntax must include `=>` at
-        // depth 1 before we hit the closing ')'. Without this we'd grab
-        // unrelated parenthesised expressions like `(A + 1)` from the
-        // legacy fallback.
-        if (!QuickHasArrow()) { _streamer.RollBack(); return false; }
-
-        var slotValues = new string?[slots];
-        string? othersFill = null;
-        bool sawAny = false;
-        int depth = 1; // we're past the opening '('
-
-        // Each iteration consumes one `<key> => <value>` chunk plus the
-        // following `,` or final `)`.
-        while (_streamer.Current != null && depth > 0)
-        {
-            // Read the key.
-            string keyTok = _streamer.Current.Value ?? string.Empty;
-            bool isOthers = keyTok.Equals("others", StringComparison.OrdinalIgnoreCase);
-            int keyIndex = -1;
-            if (isOthers)
-            {
-                _streamer.MoveNext();
-            }
-            else
-            {
-                if (!int.TryParse(keyTok, out keyIndex))
-                {
-                    // Not a simple integer key — bail to the legacy path.
-                    _streamer.RollBack();
-                    return false;
-                }
-                _streamer.MoveNext();
-            }
-
-            if (_streamer.Current?.Value != "=>") { _streamer.RollBack(); return false; }
-            _streamer.MoveNext(); // consume '=>'
-
-            // Collect the value expression tokens up to the next top-level
-            // ',' or the closing ')'. Paren-aware so nested aggregates +
-            // function-call arguments don't terminate the value prematurely.
-            string valueExpr = "";
-            int valueDepth = 0;
-            while (_streamer.Current != null)
-            {
-                string tok = _streamer.Current.Value ?? string.Empty;
-                if (valueDepth == 0 && (tok == "," || tok == ")")) break;
-                if (tok == "(") valueDepth++;
-                else if (tok == ")") valueDepth--;
-                valueExpr += tok + " ";
-                _streamer.MoveNext();
-            }
-            valueExpr = valueExpr.Trim();
-
-            string slotBits = EvaluateAggregateValue(valueExpr, elementSize);
-
-            if (isOthers) othersFill = slotBits;
-            else if (array.SlotOf(keyIndex) is int slot and >= 0) slotValues[slot] = slotBits;
-            sawAny = true;
-
-            // Consume the separator. ',' → next chunk; ')' → done.
-            if (_streamer.Current?.Value == ",")
-            {
-                _streamer.MoveNext();
-                continue;
-            }
-            if (_streamer.Current?.Value == ")")
-            {
-                _streamer.MoveNext();
-                depth = 0;
-                break;
-            }
-            // Unexpected token — bail.
-            _streamer.RollBack();
-            return false;
-        }
-
-        if (!sawAny) { _streamer.RollBack(); return false; }
-
-        // Materialise the bitstring slot-by-slot, MSB-first (slot 0 at the
-        // start of the string — matches DeferredIndex / DynamicIndex slot
-        // extraction).
-        string fill = othersFill ?? new string('0', elementSize);
-        var sb = new System.Text.StringBuilder(elementSize * slots);
-        for (int i = 0; i < slots; i++)
-        {
-            sb.Append(slotValues[i] ?? fill);
-        }
-        bitstring = sb.ToString();
-        return true;
-    }
-
-    /// <summary>
-    /// Cheap lookahead for the named-aggregate detector: returns true when
-    /// the next significant `=&gt;` token appears before the matching outer
-    /// `)`. Doesn't consume the stream.
-    /// </summary>
-    private bool QuickHasArrow()
-    {
-        _streamer.SetRollBack();
-        int depth = 1;
-        bool found = false;
-        while (_streamer.Current != null && depth > 0)
-        {
-            string tok = _streamer.Current.Value ?? string.Empty;
-            if (tok == "(") depth++;
-            else if (tok == ")") { depth--; if (depth == 0) break; }
-            else if (tok == "=>" && depth == 1) { found = true; break; }
-            _streamer.MoveNext();
-        }
-        _streamer.RollBack();
-        return found;
-    }
-
-    /// <summary>
-    /// Evaluates an aggregate value expression (string / hex literal,
-    /// integer literal, identifier, function call, concatenation) to an
-    /// element-wide bitstring. Routes through <see cref="Operation"/> so
-    /// user-defined functions resolve via the existing FunctionExecutor
-    /// path. Falls back to a deterministic all-'U' element when evaluation
-    /// fails so the rest of the aggregate still materialises.
-    /// </summary>
-    private string EvaluateAggregateValue(string expr, int elementSize)
-    {
-        if (string.IsNullOrWhiteSpace(expr))
-            return new string('U', elementSize);
-
-        // Trim a trailing `)` that the value-collector may leave behind
-        // when the value itself is a parenthesised expression — Operation
-        // can handle balanced parens, not stray closers.
-        // (Defensive: the collector above is balance-aware, so this is a
-        // belt-and-braces guard.)
-        expr = expr.Trim();
-
-        // Nested `(others => '0')` shape: handle directly so we don't
-        // have to construct an Operation for a literal-fill aggregate.
-        if (expr.StartsWith("(") && expr.IndexOf("others", StringComparison.OrdinalIgnoreCase) >= 0)
-        {
-            char fill = expr.Contains("'1'") ? '1' : (expr.Contains("'0'") ? '0' : 'U');
-            return new string(fill, elementSize);
-        }
-
-        // String literal `"..."` — strip quotes and pad/truncate.
-        if (expr.Length >= 2 && expr[0] == '"' && expr[^1] == '"')
-            return NormaliseBits(expr.Substring(1, expr.Length - 2), elementSize);
-
-        // Hex literal `x"NN"` — convert via the existing helper.
-        if (expr.Length >= 3 && (expr[0] == 'x' || expr[0] == 'X') && expr[1] == '"' && expr[^1] == '"')
-            return NormaliseBits(ParseHexLiteral(expr), elementSize);
-
-        // General expression — hand off to Operation. Use a combined scope
-        // (ports + constants/signals declared so far) so identifier lookups
-        // can resolve to either side.
-        try
+        // An aggregate packs against the declared object's shape (records,
+        // arrays, vectors); without a shape only positional elements can be
+        // placed (concatenated as written).
+        string group = string.Join(" ", tokens);
+        if (Aggregate.IsAggregate(group) && (_currentShape != null || !group.Contains("=>")))
         {
             var scope = new HashSet<Variable>(_comparator);
-            foreach (var v in Variables) scope.Add(v);
-            var op = new Operation(expr, scope);
-            var result = op.Execute();
-            string bits = result switch
-            {
-                Variable v => v.Value?.ToString() ?? string.Empty,
-                null       => string.Empty,
-                _          => result.ToString() ?? string.Empty,
-            };
-            return NormaliseBits(bits, elementSize);
-        }
-        catch
-        {
-            return new string('U', elementSize);
-        }
-    }
-
-    /// <summary>
-    /// Normalises a raw bit / value string into an element-wide bitstring:
-    /// strips surrounding quotes, pads with '0' on the left when shorter,
-    /// or truncates on the left when longer. Integer-shaped results (e.g.
-    /// <c>"170"</c> from a numeric function call) are converted to base-2.
-    /// </summary>
-    private static string NormaliseBits(string raw, int width)
-    {
-        if (string.IsNullOrEmpty(raw)) return new string('U', width);
-        string s = raw.Replace("\"", string.Empty).Replace("'", string.Empty).Trim();
-
-        bool isBinary = s.Length > 0 && s.All(c => c == '0' || c == '1' || c == 'U' || c == 'X' || c == 'Z');
-        if (!isBinary)
-        {
-            if (int.TryParse(s, out int n))
-            {
-                if (n < 0) n &= (int)((1L << width) - 1);
-                s = Convert.ToString(n, 2);
-            }
-            else return new string('U', width);
+            scope.UnionWith(Variables);
+            return Aggregate.Parse(group, _currentShape, scope).Bits();
         }
 
-        if (s.Length == width) return s;
-        if (s.Length > width)  return s.Substring(s.Length - width);
-        return s.PadLeft(width, '0');
+        // A regular parenthesized expression: kept as text.
+        return ("(" + string.Concat(tokens.Select(t => t + " ")) + ")").Trim();
     }
 
     /// <summary>
@@ -1603,9 +998,7 @@ public class VariableSyntetizer : ISControl
     {
         // Remove x" prefix and " suffix
         string hex = hexLiteral.Substring(2, hexLiteral.Length - 3);
-        string binary = string.Join("", hex.Select(c =>
-            Convert.ToString(Convert.ToInt32(c.ToString(), 16), 2).PadLeft(4, '0')));
-        return binary;
+        return HdlLiteral.HexBits(hex);
     }
 
     /// <summary>
@@ -1825,6 +1218,242 @@ public class VariableSyntetizer : ISControl
     }
 
     /// <summary>
+    /// A parsed subtype indication — type mark plus optional constraint — as the
+    /// object it declares will hold it: storage type, width in characters, the
+    /// declared range as written, the user type (if any) and, for integers,
+    /// whether the range needs a sign bit.
+    /// </summary>
+    private readonly record struct SubtypeIndication(
+        Constants.DATATYPES Type, TypeDefinition? Custom, int Width,
+        int? Left, int? Right, bool IsDownto, bool Signed);
+
+    /// <summary>A template object of <paramref name="subtype"/> (record fields, array elements, initializer shape).</summary>
+    private static Variable ShapeOf(SubtypeIndication subtype) =>
+        ApplyShape(new Variable { Type = subtype.Type, Size = subtype.Width }, subtype);
+
+    /// <summary>
+    /// Gives <paramref name="v"/> the shape declared by <paramref name="subtype"/>:
+    /// declared range, array geometry (element width, element template, range of
+    /// every constrained array — also arrays of scalars, so <c>array (0 to 7)</c>
+    /// indexes ascending), record layout and user/enum type names. The single
+    /// place objects, record fields and array elements get their shape.
+    /// </summary>
+    private static Variable ApplyShape(Variable v, SubtypeIndication subtype)
+    {
+        if (subtype.Left is int left && subtype.Right is int right)
+            v.SetDeclaredRange(left, right, subtype.IsDownto);
+        var t = subtype.Custom;
+        switch (t?.Kind)
+        {
+            case TypeKind.Array:
+                if (!t.IsUnconstrained)
+                {
+                    var (l, r) = t.DeclaredRange;
+                    v.SetDeclaredRange(l, r, t.IsDownto);
+                }
+                if (t.ElementSize > 1)
+                {
+                    v.ElementSize = t.ElementSize;
+                    v.ArrayLength = t.ArrayLength;
+                    v.ElementShape = t.ElementShape;
+                    if (string.IsNullOrEmpty(v.CustomTypeName))
+                        v.CustomTypeName = t.Name;
+                }
+                break;
+            case TypeKind.Record:
+                v.Layout = t.Layout;
+                v.CustomTypeName = t.Name;
+                break;
+            case TypeKind.Enumeration:
+                // Kept apart from CustomTypeName so the case numeric/exhaustiveness
+                // gates that key on CustomTypeName are unaffected (precise-C10).
+                v.EnumTypeName = t.Name;
+                v.EnumLiterals = t.EnumValues;
+                break;
+        }
+        return v;
+    }
+
+    /// <summary>
+    /// Reads (without consuming) the type mark at the cursor and resolves a
+    /// user type: local registry, this parser's types, then package types.
+    /// </summary>
+    private (Constants.DATATYPES Type, string Name, TypeDefinition? Custom) PeekTypeMark()
+    {
+        string name = _streamer.Current?.Value?.ToLower() ?? string.Empty;
+        var type = Variable.GetDatatype(name);
+        TypeDefinition? custom = type != Constants.DATATYPES.UNKNOWN ? null
+            : _typeRegistry?.Get(name) ?? ParsedTypes.Get(name) ?? PackageSubtypeScanner.LookupGlobally(name);
+        return (type, name, custom);
+    }
+
+    /// <summary>
+    /// Consumes a subtype indication whose type mark was resolved by
+    /// <see cref="PeekTypeMark"/>. The single parser of «type + constraint» for
+    /// object declarations, record fields and array elements.
+    /// </summary>
+    private SubtypeIndication ParseSubtypeIndication((Constants.DATATYPES Type, string Name, TypeDefinition? Custom) mark)
+    {
+        var dataType = mark.Type;
+        string dataTypeStr = mark.Name;
+        var customTypeDef = mark.Custom;
+        bool signedInt = dataType == Constants.DATATYPES.INTEGER;
+        // v0.13.0: Handle custom types - they are IDENTIFIERS not KEYWORDS
+        // For custom types found in the registry, consume the type identifier directly
+        if (customTypeDef != null)
+        {
+            _streamer.Expect(IDENTIFIERS); // consume custom type name (e.g., 'reg_array_t')
+        }
+        else
+        {
+            _streamer.Expect(KEYWORDS); // consume standard type keyword (e.g., 'std_logic')
+        }
+        int VectorSize = 0;
+
+        // Declared vector range (VHDL 'left/'right/direction), captured here
+        // and applied to the created Variable below so index/slice/attribute
+        // resolution honours to/downto and non-zero low bounds. Null => no
+        // range recorded => conventional (Size-1 downto 0) fallback.
+        int? declLeft = null;
+        int? declRight = null;
+        bool declIsDownto = true;
+
+        // Set default size for single-bit types
+        if (dataType == Constants.DATATYPES.STD_LOGIC || dataType == Constants.DATATYPES.BIT)
+        {
+            VectorSize = 1;
+        }
+
+        // Handle vector types with parentheses (std_logic_vector, bit_vector, signed, unsigned, etc.)
+        if (dataType == Constants.DATATYPES.STD_LOGIC_VECTOR ||
+            dataTypeStr == "bit_vector" || dataTypeStr == "signed" || dataTypeStr == "unsigned" ||
+            dataTypeStr == "std_ulogic_vector" || dataTypeStr == "boolean_vector" || dataTypeStr == "integer_vector")
+        {
+            if (_streamer.Current?.Value == "(")
+            {
+                // `(7 downto 0)`, `(0 to 7)`, `(W-1 downto 0)`: bounds folded from
+                // literals, constants and generics; unresolvable bounds keep the
+                // historical width of 8.
+                if (FoldRange(ReadParenthesized()) is { } range)
+                {
+                    int width = range.IsDownto ? range.Left - range.Right + 1 : range.Right - range.Left + 1;
+                    VectorSize = width > 0 ? width : 8;
+                    declLeft = range.Left;
+                    declRight = range.Right;
+                    declIsDownto = range.IsDownto;
+                }
+                else
+                {
+                    VectorSize = 8;
+                }
+            }
+        }
+        // Handle integer/natural/positive with optional range constraint
+        else if (dataType == Constants.DATATYPES.INTEGER || dataType == Constants.DATATYPES.NATURAL ||
+                 dataTypeStr == "positive")
+        {
+            if (_streamer.Current?.Value?.ToLower() == "range")
+            {
+                _streamer.Expect(KEYWORDS); // consume "range"
+                // F-G-02 fix (session 8, 2026-07-09): scoped
+                // PackageRegistry lookup for range bounds. Prior code
+                // called GetVariableValue which registers a placeholder
+                // (Value=0) for any identifier not in local scope, so
+                // `range 0 to BUZ_LONG_TICKS` collapsed to `0 to 0` and
+                // yielded width 1. Now, if the current token is an
+                // identifier that resolves in PackageRegistry, use that
+                // constant's value directly and advance the stream —
+                // otherwise fall back to GetVariableValue's legacy
+                // behaviour. Keeping the PackageRegistry lookup ONLY in
+                // this branch (not in GetVariableValue itself) avoids
+                // disturbing initializer / expression paths that read
+                // signals whose *names* happen to shadow constants.
+                int initial = ReadRangeBound();
+                _streamer.Expect(KEYWORDS); // consume "to"
+                int end = ReadRangeBound();
+                VectorSize = RangeToBitWidth(initial, end);
+            signedInt = Math.Min(initial, end) < 0;
+            }
+        }
+        // Handle time type - will be handled in initialization
+        // Handle real type - will be handled in initialization
+        // Handle RANGE standalone type
+        else if (dataType == Constants.DATATYPES.RANGE)
+        {
+            object varValue = GetVariableValue();
+            int initial = Convert.ToInt32(varValue);
+            _streamer.Expect(KEYWORDS);
+            varValue = GetVariableValue();
+            int end = Convert.ToInt32(varValue);
+            VectorSize = Math.Abs(end - initial);
+        }
+        // Handle custom types from registry
+        else if (customTypeDef != null)
+        {
+            // Index constraint at the use site: `coeff_array_t(0 to N-1)` for an
+            // unconstrained array type (any other parenthesised constraint is skipped).
+            if (_streamer.Current?.Value == "(")
+            {
+                var bounds = ReadParenthesized();
+                if (customTypeDef is { Kind: TypeKind.Array, IsUnconstrained: true } && FoldRange(bounds) is { } range)
+                    customTypeDef = customTypeDef.Constrain(range.Left, range.Right, range.IsDownto);
+            }
+            VectorSize = customTypeDef.TotalSize;
+            // For custom types, use base type if available (for arrays/subtypes)
+            if (customTypeDef.Kind == TypeKind.Array)
+            {
+                dataType = customTypeDef.BaseType != Constants.DATATYPES.UNKNOWN
+                    ? customTypeDef.BaseType
+                    : Constants.DATATYPES.STD_LOGIC_VECTOR;
+            }
+            else if (customTypeDef.Kind == TypeKind.Enumeration)
+            {
+                // Enum types can be stored as integers representing enum index
+                dataType = Constants.DATATYPES.INTEGER;
+            }
+            else if (customTypeDef.Kind == TypeKind.Subtype)
+            {
+                dataType = customTypeDef.BaseType;
+                // Inherit the subtype's declared range so signals of a
+                // subtype like `byte is std_logic_vector(7 downto 0)` index
+                // correctly. SubtypeRange is stored (High=max, Low=min).
+                if (customTypeDef.BaseType == Constants.DATATYPES.STD_LOGIC_VECTOR)
+                {
+                    declLeft = customTypeDef.IsDownto ? customTypeDef.SubtypeRange.High : customTypeDef.SubtypeRange.Low;
+                    declRight = customTypeDef.IsDownto ? customTypeDef.SubtypeRange.Low : customTypeDef.SubtypeRange.High;
+                    declIsDownto = customTypeDef.IsDownto;
+                }
+            }
+            // For records, use STD_LOGIC_VECTOR as storage type
+            else if (customTypeDef.Kind == TypeKind.Record)
+            {
+                dataType = Constants.DATATYPES.STD_LOGIC_VECTOR;
+            }
+        }
+        return new SubtypeIndication(dataType, customTypeDef, VectorSize, declLeft, declRight, declIsDownto, signedInt);
+    }
+
+    /// <summary>
+    /// Parses every <c>type … ;</c> declaration of a package's declarative text
+    /// (records, enumerations, arrays) with the same type parser as an
+    /// architecture and registers them into <paramref name="into"/>. Returns the
+    /// parsed types so the caller can publish enum literals.
+    /// </summary>
+    public static IReadOnlyList<TypeDefinition> RegisterTypeDeclarations(string declarativeText, TypeRegistry into)
+    {
+        var streamer = TokenStream.FromLines(declarativeText.Split('\n'));
+        var parser = new VariableSyntetizer(streamer, new HashSet<Variable>(), TypeRegistry: into);
+        while (streamer.Current != null)
+        {
+            if (streamer.Current.Value.Equals("type", StringComparison.OrdinalIgnoreCase))
+                parser.ParseTypeDeclaration();
+            else
+                streamer.MoveNext();
+        }
+        return parser.ParsedTypes.Types.Values.ToList();
+    }
+
+    /// <summary>
     /// Parses a type declaration and registers it in the type registry.
     /// Handles: enumeration types, array types, record types
     /// </summary>
@@ -1896,18 +1525,9 @@ public class VariableSyntetizer : ISControl
             // string-to-string so the literal flows straight through.
             if (typeDef.Kind == TypeKind.Enumeration)
             {
-                foreach (var literal in typeDef.EnumValues)
-                {
-                    if (string.IsNullOrEmpty(literal)) continue;
-                    if (Variables.Any(v => v.Name.Equals(literal, StringComparison.OrdinalIgnoreCase)))
-                        continue;
-                    Variables.Add(new Variable
-                    {
-                        Name = literal,
-                        Type = Constants.DATATYPES.INTEGER,
-                        Value = literal,
-                    });
-                }
+                foreach (var literal in typeDef.LiteralConstants())
+                    if (!Variables.Any(v => v.Name.Equals(literal.Name, StringComparison.OrdinalIgnoreCase)))
+                        Variables.Add(literal);
             }
         }
     }
@@ -1958,238 +1578,137 @@ public class VariableSyntetizer : ISControl
     }
 
     /// <summary>
-    /// Parses an array type declaration.
-    /// Example: type mem_t is array (0 to 255) of std_logic_vector(7 downto 0);
+    /// Parses <c>array (L to|downto R) of element</c> (or <c>(natural range &lt;&gt;)</c>).
+    /// Bounds may be constant expressions (<c>0 to N-1</c>); the element subtype
+    /// is parsed like a record element, so arrays of records and of constrained
+    /// vectors carry their element width and template.
     /// </summary>
     private TypeDefinition ParseArrayType(string typeName)
     {
-        var typeDef = new TypeDefinition
-        {
-            Name = typeName,
-            Kind = TypeKind.Array
-        };
+        var typeDef = new TypeDefinition { Name = typeName, Kind = TypeKind.Array };
+        _streamer.MoveNext(); // 'array'
 
-        // Skip 'array'
-        if (_streamer.Current?.Value.ToLower() == "array")
-        {
-            _streamer.MoveNext();
-        }
-
-        // Parse array bounds: (0 to 255) or (natural range <>)
         if (_streamer.Current?.Value == "(")
         {
-            _streamer.MoveNext(); // skip '('
-
-            // Check for unconstrained array (natural range <>)
-            if (_streamer.Current?.Value.ToLower() == "natural" ||
-                _streamer.Current?.Value.ToLower() == "integer" ||
-                _streamer.Current?.Value.ToLower() == "positive")
-            {
+            var bounds = ReadParenthesized();
+            if (bounds.Contains("<>"))
                 typeDef.IsUnconstrained = true;
-                // Skip to closing ')'
-                while (_streamer.Current != null && _streamer.Current.Value != ")")
-                {
-                    _streamer.MoveNext();
-                }
-            }
-            else
+            else if (FoldRange(bounds) is { } range)
             {
-                // Parse constrained bounds: low to/downto high
-                if (int.TryParse(_streamer.Current?.Value, out int lowBound))
-                {
-                    _streamer.MoveNext(); // skip low bound
-
-                    // Get direction (to or downto)
-                    string direction = _streamer.Current?.Value.ToLower() ?? "to";
-                    typeDef.IsDownto = direction == "downto";
-                    _streamer.MoveNext(); // skip 'to' or 'downto'
-
-                    // Get high bound
-                    if (int.TryParse(_streamer.Current?.Value, out int highBound))
-                    {
-                        if (typeDef.IsDownto)
-                        {
-                            typeDef.ArrayBounds = (highBound, lowBound);
-                        }
-                        else
-                        {
-                            typeDef.ArrayBounds = (lowBound, highBound);
-                        }
-                        _streamer.MoveNext(); // skip high bound
-                    }
-                }
+                typeDef.IsDownto = range.IsDownto;
+                typeDef.ArrayBounds = (Math.Min(range.Left, range.Right), Math.Max(range.Left, range.Right));
             }
-
-            // Skip to closing ')'
-            while (_streamer.Current != null && _streamer.Current.Value != ")")
-            {
-                _streamer.MoveNext();
-            }
-            if (_streamer.Current?.Value == ")")
-                _streamer.MoveNext();
+            else if (!bounds.Any(t => t.Equals("to", StringComparison.OrdinalIgnoreCase) || t.Equals("downto", StringComparison.OrdinalIgnoreCase)))
+                typeDef.IsUnconstrained = true;
         }
 
-        // Skip 'of'
-        if (_streamer.Current?.Value.ToLower() == "of")
-        {
+        if (_streamer.Current?.Value.Equals("of", StringComparison.OrdinalIgnoreCase) == true)
             _streamer.MoveNext();
-        }
 
-        // Get element type
-        string elementTypeName = _streamer.Current?.Value ?? "std_logic";
-        typeDef.BaseTypeName = elementTypeName;
-        typeDef.BaseType = Variable.GetDatatype(elementTypeName);
-        _streamer.MoveNext();
-
-        // Check for element vector size: std_logic_vector(7 downto 0)
-        if (_streamer.Current?.Value == "(")
+        typeDef.BaseTypeName = _streamer.Current?.Value ?? "std_logic";
+        var element = ParseElementSubtype();
+        typeDef.BaseType = element.Shape.Type;
+        // Integer/enum elements keep the legacy one-slot width until per-element
+        // decoding exists for them (pending, see the v3.1.2 plan).
+        if (element.Kind is FieldKind.Vector or FieldKind.Record)
         {
-            _streamer.MoveNext(); // skip '('
-
-            if (int.TryParse(_streamer.Current?.Value, out int elemHigh))
-            {
-                _streamer.MoveNext(); // skip high
-                _streamer.MoveNext(); // skip 'downto' or 'to'
-
-                if (int.TryParse(_streamer.Current?.Value, out int elemLow))
-                {
-                    typeDef.ElementSize = Math.Abs(elemHigh - elemLow) + 1;
-                    _streamer.MoveNext(); // skip low
-                }
-            }
-
-            // Skip to closing ')'
-            while (_streamer.Current != null && _streamer.Current.Value != ")")
-            {
-                _streamer.MoveNext();
-            }
-            if (_streamer.Current?.Value == ")")
-                _streamer.MoveNext();
-        }
-        else if (typeDef.BaseType == Constants.DATATYPES.STD_LOGIC ||
-                 typeDef.BaseType == Constants.DATATYPES.BIT)
-        {
-            typeDef.ElementSize = 1;
+            typeDef.ElementSize = element.Width;
+            typeDef.ElementShape = element.Shape;
         }
 
-        // Skip ';'
         if (_streamer.Current?.Value == ";")
             _streamer.MoveNext();
-
-#if DEBUG
-        Console.WriteLine($"[ParseTypeDeclaration] Array '{typeName}': ({typeDef.ArrayBounds.Low} to {typeDef.ArrayBounds.High}) of {typeDef.BaseTypeName}, ElementSize={typeDef.ElementSize}, TotalSize={typeDef.TotalSize}");
-#endif
-
         return typeDef;
     }
 
     /// <summary>
-    /// Parses a record type declaration.
-    /// Example: type packet_t is record valid: std_logic; data: std_logic_vector(7 downto 0); end record;
+    /// Parses <c>record … end record [name];</c>. Each element declaration is an
+    /// identifier list (<c>lo, hi : std_logic;</c>) with a subtype indication
+    /// parsed like an object's, so constants in bounds, integer ranges, enums,
+    /// nested records and arrays get their real width.
     /// </summary>
     private TypeDefinition ParseRecordType(string typeName)
     {
-        var typeDef = new TypeDefinition
+        _streamer.MoveNext(); // 'record'
+        var fields = new List<FieldSlot>();
+        int guard = 0;
+        while (_streamer.Current != null && guard++ < 1000)
         {
-            Name = typeName,
-            Kind = TypeKind.Record
-        };
-
-        // Skip 'record'
-        if (_streamer.Current?.Value.ToLower() == "record")
-        {
-            _streamer.MoveNext();
-        }
-
-        int iterations = 0;
-        const int MAX_ITERATIONS = 1000;
-
-        // Parse fields until 'end record'
-        while (_streamer.Current != null && iterations < MAX_ITERATIONS)
-        {
-            iterations++;
-            string val = _streamer.Current.Value.ToLower();
-
-            if (val == "end")
+            if (_streamer.Current.Value.Equals("end", StringComparison.OrdinalIgnoreCase))
             {
-                _streamer.MoveNext(); // skip 'end'
-                if (_streamer.Current?.Value.ToLower() == "record")
-                {
-                    _streamer.MoveNext(); // skip 'record'
-                }
-                // Skip optional type name after 'end record'
-                if (_streamer.Current?.Type == IDENTIFIERS)
-                {
+                _streamer.MoveNext(); // 'end'
+                if (_streamer.Current?.Value.Equals("record", StringComparison.OrdinalIgnoreCase) == true)
                     _streamer.MoveNext();
-                }
+                if (_streamer.Current?.Type == IDENTIFIERS)
+                    _streamer.MoveNext(); // optional type name
                 break;
             }
 
-            // Parse field: fieldName : fieldType;
-            if (_streamer.Current?.Type == IDENTIFIERS)
+            var names = new List<string>();
+            while (_streamer.Current?.Type == IDENTIFIERS)
             {
-                string fieldName = _streamer.Current.Value;
+                names.Add(_streamer.Current.Value);
                 _streamer.MoveNext();
-
-                if (_streamer.Current?.Value == ":")
-                {
-                    _streamer.MoveNext(); // skip ':'
-
-                    string fieldTypeName = _streamer.Current?.Value ?? "std_logic";
-                    var fieldType = Variable.GetDatatype(fieldTypeName);
-                    _streamer.MoveNext();
-
-                    int fieldSize = 1;
-                    // Check for vector size
-                    if (_streamer.Current?.Value == "(")
-                    {
-                        _streamer.MoveNext(); // skip '('
-                        if (int.TryParse(_streamer.Current?.Value, out int high))
-                        {
-                            _streamer.MoveNext();
-                            _streamer.MoveNext(); // skip direction
-                            if (int.TryParse(_streamer.Current?.Value, out int low))
-                            {
-                                fieldSize = Math.Abs(high - low) + 1;
-                                _streamer.MoveNext();
-                            }
-                        }
-                        // Skip to ')'
-                        while (_streamer.Current != null && _streamer.Current.Value != ")")
-                            _streamer.MoveNext();
-                        if (_streamer.Current?.Value == ")")
-                            _streamer.MoveNext();
-                    }
-
-                    var field = new Variable
-                    {
-                        Name = fieldName,
-                        Type = fieldType,
-                        Size = fieldSize
-                    };
-                    typeDef.RecordFields.Add(field);
-
-                    // Skip ';'
-                    if (_streamer.Current?.Value == ";")
-                        _streamer.MoveNext();
-
-                    continue;
-                }
+                if (_streamer.Current?.Value != ",") break;
+                _streamer.MoveNext(); // ','
             }
+            if (names.Count == 0 || _streamer.Current?.Value != ":")
+            {
+                _streamer.MoveNext();
+                continue;
+            }
+            _streamer.MoveNext(); // ':'
 
-            _streamer.MoveNext();
+            var field = ParseElementSubtype();
+            int skipped = 0;
+            SkipToSemicolonSafe(ref skipped, 1000);
+            fields.AddRange(names.Select(n => field with { Name = n }));
         }
-
-        // Skip final ';'
         if (_streamer.Current?.Value == ";")
             _streamer.MoveNext();
 
-#if DEBUG
-        Console.WriteLine($"[ParseTypeDeclaration] Record '{typeName}': {typeDef.RecordFields.Count} fields, TotalSize={typeDef.TotalSize}");
-#endif
-
-        return typeDef;
+        return new TypeDefinition
+        {
+            Name = typeName,
+            Kind = TypeKind.Record,
+            Layout = new RecordLayout(typeName, fields),
+        };
     }
+
+    /// <summary>
+    /// Parses the subtype indication of a record element or array element into
+    /// a <see cref="FieldSlot"/> (name and offset are set by the caller /
+    /// <see cref="RecordLayout"/>). An unresolvable type mark (e.g. a local
+    /// subtype Kmila drops) becomes an opaque 32-bit vector, like an object
+    /// of unknown type.
+    /// </summary>
+    private FieldSlot ParseElementSubtype()
+    {
+        var mark = PeekTypeMark();
+        if (mark.Type == Constants.DATATYPES.UNKNOWN && mark.Custom == null)
+        {
+            var opaque = new Variable { Type = Constants.DATATYPES.STD_LOGIC_VECTOR, Size = 32, CustomTypeName = mark.Name };
+            return new FieldSlot(string.Empty, 0, 32, FieldKind.Vector, opaque);
+        }
+        var subtype = ParseSubtypeIndication(mark);
+        var shape = ShapeOf(subtype);
+        var t = subtype.Custom;
+        if (t?.Kind == TypeKind.Record)
+            return new FieldSlot(string.Empty, 0, t.Layout!.Width, FieldKind.Record, shape);
+        if (t?.Kind == TypeKind.Enumeration)
+            return new FieldSlot(string.Empty, 0, Math.Max(subtype.Width, 1), FieldKind.Enum, shape);
+        if (t?.Kind == TypeKind.Array)
+            return new FieldSlot(string.Empty, 0, Math.Max(subtype.Width, 1), FieldKind.Vector, shape);
+        return subtype.Type switch
+        {
+            Constants.DATATYPES.INTEGER or Constants.DATATYPES.NATURAL =>
+                new FieldSlot(string.Empty, 0, subtype.Width > 0 ? subtype.Width : 32, FieldKind.Integer, shape, subtype.Signed),
+            Constants.DATATYPES.BOOLEAN => new FieldSlot(string.Empty, 0, 1, FieldKind.Boolean, shape),
+            Constants.DATATYPES.STD_LOGIC or Constants.DATATYPES.BIT => new FieldSlot(string.Empty, 0, 1, FieldKind.Logic, shape),
+            _ => new FieldSlot(string.Empty, 0, Math.Max(subtype.Width, 1), FieldKind.Vector, shape),
+        };
+    }
+
 
     /// <summary>
     /// Safely skips to semicolon with iteration limit.
@@ -2958,6 +2477,42 @@ public class VariableSyntetizer : ISControl
     }
 
     /// <summary>
+    /// Consumes a parenthesised group at the cursor and returns the tokens
+    /// between its outer parentheses.
+    /// </summary>
+    private List<string> ReadParenthesized()
+    {
+        var tokens = new List<string>();
+        _streamer.MoveNext(); // '('
+        int depth = 0;
+        while (_streamer.Current != null && !(_streamer.Current.Value == ")" && depth == 0))
+        {
+            if (_streamer.Current.Value == "(") depth++;
+            else if (_streamer.Current.Value == ")") depth--;
+            tokens.Add(_streamer.Current.Value);
+            _streamer.MoveNext();
+        }
+        if (_streamer.Current?.Value == ")")
+            _streamer.MoveNext();
+        return tokens;
+    }
+
+    /// <summary>
+    /// Folds <c>L to|downto R</c> range tokens with constant bounds; null when
+    /// there is no direction keyword or a bound is not constant.
+    /// </summary>
+    private (int Left, int Right, bool IsDownto)? FoldRange(List<string> tokens)
+    {
+        int dir = tokens.FindIndex(t => t.Equals("to", StringComparison.OrdinalIgnoreCase)
+                                     || t.Equals("downto", StringComparison.OrdinalIgnoreCase));
+        if (dir <= 0) return null;
+        return FoldSimpleExpr(tokens.GetRange(0, dir)) is int left
+               && FoldSimpleExpr(tokens.GetRange(dir + 1, tokens.Count - dir - 1)) is int right
+            ? (left, right, tokens[dir].Equals("downto", StringComparison.OrdinalIgnoreCase))
+            : null;
+    }
+
+    /// <summary>
     /// F-G-01 helper (session 8, 2026-07-09): fold a small VHDL range-bound
     /// expression to an integer. Handles integer literals, single-token
     /// constant references (resolved via PackageRegistry), and left-to-right
@@ -2965,7 +2520,7 @@ public class VariableSyntetizer : ISControl
     /// when the expression contains anything more complex — the caller then
     /// falls back to the pre-existing default-8 behaviour.
     /// </summary>
-    private static int? FoldSimpleExpr(List<string> tokens)
+    private int? FoldSimpleExpr(List<string> tokens)
     {
         // Filter out whitespace-only tokens defensively.
         var t = tokens.Where(x => !string.IsNullOrWhiteSpace(x)).ToList();
@@ -3009,10 +2564,16 @@ public class VariableSyntetizer : ISControl
     /// Resolves a single token to an integer: literal → parse; identifier →
     /// look up in <see cref="PackageRegistry"/>. Returns null on miss.
     /// </summary>
-    private static int? ResolveToken(string token)
+    private int? ResolveToken(string token)
     {
         string s = token.Replace("_", string.Empty);
         if (int.TryParse(s, out int lit)) return lit;
+
+        // Constants and generics already declared in this scope (`constant W`,
+        // `generic (WIDTH …)`) before package constants.
+        var local = Variables.FirstOrDefault(v => v.IsConstant && v.Name.Equals(token, StringComparison.OrdinalIgnoreCase))
+                    ?? _comparator.FirstOrDefault(v => v.IsConstant && v.Name.Equals(token, StringComparison.OrdinalIgnoreCase));
+        if (local is not null && int.TryParse(local.Value?.ToString(), out int lc)) return lc;
 
         var c = PackageRegistry.Instance.GetConstant(token);
         if (c?.Value is int ci) return ci;
@@ -3054,6 +2615,14 @@ public class VariableSyntetizer : ISControl
     /// </summary>
     private int ReadRangeBound()
     {
+        // A signed bound (`range -4 to 3`): the sign applies to the bound after it.
+        if (_streamer.Current?.Value is "-" or "+")
+        {
+            bool negative = _streamer.Current.Value == "-";
+            _streamer.MoveNext();
+            int magnitude = ReadRangeBound();
+            return negative ? -magnitude : magnitude;
+        }
         // Peek: identifier that PackageRegistry knows about?
         if (_streamer.Current?.Type == IDENTIFIERS)
         {

@@ -194,12 +194,8 @@ public class FunctionExecutor
             // Variable.PortType is IN). Pass 8 (2026-07-29): without this,
             // procedure calls inside function bodies that write to caller
             // locals via bound-body Operations throw before the write.
-            var clone = new Variable(localVar.Name, localVar.Value?.ToString() ?? "", localVar.Type)
-            {
-                Size = localVar.Size,
-                CustomTypeName = localVar.CustomTypeName,
-                PortType = Parser.Models.Constants.PortType.OUT
-            };
+            var clone = localVar.CloneShaped();
+            clone.PortType = Parser.Models.Constants.PortType.OUT;
             localScope.Add(clone);
         }
 
@@ -227,29 +223,9 @@ public class FunctionExecutor
         }
 
         // Tokenize the body
-        Tokenizer tokenizer = new();
-        List<Token> allTokens = new();
-
-        // Tokenize each line of the body
-        foreach (var line in function.BodyLines ?? Array.Empty<string>())
-        {
-            if (string.IsNullOrWhiteSpace(line)) continue;
-            tokenizer.TokenizeLine(line);
-        }
-
-        // If BodyRaw is set, tokenize it as a single block
-        if (!string.IsNullOrEmpty(function.BodyRaw))
-        {
-            foreach (var line in function.BodyRaw.Split('\n'))
-            {
-                if (string.IsNullOrWhiteSpace(line)) continue;
-                tokenizer.TokenizeLine(line);
-            }
-        }
-
-        tokenizer.Evaluate();
-        var tokens = tokenizer.GetDictionaryType();
-        TokenStream streamer = new(tokens);
+        // Body lines, then BodyRaw (when set) as one more block.
+        var streamer = TokenStream.FromLines((function.BodyLines ?? Array.Empty<string>())
+            .Concat(string.IsNullOrEmpty(function.BodyRaw) ? [] : function.BodyRaw.Split('\n')));
 
         // Parse the body using Process-like parsing
         function.SynthesizedBody = ParseFunctionBody(streamer, localScope);
@@ -602,12 +578,8 @@ public class FunctionExecutor
         // parallel to the fn-local fix in CreateLocalScope at :205.
         foreach (var localVar in procedure.LocalVariables)
         {
-            var clone = new Variable(localVar.Name, localVar.Value?.ToString() ?? "", localVar.Type)
-            {
-                Size = localVar.Size,
-                CustomTypeName = localVar.CustomTypeName,
-                PortType = Parser.Models.Constants.PortType.OUT
-            };
+            var clone = localVar.CloneShaped();
+            clone.PortType = Parser.Models.Constants.PortType.OUT;
             localScope.Add(clone);
         }
 
@@ -634,28 +606,9 @@ public class FunctionExecutor
             return;
         }
 
-        Tokenizer tokenizer = new();
-
-        // Tokenize each line of the body
-        foreach (var line in procedure.BodyLines ?? Array.Empty<string>())
-        {
-            if (string.IsNullOrWhiteSpace(line)) continue;
-            tokenizer.TokenizeLine(line);
-        }
-
-        // If BodyRaw is set, tokenize it as a single block
-        if (!string.IsNullOrEmpty(procedure.BodyRaw))
-        {
-            foreach (var line in procedure.BodyRaw.Split('\n'))
-            {
-                if (string.IsNullOrWhiteSpace(line)) continue;
-                tokenizer.TokenizeLine(line);
-            }
-        }
-
-        tokenizer.Evaluate();
-        var tokens = tokenizer.GetDictionaryType();
-        TokenStream streamer = new(tokens);
+        // Body lines, then BodyRaw (when set) as one more block.
+        var streamer = TokenStream.FromLines((procedure.BodyLines ?? Array.Empty<string>())
+            .Concat(string.IsNullOrEmpty(procedure.BodyRaw) ? [] : procedure.BodyRaw.Split('\n')));
 
         procedure.SynthesizedBody = ParseFunctionBody(streamer, localScope);
     }

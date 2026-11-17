@@ -547,6 +547,10 @@ public sealed class SourceElaborator
 
         var declSb = new StringBuilder(parent.ArchitectureDeclPart);
         var bodySb = new StringBuilder();
+        // Type declarations already in the flattened declarative part (name → text).
+        var emittedTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (name, text, _, _) in TypeDeclarations(parent.ArchitectureDeclPart))
+            emittedTypes.TryAdd(name, text);
 
         int cursor = 0;
         foreach (Match im in InstanceRe.Matches(parent.ArchitectureBody))
@@ -600,9 +604,11 @@ public sealed class SourceElaborator
             // `tb : u1 = calc_top, u2 = calc_top` collapsed both grandchild
             // signals to the same `u_scan__foo` and the parser saw duplicates.
             string aliasPrefix = $"{pathPrefix}{label}__";
+            // A formal written with selectors (`p.lo => a`, `v(0) => b`) renames
+            // and declares its base port once; each association wires its part.
             foreach (var kv in portMappings)
             {
-                rename[kv.Key] = aliasPrefix + kv.Key;
+                rename[FormalBase(kv.Key)] = aliasPrefix + FormalBase(kv.Key);
             }
 
             // Internal child signals → prefix with `<instance_label>__`.
@@ -652,12 +658,14 @@ public sealed class SourceElaborator
                     { [kv.Key] = kv.Value });
             }
 
+            childDecl = DeduplicateTypes(childDecl, ref childBody, emittedTypes, aliasPrefix);
+
             declSb.AppendLine();
             declSb.AppendLine($"  -- ↓ inlined from component {label} : {entName}");
-            foreach (var kv in portMappings)
+            foreach (var formal in portMappings.Select(kv => FormalBase(kv.Key)).Distinct(StringComparer.OrdinalIgnoreCase))
             {
-                var aliasName = aliasPrefix + kv.Key;
-                if (portInfo.TryGetValue(kv.Key, out var info))
+                var aliasName = aliasPrefix + formal;
+                if (portInfo.TryGetValue(formal, out var info))
                 {
                     // P4 bug: port type text may reference the child's
                     // generics (e.g. `STD_LOGIC_VECTOR(WIDTH-1 downto 0)`).
@@ -688,7 +696,7 @@ public sealed class SourceElaborator
             {
                 var aliasName = aliasPrefix + kv.Key;
                 var mapped = kv.Value;
-                if (!portInfo.TryGetValue(kv.Key, out var info))
+                if (!portInfo.TryGetValue(FormalBase(kv.Key), out var info))
                 {
                     bodySb.AppendLine($"  {aliasName} <= {mapped};");
                     continue;
@@ -714,18 +722,6 @@ public sealed class SourceElaborator
 
         return (declSb.ToString(), bodySb.ToString());
     }
-
-    private static readonly Regex SimpleIdentRe = new(@"^\s*[a-zA-Z_][a-zA-Z0-9_]*\s*$", RegexOptions.Compiled);
-
-    /// <summary>
-    /// True when the port-map RHS is a bare identifier (no subscript, slice,
-    /// concatenation, or function call). Used by the elaborator to decide
-    /// whether an output port can be direct-bound to the parent's signal
-    /// (bypassing the alias-hop) or whether the alias has to stay so the
-    /// sliced LHS works inside the inlined child body.
-    /// </summary>
-    private static bool IsSimpleIdentifier(string mapped)
-        => !string.IsNullOrWhiteSpace(mapped) && SimpleIdentRe.IsMatch(mapped);
 
     /// <summary>
     /// Filters out matches of the instance regex that are actually labelled
@@ -909,11 +905,71 @@ public sealed class SourceElaborator
         }
     }
 
+    /// <summary>Port named by a formal that may carry selectors: <c>p</c> for <c>p.lo</c> or <c>p(3)</c>.</summary>
+    private static string FormalBase(string formal)
+    {
+        int cut = formal.IndexOfAny(['.', '(']);
+        return (cut < 0 ? formal : formal[..cut]).Trim();
+    }
+
+    private static readonly Regex TypeDeclStartRe = new(@"\btype\s+(?<name>\w+)\s+is\s+(?<kind>record\b)?", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex EndRecordRe = new(@"\bend\s+record\b[^;]*;", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>
+    /// <c>type … ;</c> declarations of a declarative part: name, normalised text
+    /// (lowercase, single spaces) and the span they occupy.
+    /// </summary>
+    private static IEnumerable<(string Name, string Text, int Start, int Length)> TypeDeclarations(string decl)
+    {
+        string masked = VhdlText.MaskStringLiterals(VhdlText.BlankLineComments(decl));
+        foreach (Match m in TypeDeclStartRe.Matches(masked))
+        {
+            int end = m.Groups["kind"].Success
+                ? EndRecordRe.Match(masked, m.Index) is { Success: true } er ? er.Index + er.Length : -1
+                : masked.IndexOf(';', m.Index) + 1;
+            if (end <= m.Index) continue;
+            string text = Regex.Replace(masked[m.Index..end], @"\s+", " ").Trim().ToLowerInvariant();
+            yield return (m.Groups["name"].Value, text, m.Index, end - m.Index);
+        }
+    }
+
+    /// <summary>
+    /// Keeps one copy of each type in the flattened architecture: a child's type
+    /// identical to one already emitted is dropped; one with the same name but
+    /// different text (e.g. sized by a generic) is renamed with the instance
+    /// prefix in the child's declarations and body (fields keep their names).
+    /// </summary>
+    private static string DeduplicateTypes(string childDecl, ref string childBody,
+        Dictionary<string, string> emitted, string aliasPrefix)
+    {
+        var drop = new List<(int Start, int Length)>();
+        var renames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (name, text, start, length) in TypeDeclarations(childDecl))
+        {
+            if (!emitted.TryGetValue(name, out var existing)) emitted[name] = text;
+            else if (existing == text) drop.Add((start, length));
+            else
+            {
+                renames[name] = aliasPrefix + name;
+                emitted[aliasPrefix + name] = text;
+            }
+        }
+        foreach (var (start, length) in drop.OrderByDescending(d => d.Start))
+            childDecl = childDecl.Remove(start, length);
+        if (renames.Count > 0)
+        {
+            childDecl = RenameTokens(childDecl, renames);
+            childBody = RenameTokens(childBody, renames);
+        }
+        return childDecl;
+    }
+
     /// <summary>
     /// Whole-word identifier substitution. Replaces every standalone
     /// occurrence of a key in <paramref name="rename"/> with its mapped
     /// value. Identifiers are matched case-insensitively; substring matches
-    /// (e.g. `clk` inside `clkx`) are NOT replaced.
+    /// (e.g. `clk` inside `clkx`), names after a <c>.</c> (record fields,
+    /// selected names) and text inside string literals are NOT replaced.
     /// </summary>
     private static string RenameTokens(string source, Dictionary<string, string> rename)
     {
@@ -921,15 +977,22 @@ public sealed class SourceElaborator
 
         // Build one alternation regex from the keys (longest-first so longer
         // names aren't shadowed by shorter ones that share a prefix).
+        // Matched on a copy with string literals masked, and never right after
+        // a `.`: record fields (`p.lo`) and selected names (`work.pkg.x`) keep
+        // their spelling.
         var keys = rename.Keys
                          .OrderByDescending(k => k.Length)
                          .Select(Regex.Escape);
-        var pattern = @"\b(" + string.Join("|", keys) + @")\b";
+        var pattern = @"(?<![\w.])(" + string.Join("|", keys) + @")\b";
         var rx = new Regex(pattern, RegexOptions.IgnoreCase);
-        return rx.Replace(source, m =>
+        var sb = new StringBuilder(source.Length);
+        int last = 0;
+        foreach (Match m in rx.Matches(VhdlText.MaskStringLiterals(source)))
         {
-            return rename[m.Value.ToLowerInvariant()];
-        });
+            sb.Append(source, last, m.Index - last).Append(rename[m.Value]);
+            last = m.Index + m.Length;
+        }
+        return sb.Append(source, last, source.Length - last).ToString();
     }
 
     // ---------- Standalone generic specialization (for resource estimation) ----------

@@ -234,15 +234,7 @@ public class ProcedureCallStatement : ISControl
         // wait/report/assert/nested-call dispatch stays in sync between
         // registration-time synth (SynthesizeProcedureBody) and this
         // call-time resolve.
-        var tokenizer = new Parser.Repositories.Tokenizer();
-        foreach (var line in substituted.Split('\n'))
-        {
-            if (string.IsNullOrWhiteSpace(line)) continue;
-            tokenizer.TokenizeLine(line);
-        }
-        tokenizer.Evaluate();
-        var tokens = tokenizer.GetDictionaryType();
-        var streamer = new Parser.Repositories.TokenStream(tokens);
+        var streamer = Parser.Repositories.TokenStream.FromLines(substituted.Split('\n'));
 
         var tasks = Interpreter.Services.FunctionExecutor
             .ParseFunctionBodyStatic(streamer, boundScope);
@@ -292,26 +284,15 @@ public class ProcedureCallStatement : ISControl
         {
             if (!parseScope.Any(v => v.Name.Equals(lv.Name, StringComparison.OrdinalIgnoreCase)))
             {
-                parseScope.Add(new Variable(lv.Name, lv.Value?.ToString() ?? string.Empty, lv.Type)
-                {
-                    Size = lv.Size,
-                    CustomTypeName = lv.CustomTypeName,
-                    PortType = Parser.Models.Constants.PortType.OUT
-                });
+                var local = lv.CloneShaped();
+                local.PortType = Parser.Models.Constants.PortType.OUT;
+                parseScope.Add(local);
             }
         }
 
         string substituted = SubstituteFormalsInBody(def.BodyRaw, renameMap);
 
-        var tokenizer = new Parser.Repositories.Tokenizer();
-        foreach (var line in substituted.Split('\n'))
-        {
-            if (!string.IsNullOrWhiteSpace(line))
-                tokenizer.TokenizeLine(line);
-        }
-        tokenizer.Evaluate();
-        var tokens = tokenizer.GetDictionaryType();
-        var streamer = new Parser.Repositories.TokenStream(tokens);
+        var streamer = Parser.Repositories.TokenStream.FromLines(substituted.Split('\n'));
 
         return Interpreter.Services.FunctionExecutor
             .ParseFunctionBodyStatic(streamer, parseScope);

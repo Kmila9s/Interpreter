@@ -247,6 +247,14 @@ public class PackageRegistry
     }
 
     /// <summary>
+    /// The constant named by a selected name (<c>work.pkg.c</c>, <c>pkg.c</c>):
+    /// <paramref name="constantName"/> declared in package <paramref name="packageName"/>, or null.
+    /// </summary>
+    public Variable? GetConstant(string packageName, string constantName) =>
+        GetPackage(packageName)?.Constants.FirstOrDefault(c =>
+            c.Name.Equals(constantName, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
     /// Attempts to get a constant by name.
     /// </summary>
     /// <param name="constantName">The constant name to look up.</param>

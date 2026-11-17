@@ -1,3 +1,4 @@
+using Interpreter.Models;
 using Parser.Models;
 using static Parser.Models.Constants;
 
@@ -76,13 +77,7 @@ public static class StandardFunctions
     /// <summary>
     /// Converts an integer to std_logic_vector.
     /// </summary>
-    public static string ToStdLogicVector(int value, int width)
-    {
-        string binary = Convert.ToString(value, 2).PadLeft(width, '0');
-        if (binary.Length > width)
-            binary = binary.Substring(binary.Length - width);
-        return binary;
-    }
+    public static string ToStdLogicVector(int value, int width) => FieldCodec.IntegerBits(value, width);
 
     /// <summary>
     /// Converts std_logic_vector to integer.
@@ -136,18 +131,8 @@ public static class StandardFunctions
     /// </summary>
     public static string Resize(string value, int newWidth)
     {
-        string cleaned = value.Replace("\"", "").Replace("'", "");
-
-        if (cleaned.Length >= newWidth)
-        {
-            // Truncate from the left
-            return cleaned.Substring(cleaned.Length - newWidth);
-        }
-        else
-        {
-            // Extend with zeros (for unsigned) or sign extend (for signed)
-            return cleaned.PadLeft(newWidth, '0');
-        }
+        // Truncate on the left / zero-extend (unsigned resize).
+        return VectorIndexing.Fit(value.Replace("\"", "").Replace("'", ""), newWidth);
     }
 
     /// <summary>
@@ -644,6 +629,7 @@ public static class StandardFunctions
         if (arg is Models.DeferredExpression de)
         {
             var ev = de.Evaluate();
+            if (ev.IsInteger) return (int)FieldCodec.IntegerOf(ev.Value);
             string sd = ev.Value?.ToString() ?? "";
             if (sd.Length > 1 && sd.All(c => c == '0' || c == '1'))
             {

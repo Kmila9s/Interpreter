@@ -99,10 +99,15 @@ public class TypeDefinition
     public int ElementSize { get; set; } = 1;
 
     /// <summary>
-    /// Gets or sets the record fields for record types.
-    /// Each Variable represents a field with its name, type, and size.
+    /// For record types: the packed field layout (offsets, widths, encodings).
     /// </summary>
-    public List<Variable> RecordFields { get; set; } = new();
+    public RecordLayout? Layout { get; set; }
+
+    /// <summary>
+    /// For array types: template of the element subtype (record layout, vector
+    /// range), carried onto objects as <see cref="Variable.ElementShape"/>.
+    /// </summary>
+    public Variable? ElementShape { get; set; }
 
     /// <summary>
     /// Gets or sets the subtype constraint range for subtypes.
@@ -121,7 +126,7 @@ public class TypeDefinition
             {
                 TypeKind.Enumeration => (int)Math.Ceiling(Math.Log2(Math.Max(EnumValues.Count, 1))),
                 TypeKind.Array => (ArrayBounds.High - ArrayBounds.Low + 1) * ElementSize,
-                TypeKind.Record => RecordFields.Sum(f => f.Size),
+                TypeKind.Record => Layout?.Width ?? 0,
                 TypeKind.Subtype => SubtypeRange.High - SubtypeRange.Low + 1,
                 _ => 1
             };
@@ -133,20 +138,36 @@ public class TypeDefinition
     /// </summary>
     public int ArrayLength => ArrayBounds.High - ArrayBounds.Low + 1;
 
+    /// <summary>
+    /// The literals of an enumeration as constants (a literal is a value, not
+    /// an object: never dumped, never driven), so expressions resolve them.
+    /// </summary>
+    public IEnumerable<Variable> LiteralConstants() =>
+        EnumValues.Where(l => !string.IsNullOrEmpty(l)).Select(literal => new Variable
+        {
+            Name = literal,
+            Type = Constants.DATATYPES.INTEGER,
+            Value = literal,
+            IsConstant = true,
+            EnumTypeName = Name,
+        });
+
+    /// <summary>
+    /// This unconstrained array type with the index constraint given where it is
+    /// used (<c>coeff_array_t(0 to N-1)</c>): a copy with those bounds.
+    /// </summary>
+    public TypeDefinition Constrain(int left, int right, bool isDownto)
+    {
+        var constrained = (TypeDefinition)MemberwiseClone();
+        constrained.ArrayBounds = (Math.Min(left, right), Math.Max(left, right));
+        constrained.IsDownto = isDownto;
+        constrained.IsUnconstrained = false;
+        return constrained;
+    }
+
     /// <summary>The array's bounds as written: <c>(0 to 3)</c> → (0, 3), <c>(7 downto 0)</c> → (7, 0).</summary>
     public (int Left, int Right) DeclaredRange =>
         IsDownto ? (ArrayBounds.High, ArrayBounds.Low) : (ArrayBounds.Low, ArrayBounds.High);
-
-    /// <summary>
-    /// Storage slot of element <paramref name="index"/> (slot 0 is the leftmost
-    /// element, as <see cref="Variable.IndexToOffset"/> maps it), or -1 when the
-    /// index is outside the array.
-    /// </summary>
-    public int SlotOf(int index)
-    {
-        int slot = Variable.OffsetInRange(DeclaredRange.Left, IsDownto, index);
-        return slot >= 0 && slot < ArrayLength ? slot : -1;
-    }
 
     /// <summary>
     /// Creates a default value for this type.
@@ -157,47 +178,13 @@ public class TypeDefinition
         return Kind switch
         {
             TypeKind.Enumeration => EnumValues.Count > 0 ? EnumValues[0] : "UNKNOWN",
-            TypeKind.Array => CreateDefaultArrayValue(),
-            TypeKind.Record => CreateDefaultRecordValue(),
+            TypeKind.Array => ElementShape?.Layout is { } element
+                ? string.Concat(Enumerable.Repeat(FieldCodec.DefaultBits(element), ArrayLength))
+                : new string('U', TotalSize),
+            TypeKind.Record => FieldCodec.DefaultBits(Layout!),
             TypeKind.Subtype => new string('U', TotalSize),
             _ => "U"
         };
-    }
-
-    /// <summary>
-    /// Creates a default array value (all elements set to default).
-    /// </summary>
-    private object CreateDefaultArrayValue()
-    {
-        // For simple arrays of std_logic, return string of 'U's
-        if (BaseType == Constants.DATATYPES.STD_LOGIC ||
-            BaseType == Constants.DATATYPES.BIT)
-        {
-            return new string('U', ArrayLength);
-        }
-
-        // For arrays of vectors, create array of default vectors
-        if (BaseType == Constants.DATATYPES.STD_LOGIC_VECTOR)
-        {
-            var defaultElement = new string('U', ElementSize);
-            return Enumerable.Repeat(defaultElement, ArrayLength).ToArray();
-        }
-
-        // For other types, return placeholder
-        return $"(array:{Name})";
-    }
-
-    /// <summary>
-    /// Creates a default record value (all fields set to default).
-    /// </summary>
-    private object CreateDefaultRecordValue()
-    {
-        var values = new Dictionary<string, object>();
-        foreach (var field in RecordFields)
-        {
-            values[field.Name] = field.Value ?? new string('U', Math.Max(field.Size, 1));
-        }
-        return values;
     }
 
     /// <summary>
@@ -209,7 +196,7 @@ public class TypeDefinition
         {
             TypeKind.Enumeration => $"type {Name} is ({string.Join(", ", EnumValues)});",
             TypeKind.Array => $"type {Name} is array ({ArrayBounds.Low} {(IsDownto ? "downto" : "to")} {ArrayBounds.High}) of {BaseTypeName};",
-            TypeKind.Record => $"type {Name} is record ({RecordFields.Count} fields);",
+            TypeKind.Record => $"type {Name} is record ({Layout?.Fields.Count ?? 0} fields);",
             TypeKind.Subtype => $"subtype {Name} is {BaseTypeName}({SubtypeRange.High} downto {SubtypeRange.Low});",
             _ => $"type {Name};"
         };

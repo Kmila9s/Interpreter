@@ -344,6 +344,12 @@ internal static class ConcurrentAssignSynthesizer
                             sourceLine);
                     }
                     break;
+                case IDeferredOperand deferred:
+                    // Run-time operand (aggregate, record field): a labeled net of its width.
+                    int deferredWidth = Math.Max(1, deferred.Width);
+                    stack.Push(ctx.GetOrCreateNet($"{op.Result.Name}_aggregate",
+                        deferredWidth > 1 ? NetKind.Bus : NetKind.Wire, deferredWidth, NetOrigin.Internal, sourceLine));
+                    break;
                 case Operator opr:
                     HandleOperator(opr, stack, ctx, sourceLine);
                     break;
@@ -754,19 +760,11 @@ internal static class ConcurrentAssignSynthesizer
                 try
                 {
                     var parseScope = BuildInliningScope(fdef, duf.Variables);
-                    var tokenizer = new Parser.Repositories.Tokenizer();
                     var sourceLines = fdef.BodyLines != null && fdef.BodyLines.Length > 0
                         ? fdef.BodyLines
                         : fdef.BodyRaw.Split('\n');
-                    foreach (var line in sourceLines)
-                    {
-                        if (!string.IsNullOrWhiteSpace(line))
-                            tokenizer.TokenizeLine(line);
-                    }
-                    tokenizer.Evaluate();
-                    var tokenDict = tokenizer.GetDictionaryType();
-                    if (tokenDict == null || tokenDict.Count == 0) return null;
-                    var streamer = new Parser.Repositories.TokenStream(tokenDict);
+                    var streamer = Parser.Repositories.TokenStream.FromLines(sourceLines);
+                    if (streamer.Current == null) return null;
                     body = Interpreter.Services.FunctionExecutor.ParseFunctionBodyStatic(streamer, parseScope);
                     // Do NOT cache back onto fdef.SynthesizedBody — the runtime
                     // path binds it against its own scope; sharing that pointer
@@ -1377,11 +1375,7 @@ internal static class ConcurrentAssignSynthesizer
         foreach (var p in fdef.Parameters) scope.Add(p.CreateVariable());
         foreach (var loc in fdef.LocalVariables)
         {
-            scope.Add(new Variable(loc.Name, loc.Value?.ToString() ?? "", loc.Type)
-            {
-                Size = loc.Size,
-                CustomTypeName = loc.CustomTypeName
-            });
+            scope.Add(loc.CloneShaped());
         }
         foreach (var cv in callerScope)
         {
