@@ -10,13 +10,14 @@ namespace Interpreter.Services;
 /// <param name="NewValue">The new value to assign.</param>
 /// <param name="Delay">Optional delay for "after X ns" syntax.</param>
 /// <param name="SourceLine">Source line number that produced this update.</param>
-/// <param name="Range">Indices (as written) of the part written, or null for the whole signal.</param>
+/// <param name="Span">Start and width, in the target's value string, of the part written (resolved when the
+/// statement ran), or null for the whole signal.</param>
 public record SignalUpdate(
     Variable Target,
     object NewValue,
     TimeSpan? Delay = null,
     int SourceLine = 0,
-    (int Left, int Right)? Range = null
+    (int Start, int Width)? Span = null
 );
 
 /// <summary>
@@ -77,13 +78,13 @@ public class SignalScheduler
     /// <param name="target">The target signal to update.</param>
     /// <param name="newValue">The new value to assign.</param>
     /// <param name="sourceLine">Source line number that produced this update.</param>
-    /// <param name="range">Indices of the part written (e.g. <c>v(3 downto 2)</c>), or null for the whole signal.
+    /// <param name="span">Part written (start and width in the value string, e.g. of <c>v(3 downto 2)</c> or <c>p.lo</c>), or null for the whole signal.
     /// Part writes keep their statement order relative to every other write of the same delta.</param>
-    public void Schedule(Variable target, object newValue, int sourceLine = 0, (int Left, int Right)? range = null)
+    public void Schedule(Variable target, object newValue, int sourceLine = 0, (int Start, int Width)? span = null)
     {
         lock (_lock)
         {
-            _currentDeltaUpdates.Enqueue(new SignalUpdate(target, newValue, null, sourceLine, range));
+            _currentDeltaUpdates.Enqueue(new SignalUpdate(target, newValue, null, sourceLine, span));
         }
     }
 
@@ -93,7 +94,7 @@ public class SignalScheduler
     /// `TimeSpan` so sub-100ns delays (1 ns, 10 ns) round correctly.
     /// Bench bug #8 fix.
     /// </summary>
-    public void ScheduleAfterNs(Variable target, object newValue, long delayNs, int sourceLine = 0, (int Left, int Right)? range = null)
+    public void ScheduleAfterNs(Variable target, object newValue, long delayNs, int sourceLine = 0, (int Start, int Width)? span = null)
     {
         lock (_lock)
         {
@@ -105,7 +106,7 @@ public class SignalScheduler
                 queue = new Queue<SignalUpdate>();
                 _futureUpdates[futureTick] = queue;
             }
-            queue.Enqueue(new SignalUpdate(target, newValue, TimeSpan.FromTicks(delayNs * 10), sourceLine, range));
+            queue.Enqueue(new SignalUpdate(target, newValue, TimeSpan.FromTicks(delayNs * 10), sourceLine, span));
         }
     }
 
@@ -178,9 +179,9 @@ public class SignalScheduler
             {
                 var update = _currentDeltaUpdates.Dequeue();
                 object? oldValue = update.Target.Value;
-                update.Target.Value = update.Range is { } part
+                update.Target.Value = update.Span is { } part
                     ? VectorIndexing.Write(update.Target, oldValue?.ToString() ?? string.Empty,
-                                           part.Left, part.Right, update.NewValue?.ToString() ?? string.Empty)
+                                           part, update.NewValue?.ToString() ?? string.Empty)
                     : ExpandAggregateMarker(update.NewValue, update.Target);
                 if (!Equals(oldValue, update.Target.Value))
                 {

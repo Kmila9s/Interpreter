@@ -93,11 +93,16 @@ public class Process : ISControl
     /// </summary>
     /// <param name="SignalsPorts">The signals and ports of the process.</param>
     /// <param name="Streamer">The token stream.</param>
-    public Process(HashSet<Variable> SignalsPorts, TokenStream Streamer)
+    /// <param name="Types">User types visible to the process declarative part (the architecture's).</param>
+    public Process(HashSet<Variable> SignalsPorts, TokenStream Streamer, TypeRegistry? Types = null)
     {
         _streamer = Streamer;
         this.SignalsPorts = SignalsPorts;
+        _types = Types;
     }
+
+    /// <summary>User types visible to the declarative part (record/array/enum variables).</summary>
+    private readonly TypeRegistry? _types;
 
     /// <summary>
     /// Executes the process asynchronously.
@@ -162,7 +167,7 @@ public class Process : ISControl
         // Check for cancellation before starting
         cancellationToken.ThrowIfCancellationRequested();
 
-        VariableSyntetizer syntetizer = new(_streamer, SignalsPorts);
+        VariableSyntetizer syntetizer = new(_streamer, SignalsPorts, TypeRegistry: _types);
         SyntentizeSensitiveList();
 
         progress.ReportPhase(0.3f, $"Sensitivity list: {SensitiveList.Count} signal(s)", ProcessingPhase.ParsingProcess);

@@ -128,61 +128,6 @@ public class TypeRegistry
     }
 
     /// <summary>
-    /// Gets the size in bits for a type.
-    /// </summary>
-    /// <param name="typeName">The type name.</param>
-    /// <returns>Size in bits, or 0 if unknown.</returns>
-    public int GetTypeSize(string typeName)
-    {
-        // Check custom types first
-        if (_types.TryGetValue(typeName, out var typeDef))
-        {
-            return typeDef.TotalSize;
-        }
-
-        // Built-in type sizes
-        var builtinType = Variable.GetDatatype(typeName);
-        return builtinType switch
-        {
-            Constants.DATATYPES.STD_LOGIC => 1,
-            Constants.DATATYPES.BIT => 1,
-            Constants.DATATYPES.BOOLEAN => 1,
-            Constants.DATATYPES.INTEGER => 32,
-            Constants.DATATYPES.NATURAL => 32,
-            // Note: REAL type not in Parser Constants yet
-            // Vectors need their range parsed separately
-            _ => 0
-        };
-    }
-
-    /// <summary>
-    /// Creates a default value for a type.
-    /// </summary>
-    /// <param name="typeName">The type name.</param>
-    /// <returns>Default value for the type.</returns>
-    public object GetDefaultValue(string typeName)
-    {
-        // Check custom types first
-        if (_types.TryGetValue(typeName, out var typeDef))
-        {
-            return typeDef.GetDefaultValue();
-        }
-
-        // Built-in type defaults
-        var builtinType = Variable.GetDatatype(typeName);
-        return builtinType switch
-        {
-            Constants.DATATYPES.STD_LOGIC => "U",
-            Constants.DATATYPES.BIT => "0",
-            Constants.DATATYPES.BOOLEAN => false,
-            Constants.DATATYPES.INTEGER => 0,
-            Constants.DATATYPES.NATURAL => 0,
-            Constants.DATATYPES.STD_LOGIC_VECTOR => "U",
-            _ => "U"
-        };
-    }
-
-    /// <summary>
     /// Clears all registered types.
     /// </summary>
     public void Clear() => _types.Clear();
@@ -198,12 +143,6 @@ public class TypeRegistry
     /// </summary>
     public IEnumerable<TypeDefinition> GetArrayTypes() =>
         _types.Values.Where(t => t.Kind == TypeKind.Array);
-
-    /// <summary>
-    /// Gets all record types.
-    /// </summary>
-    public IEnumerable<TypeDefinition> GetRecordTypes() =>
-        _types.Values.Where(t => t.Kind == TypeKind.Record);
 
     /// <summary>
     /// Gets a summary of all registered types.

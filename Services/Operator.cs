@@ -599,7 +599,7 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         };
     }
 
-    private static bool ToBool(object? value)
+    internal static bool ToBool(object? value)
     {
         if (value is bool b) return b;
         string s = value?.ToString() ?? "";

@@ -51,6 +51,29 @@ public static class HdlLiteral
         return true;
     }
 
+    /// <summary>
+    /// Bits written by a literal: <c>x"0F"</c> → <c>00001111</c>, <c>"0101"</c> →
+    /// <c>0101</c>, <c>'1'</c> → <c>1</c>. False for anything else.
+    /// </summary>
+    public static bool TryBits(string text, out string bits)
+    {
+        bits = string.Empty;
+        if (text.Length >= 3 && text[0] is 'x' or 'X' && text[1] == '"' && text[^1] == '"')
+        {
+            try { bits = HexBits(text[2..^1]); return true; }
+            catch (FormatException) { return false; }
+            catch (ArgumentException) { return false; }
+        }
+        if (text.Length >= 2 && text[0] == '"' && text[^1] == '"') { bits = text[1..^1]; return true; }
+        if (text.Length == 3 && text[0] == '\'' && text[2] == '\'') { bits = text[1].ToString(); return true; }
+        return false;
+    }
+
+    /// <summary>Binary text of hex digits (<c>"0F"</c> → <c>"00001111"</c>); underscores are ignored.</summary>
+    public static string HexBits(string hexDigits) =>
+        string.Concat(hexDigits.Where(c => c != '_')
+            .Select(c => Convert.ToString(Convert.ToInt32(c.ToString(), 16), 2).PadLeft(4, '0')));
+
     private static bool IsBitString(string s)
     {
         foreach (char c in s)

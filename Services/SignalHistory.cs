@@ -1,4 +1,6 @@
+using Interpreter.Models;
 using Parser.Models;
+using static Parser.Models.Constants;
 
 namespace Interpreter.Services;
 
@@ -536,23 +538,13 @@ public class SignalHistory
                 .Where(k => !k.IsConstant)
                 .OrderBy(k => k.Name)
                 .ToList();
-            var signalIds = new Dictionary<Variable, string>();
-
             sb.AppendLine($"$scope module {moduleName} $end");
 
-            int idCounter = 0;
+            // One column per dumped value: a signal, or each field of a record
+            // signal (inside a `$scope` named after it).
+            var columns = new List<VcdColumn>();
             foreach (var signal in signals)
-            {
-                // Generate a unique short identifier (!, ", #, $, etc.)
-                string id = GenerateVcdId(idCounter++);
-                signalIds[signal] = id;
-
-                // Determine signal width
-                int width = GetSignalWidth(signal);
-                string vcdType = width == 1 ? "wire" : "reg";
-
-                sb.AppendLine($"$var {vcdType} {width} {id} {signal.Name} $end");
-            }
+                AppendColumns(sb, columns, signal);
 
             sb.AppendLine("$upscope $end");
             sb.AppendLine("$enddefinitions $end");
@@ -569,22 +561,27 @@ public class SignalHistory
                 return sb.ToString();
             }
 
+            // A record's columns are consecutive: read each signal's history once per instant.
+            Variable? lastSignal = null;
+            long lastTime = -1;
+            object? lastRaw = null;
+            object? ValueOnce(Variable signal, long time)
+            {
+                if (!ReferenceEquals(signal, lastSignal) || time != lastTime)
+                    (lastSignal, lastTime, lastRaw) = (signal, time, GetValueAtTime(signal, time));
+                return lastRaw;
+            }
+
             // Initial values ($dumpvars)
             sb.AppendLine("$dumpvars");
-            foreach (var signal in signals)
+            var lastValues = new object?[columns.Count];
+            for (int c = 0; c < columns.Count; c++)
             {
-                var initialValue = GetValueAtTime(signal, allTimes[0]);
-                string vcdValue = FormatVcdValue(initialValue, GetSignalWidth(signal));
-                sb.AppendLine($"{vcdValue}{signalIds[signal]}");
+                var column = columns[c];
+                lastValues[c] = column.Project(ValueOnce(column.Signal, allTimes[0]));
+                sb.AppendLine($"{column.Format(lastValues[c])}{column.Id}");
             }
             sb.AppendLine("$end");
-
-            // Track last known values to only output changes
-            var lastValues = new Dictionary<Variable, object?>();
-            foreach (var signal in signals)
-            {
-                lastValues[signal] = GetValueAtTime(signal, allTimes[0]);
-            }
 
             // Value changes at each timestamp
             foreach (var time in allTimes)
@@ -592,10 +589,11 @@ public class SignalHistory
                 bool hasChanges = false;
                 var changes = new System.Text.StringBuilder();
 
-                foreach (var signal in signals)
+                for (int c = 0; c < columns.Count; c++)
                 {
-                    var currentValue = GetValueAtTime(signal, time);
-                    var lastValue = lastValues[signal];
+                    var column = columns[c];
+                    var currentValue = column.Project(ValueOnce(column.Signal, time));
+                    var lastValue = lastValues[c];
 
                     // Only output if value changed
                     if (!Equals(currentValue, lastValue))
@@ -610,9 +608,8 @@ public class SignalHistory
                             hasChanges = true;
                         }
 
-                        string vcdValue = FormatVcdValue(currentValue, GetSignalWidth(signal));
-                        changes.AppendLine($"{vcdValue}{signalIds[signal]}");
-                        lastValues[signal] = currentValue;
+                        changes.AppendLine($"{column.Format(currentValue)}{column.Id}");
+                        lastValues[c] = currentValue;
                     }
                 }
 
@@ -624,6 +621,84 @@ public class SignalHistory
 
             return sb.ToString();
         }
+    }
+
+    /// <summary>
+    /// One dumped value: which signal it reads, how its part of the signal's
+    /// value is taken (<see cref="Project"/>) and written (<see cref="Format"/>).
+    /// </summary>
+    private sealed record VcdColumn(Variable Signal, string Id, Func<object?, object?> Project, Func<object?, string> Format);
+
+    private static object? Whole(object? value) => value;
+
+    /// <summary>
+    /// Declares the column(s) of <paramref name="signal"/>: a record becomes a
+    /// <c>$scope</c> with one column per field (nested records as nested
+    /// scopes), integers are <c>integer 32</c> like GHDL, enumerations the
+    /// literal index, anything else keeps its width.
+    /// </summary>
+    private static void AppendColumns(System.Text.StringBuilder sb, List<VcdColumn> columns, Variable signal)
+    {
+        if (signal.Layout is { } layout)
+        {
+            var open = new List<string>();
+            sb.AppendLine($"$scope module {signal.Name} $end");
+            foreach (var (path, offset, field) in layout.Leaves())
+            {
+                var scopes = path.Split('.')[..^1];
+                int keep = 0;
+                while (keep < open.Count && keep < scopes.Length && open[keep] == scopes[keep]) keep++;
+                for (int c = open.Count; c > keep; c--) sb.AppendLine("$upscope $end");
+                open.RemoveRange(keep, open.Count - keep);
+                for (int c = keep; c < scopes.Length; c++)
+                {
+                    sb.AppendLine($"$scope module {scopes[c]} $end");
+                    open.Add(scopes[c]);
+                }
+                var f = field;
+                int at = offset;
+                object? Bits(object? v) => FieldCodec.Slice(v, at, f.Width);
+                if (f.Kind == FieldKind.Integer)
+                    AddColumn(sb, columns, signal, "integer", 32, f.Name, Bits,
+                        v => IntegerVcdValue(v is string bits ? FieldCodec.DecodeValue(f, bits) : null));
+                else
+                    AddColumn(sb, columns, signal, f.Width == 1 ? "wire" : "reg", f.Width, f.Name, Bits,
+                        v => FormatVcdValue(v, f.Width));
+            }
+            for (int c = open.Count; c >= 0; c--) sb.AppendLine("$upscope $end");
+            return;
+        }
+        if (signal.IsInteger)
+        {
+            AddColumn(sb, columns, signal, "integer", 32, signal.Name, Whole, IntegerVcdValue);
+            return;
+        }
+        if (signal.EnumLiterals is { } literals)
+        {
+            // Enumeration: the literal's index in binary (GHDL does not dump enums).
+            int bits = Math.Max(signal.Size, 1);
+            AddColumn(sb, columns, signal, bits == 1 ? "wire" : "reg", bits, signal.Name, Whole,
+                v => FormatVcdValue(FieldCodec.IntegerBits(FieldCodec.EnumIndex(literals, v), bits), bits));
+            return;
+        }
+        int width = GetSignalWidth(signal);
+        AddColumn(sb, columns, signal, width == 1 ? "wire" : "reg", width, signal.Name, Whole, v => FormatVcdValue(v, width));
+    }
+
+    private static void AddColumn(System.Text.StringBuilder sb, List<VcdColumn> columns, Variable signal,
+        string kind, int width, string name, Func<object?, object?> project, Func<object?, string> format)
+    {
+        string id = GenerateVcdId(columns.Count);
+        sb.AppendLine($"$var {kind} {width} {id} {name} $end");
+        columns.Add(new VcdColumn(signal, id, project, format));
+    }
+
+    /// <summary>An integer value as GHDL dumps it: shortest binary, 32-bit two's complement when negative.</summary>
+    private static string IntegerVcdValue(object? value)
+    {
+        long n = FieldCodec.IntegerOf(value);
+        string bits = n < 0 ? FieldCodec.IntegerBits(n, 32) : Convert.ToString(n, 2);
+        return $"b{bits} ";
     }
 
     /// <summary>

@@ -455,6 +455,10 @@ public class DeltaCycleEngine : IDisposable
                     // its scope. Mark dynamic so we run unconditionally.
                     if (dyni.Index.Expression != null) dynamic = true;
                     break;
+                case Models.IDeferredOperand deferred:
+                    if (deferred.Inputs is { } reads) inputs.UnionWith(reads);
+                    else dynamic = true;
+                    break;
                 case Models.DeferredFunction:
                     // User / deferred function args reach into call-time
                     // state. Treat as dynamic to be safe.
@@ -2178,27 +2182,9 @@ public class DeltaCycleEngine : IDisposable
         string clean = choice?.Trim() ?? string.Empty;
         if (clean.Length == 0) return clean;
 
-        // Hex literal `x"NN"` → binary.
-        if (clean.Length >= 3
-            && (clean[0] == 'x' || clean[0] == 'X')
-            && clean[1] == '"' && clean[^1] == '"')
-        {
-            string hex = clean.Substring(2, clean.Length - 3);
-            try
-            {
-                return string.Join("", hex.Select(c =>
-                    Convert.ToString(Convert.ToInt32(c.ToString(), 16), 2).PadLeft(4, '0')));
-            }
-            catch { /* fall through */ }
-        }
-
-        // Quoted bit string `"00001011"` → strip quotes.
-        if (clean.Length >= 2 && clean[0] == '"' && clean[^1] == '"')
-            return clean.Substring(1, clean.Length - 2);
-
-        // Single-quoted bit literal `'1'` → bit.
-        if (clean.Length == 3 && clean[0] == '\'' && clean[2] == '\'')
-            return clean.Substring(1, 1);
+        // `x"NN"`, `"0101"`, `'1'` → their bits.
+        if (Models.HdlLiteral.TryBits(clean, out string literalBits))
+            return literalBits;
 
         // Identifier reference to a known signal/constant in scope: use the
         // current value of that signal. Constants don't change so this is

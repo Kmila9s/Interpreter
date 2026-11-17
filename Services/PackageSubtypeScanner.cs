@@ -26,11 +26,11 @@ namespace Interpreter.Services;
 /// </remarks>
 public static class PackageSubtypeScanner
 {
-    // package X is ... end (package)? X;  — greedy body, single-line
+    // package X is ... end [package] [X];  — lazy body (`end package;`, `end X;`, `end;`)
     // Comments in the source are already stripped by the caller if needed;
     // we operate on the raw file text with re-multiline options set.
     private static readonly Regex PackageRe = new(
-        @"\bpackage\s+(?<name>\w+)\s+is\b(?<body>[\s\S]*?)\bend\s+(?:package\s+)?\k<name>?\s*;",
+        @"\bpackage\s+(?<name>\w+)\s+is\b(?<body>[\s\S]*?)\bend(?:\s+package)?(?:\s+\k<name>)?\s*;",
         RegexOptions.IgnoreCase | RegexOptions.Multiline);
 
     // subtype NAME is (signed|unsigned|std_logic_vector|bit_vector) (HI downto LO);
@@ -156,6 +156,18 @@ public static class PackageSubtypeScanner
 #if DEBUG
                 Console.WriteLine($"[PackageSubtypeScanner] {pkgName}.{subName} = {baseTy}({high} downto {low})  width={width}");
 #endif
+            }
+
+            // Pass 3: record / enumeration / array types, parsed by the
+            // architecture's own type parser (bounds see the constants from
+            // pass 1). Enum literals become package constants so a design
+            // that `use`s the package resolves them like any other constant.
+            foreach (var type in VariableSyntetizer.RegisterTypeDeclarations(body, pkgDef.Types))
+            {
+                if (type.Kind != TypeKind.Enumeration) continue;
+                foreach (var literal in type.LiteralConstants())
+                    if (pkgDef.Constants.All(c => !c.Name.Equals(literal.Name, StringComparison.OrdinalIgnoreCase)))
+                        registry.RegisterConstant(literal, pkgName);
             }
         }
     }

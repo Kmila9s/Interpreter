@@ -364,7 +364,7 @@ public class Architecture : ISControl
                         switch (keyword)
                         {
                             case "process":
-                                Process process = new(comparators, _streamer);
+                                Process process = new(comparators, _streamer, CustomTypes);
                                 process.Syntetize(cancellationToken);
                                 Tasks.Add(process);
                                 return;
@@ -472,7 +472,7 @@ public class Architecture : ISControl
                 switch (_streamer.Current.Value.ToLower())
                 {
                     case "process":
-                        Process process = new(comparators, _streamer);
+                        Process process = new(comparators, _streamer, CustomTypes);
                         process.Syntetize(cancellationToken);
                         Tasks.Add(process);
                         break;
@@ -1077,7 +1077,7 @@ public class Architecture : ISControl
     private void SyntetizeAssingationsInner()
     {
         // Strict shape: a concurrent statement must look like
-        //   <signal>[ ( <index> ) ] ( <= | := ) <expr> ;
+        //   <signal>{ ( <index> ) | .<field> } ( <= | := ) <expr> ;
         //   <procedure_name>[ ( <args> ) ] ;
         // Anything else (e.g. two identifiers in a row at depth 0 like the
         // `MHz bit2 <= q2` shape produced when garbage gets pasted after a
@@ -1100,10 +1100,16 @@ public class Architecture : ISControl
         rawDataBuilder.Append(first.Value).Append(' ');
         _streamer.MoveNext();
 
-        // Optional indexed access: `bus(7 downto 0) <= ...`, `mem(i)(j) <= ...`.
-        // Consume balanced parentheses immediately following the LHS.
-        while (_streamer.Current?.Value == "(")
+        // Optional selectors: `bus(7 downto 0) <= ...`, `mem(i)(j) <= ...`,
+        // `m(i).lo <= ...` — balanced parentheses and `.field` tokens.
+        while (_streamer.Current?.Value == "(" || _streamer.Current?.IsFieldSelector == true)
         {
+            if (_streamer.Current.IsFieldSelector)
+            {
+                rawDataBuilder.Append(_streamer.Current.Value).Append(' ');
+                _streamer.MoveNext();
+                continue;
+            }
             int depth = 0;
             do
             {
@@ -1189,7 +1195,7 @@ public class Architecture : ISControl
             // Reject stray UNKNOWN tokens (e.g. `$`, mojibake from a paste)
             // inside the RHS — once they reach Operation.Evaluate they
             // become a confusing runtime error far from the source line.
-            if (_streamer.Current.Type == UNKNOWN)
+            if (_streamer.Current.Type == UNKNOWN && !(_streamer.Current.IsFieldSelector && _streamer.Previous?.Value == ")"))
                 throw new ParserException(
                     $"Unexpected token '{_streamer.Current.Value}' inside concurrent statement — not a valid VHDL identifier, keyword, operator, or literal",
                     _streamer.Current);

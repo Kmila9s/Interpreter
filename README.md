@@ -1425,6 +1425,36 @@ while (_streamer.Current != null)
 
 ## 10. Changelog
 
+### Version 3.1.2 (2026-11-16) — records
+
+*   **Records end to end (G01, G09–G16).** One subtype-indication parser
+    (`ParseSubtypeIndication` + `ApplyShape`) for objects, record fields and
+    array elements: identifier lists, integer ranges (also negative bounds),
+    enums, nested records, vectors bounded by local constants or generics.
+    Field reads (`p.lo`, `q.a.hi`, `r.d(2)`, `m(i).lo`) are `FieldRead`
+    operands over a `ValuePath`; writes go through `AssignmentTarget`, now
+    built on the same `ValuePath`, and the scheduler takes the resolved span.
+    `FieldCodec` is the single value↔bits encoding (integers, enums by index,
+    booleans). Unknown fields are analysis errors with a line.
+*   **Aggregates** (`Aggregate`, an `IDeferredOperand`): named (fields or
+    indices/ranges), positional and `others`, nested, in declarations and at
+    run time; the old declaration-only aggregate parsers are gone.
+*   **Package types**: records, enums and arrays declared in packages are
+    registered (`PackageSubtypeScanner` pass 3); `end package;` is recognised;
+    enum literals become package constants; selected names `work.pkg.c` read
+    package constants; process variables see the architecture's types.
+*   **Arrays**: bounds may be constant expressions; arrays of records carry
+    their element layout; every constrained array records its declared range
+    (ascending arrays of scalars index correctly); `coeff_t(0 to N-1)` constrains
+    an unconstrained array type at the use site.
+*   **Elaboration**: `RenameTokens` never renames after a `.` nor inside strings;
+    identical child types are emitted once; partial association `p.lo => x`.
+*   **VCD**: integers are `$var integer 32`; a record is a `$scope` with one
+    `$var` per field; enumerations dump the literal index; enum literals are
+    constants and are no longer dumped (baseline `2026-11-16-v312`).
+*   `HdlLiteral.HexBits` / `TryBits`, `VectorIndexing.Fit`, `StimulusEvent.Apply`
+    replace their copies.
+
 ### Version 3.1.1 (2026-11-16)
 
 *   **One assignment target (G02–G08, G17, G49 static, G50).** `AssignmentTarget`

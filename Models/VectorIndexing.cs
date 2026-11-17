@@ -52,20 +52,21 @@ public static class VectorIndexing
         (Math.Abs(left - right) + 1) * (v.ElementSize > 1 ? v.ElementSize : 1);
 
     /// <summary>
-    /// <paramref name="current"/> with the range <paramref name="left"/>..<paramref name="right"/>
-    /// replaced by <paramref name="bits"/> (right-aligned: shorter values are
-    /// zero-extended, longer ones keep their rightmost characters).
+    /// <paramref name="current"/> with the characters of <paramref name="span"/>
+    /// (resolved by <see cref="ValuePath"/>) replaced by <paramref name="bits"/>
+    /// (right-aligned: shorter values are zero-extended, longer ones keep their
+    /// rightmost characters).
     /// </summary>
-    /// <exception cref="InvalidOperationException">The range is outside the target's value.</exception>
-    public static string Write(Variable target, string current, int left, int right, string bits)
+    public static string Write(Variable target, string current, (int Start, int Width) span, string bits)
     {
         int length = Math.Max(current.Length, target.Size);
         // Zero-extended like the engine's seeded values (LRM 'U' initial values: v3.1.5).
         if (current.Length < length) current = current.PadLeft(length, '0');
-        if (Range(target, left, right, length) is not { } span)
-            throw new InvalidOperationException(
-                $"index {(left == right ? left.ToString() : $"{left}..{right}")} out of range of \"{target.Name}\"");
-        bits = bits.Length >= span.Width ? bits[^span.Width..] : bits.PadLeft(span.Width, '0');
+        bits = Fit(bits, span.Width);
         return string.Concat(current.AsSpan(0, span.Start), bits, current.AsSpan(span.Start + span.Width));
     }
+
+    /// <summary>Right-aligns <paramref name="bits"/> to <paramref name="width"/> (truncates on the left, zero-extends).</summary>
+    public static string Fit(string bits, int width) =>
+        bits.Length >= width ? bits[^width..] : bits.PadLeft(width, '0');
 }

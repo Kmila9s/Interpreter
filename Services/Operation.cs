@@ -158,6 +158,8 @@ public class Operation : IOperation {
             {
                 string varName = splitted[0].Trim();
                 Target = AssignmentTarget.Resolve(varName, this.Variables);
+                if (Target?.Path.FieldError is { } fieldError)
+                    throw new Parser.Models.ParserException(fieldError, SourceLine, 0, varName);
                 var foundVar = Target?.Base;
 
                 if (foundVar is null)
@@ -285,6 +287,9 @@ public class Operation : IOperation {
             // current value at evaluation time, then extract the source bit.
             else if(item is Models.DynamicIndex dynIdx){
                 variables.Push(dynIdx.Evaluate());
+            }
+            else if(item is Models.IDeferredOperand deferred){
+                variables.Push(deferred.Evaluate());
             }
             else if(item is Operator op){
                 // Only treat as unary NOT if it's actually a logic operation with NOT precedence
@@ -428,6 +433,15 @@ public class Operation : IOperation {
                         AfterDelayNs = value; // assume ns when unit is missing
                     }
                 }
+                continue;
+            }
+
+            // Record / array aggregates: `(lo => a, hi => b)`, `(a, b)`,
+            // `(0 => a, others => '0')`, at operand position.
+            if (currentItem == "(" && (items.Count == 0 || items[^1] is Operator { OperatorName: not ")" })
+                && TryParseAggregate(items) is { } aggregate)
+            {
+                items.Add(aggregate);
                 continue;
             }
 
@@ -616,6 +630,14 @@ public class Operation : IOperation {
                     variable = Variables.First(p => p.Name.ToLower().Equals(currentItem.ToLower()));
                 }
 
+                // Record field paths through this object (`m(i).lo`, `p.a.b`).
+                if ((variable.Layout != null || variable.ElementShape?.Layout != null)
+                    && TryParseFieldPath() is { } fieldRead)
+                {
+                    items.Add(fieldRead);
+                    continue;
+                }
+
                 // Check for array/vector element access: var(index). Use
                 // the deferred form so the bit is re-read at expression
                 // evaluation time rather than frozen at parse time.
@@ -650,6 +672,18 @@ public class Operation : IOperation {
                 }
 
                 item = variable;
+            }
+            else if (currentItem.Contains('.') && TryParseFieldPath() is { } fieldRead)
+            {
+                // `p.lo`, `q.a.hi`, `r.d(2)` — one selected-name token.
+                items.Add(fieldRead);
+                continue;
+            }
+            else if (currentItem.Split('.') is [.., var package, var name]
+                     && PackageRegistry.Instance.GetConstant(package, name) is { } selected)
+            {
+                // `work.pkg.c` / `pkg.c` — a package constant by selected name.
+                item = MaterializeConstant(selected);
             }
             else
                 item = new Operator(currentItem);
@@ -769,17 +803,8 @@ public class Operation : IOperation {
         int nextIdx = _currentSyntetizeIndex + 1;
         if (nextIdx >= _data.Length || _data[nextIdx] != "(") return null;
 
-        // Find the matching `)`.
-        int close = nextIdx + 1;
-        int depth = 1;
-        while (close < _data.Length && depth > 0)
-        {
-            if (_data[close] == "(") depth++;
-            else if (_data[close] == ")") depth--;
-            if (depth == 0) break;
-            close++;
-        }
-        if (close >= _data.Length) return null;
+        int close = MatchingClose(nextIdx);
+        if (close < 0) return null;
 
         // Body between paren: expect `<number>` `<unit>` (2 tokens) or a
         // single integer token. Anything else — abort and don't consume.
@@ -1013,6 +1038,14 @@ public class Operation : IOperation {
                     .FirstOrDefault(v => !string.IsNullOrEmpty(v.Name) &&
                         v.Name.Equals(token, StringComparison.OrdinalIgnoreCase));
 
+                // Record field argument: `to_unsigned(c.lim, 4)`, `f(m(i).lo)`.
+                if ((token.Contains('.') || variable?.Layout != null || variable?.ElementShape?.Layout != null)
+                    && TryParseFieldPath() is { } fieldArg)
+                {
+                    argBuffer.Add(new Models.DeferredExpression([fieldArg]));
+                    continue;
+                }
+
                 // Bench bug #20 (P2A LOAD pipeline): a slice / index access
                 // on a Variable arg — `mbr_reg(7 downto 0)`, `mem(idx)` —
                 // would otherwise lose the slice info and the called
@@ -1136,6 +1169,7 @@ public class Operation : IOperation {
             Models.DeferredFunction df => df.Evaluate(),
             Models.DeferredIndex di => di.Evaluate(),
             Models.DynamicIndex dyn => dyn.Evaluate(),
+            Models.IDeferredOperand deferred => deferred.Evaluate(),
             Models.DeferredExpression de => de.Evaluate(),
             int i => new Variable("__ArgInt", i, Constants.DATATYPES.INTEGER),
             _ => new Variable("__ArgRaw", item?.ToString() ?? "", Constants.DATATYPES.STD_LOGIC_VECTOR),
@@ -1370,8 +1404,7 @@ public class Operation : IOperation {
         }
 
         var mv = new Variable(c.Name, value, type, size) { IsConstant = true };
-        if (!string.IsNullOrEmpty(c.CustomTypeName))
-            mv.CustomTypeName = c.CustomTypeName;
+        mv.CopyShapeFrom(c);
         return mv;
     }
 
@@ -1577,6 +1610,76 @@ public class Operation : IOperation {
     /// <see cref="ParseIndexedAccess"/> entry point still resolves
     /// immediately for non-engine callers (e.g. tests).
     /// </summary>
+    /// <summary>Index of the <c>)</c> token closing the <c>(</c> at <paramref name="open"/> in the token list, or -1.</summary>
+    private int MatchingClose(int open)
+    {
+        int depth = 0;
+        for (int i = open; i < _data.Length; i++)
+        {
+            if (_data[i] == "(") depth++;
+            else if (_data[i] == ")" && --depth == 0) return i;
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// At a name token, gathers it with its following <c>( … )</c> groups and
+    /// <c>.field</c> tokens; when that forms a <see cref="Models.ValuePath"/>
+    /// with a record field, consumes it and returns its <see cref="Models.FieldRead"/>.
+    /// Null (nothing consumed) when there is no field selector.
+    /// </summary>
+    private Models.FieldRead? TryParseFieldPath()
+    {
+        var parts = new List<string> { _data[_currentSyntetizeIndex] };
+        int next = _currentSyntetizeIndex + 1;
+        while (next < _data.Length)
+        {
+            if (_data[next] == "(")
+            {
+                int close = MatchingClose(next);
+                if (close < 0) break;
+                parts.AddRange(_data[next..(close + 1)]);
+                next = close + 1;
+            }
+            else if (Parser.Models.Token.IsFieldSelectorText(_data[next]))
+                parts.Add(_data[next++]);
+            else break;
+        }
+
+        string text = string.Join(" ", parts);
+        if (Models.ValuePath.Parse(text, Variables) is not { HasField: true } path)
+            return null;
+        if (path.FieldError is { } error)
+            throw new Parser.Models.ParserException(error, SourceLine, 0, text);
+        _currentSyntetizeIndex = next;
+        return new Models.FieldRead(path);
+    }
+
+    /// <summary>
+    /// At a <c>(</c> in operand position: when the group is an aggregate, consumes
+    /// it and returns it typed by its context — the operand it is compared or
+    /// concatenated with, else the assignment target. A lone
+    /// <c>(others =&gt; c)</c> for a non-record target keeps the fill-marker path.
+    /// </summary>
+    private Models.Aggregate? TryParseAggregate(List<object> items)
+    {
+        int open = _currentSyntetizeIndex, close = MatchingClose(open);
+        if (close < 0) return null;
+        string inner = string.Join(" ", _data[(open + 1)..close]);
+        if (!Models.Aggregate.IsAggregate(inner)) return null;
+
+        Variable? shape = items.Count >= 2 && items[^1] is Operator && items[^2] is Variable partner
+                          && (partner.Layout != null || partner.ElementSize > 1)
+            ? partner
+            : Target?.Path.StaticShape ?? Result;
+        bool othersOnly = _data[open + 1].Equals("others", StringComparison.OrdinalIgnoreCase)
+                          && !inner.Contains(',');
+        if (othersOnly && shape?.Layout == null) return null;
+
+        _currentSyntetizeIndex = close + 1;
+        return Models.Aggregate.Parse(inner, shape, Variables);
+    }
+
     private (bool success, Models.DeferredIndex? deferred) ParseIndexedAccessDeferred(Variable variable)
     {
         // Skip the variable name (already processed), move to "("
