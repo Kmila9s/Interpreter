@@ -1,3 +1,4 @@
+using Interpreter.Models;
 using Interpreter.Services;
 using Parser.Models;
 using static Parser.Models.Constants;
@@ -165,20 +166,12 @@ internal static class ComponentSynthesizer
         string inner = actual[(lp + 1)..rp].Trim();
         if (parent.Length == 0 || inner.Length == 0) return null;
 
-        // Range: "H downto L" or "L to H" → _idx_{high}_{low}.
-        foreach (var kw in new[] { " downto ", " to " })
-        {
-            int k = inner.IndexOf(kw, StringComparison.OrdinalIgnoreCase);
-            if (k < 0) continue;
-            string a = inner[..k].Trim(), b = inner[(k + kw.Length)..].Trim();
-            if (!int.TryParse(a, out var ai) || !int.TryParse(b, out var bi)) return null;
-            int high = Math.Max(ai, bi), low = Math.Min(ai, bi);
-            return $"{parent}_idx_{high}_{low}";
-        }
-
-        // Single bit: "c(4)" → c_idx_4.
-        if (int.TryParse(inner, out var bit)) return $"{parent}_idx_{bit}";
-        return null;
+        // "c(4)" → c_idx_4; "H downto L" / "L to H" → c_idx_{high}_{low}.
+        var (left, right) = AssignmentTarget.SplitRange(inner);
+        if (!int.TryParse(left.Trim(), out var a)) return null;
+        if (right is null) return VectorIndexing.PartName(parent, a);
+        if (!int.TryParse(right.Trim(), out var b)) return null;
+        return VectorIndexing.PartName(parent, Math.Max(a, b), Math.Min(a, b));
     }
 
     /// <summary>Strips a leading VHDL library prefix (e.g. "work.") from an

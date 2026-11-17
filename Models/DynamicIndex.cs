@@ -12,16 +12,13 @@ namespace Interpreter.Models;
 /// <remarks>
 /// Two modes:
 /// <list type="bullet">
-///   <item><b>Identifier mode</b>: <see cref="IndexSource"/> is a Variable
+///   <item><b>Identifier mode</b>: <see cref="IndexValue.Source"/> is a Variable
 ///         (typically an INTEGER iterator); Evaluate reads its current value
 ///         each delta.</item>
-///   <item><b>Expression mode</b>: <see cref="IndexExpression"/> is the raw
+///   <item><b>Expression mode</b>: <see cref="IndexValue.Expression"/> is the raw
 ///         token-joined text of the index expression (e.g.
-///         <c>"to_integer ( unsigned ( addr ) )"</c>); Evaluate builds a
-///         fresh <see cref="Services.Operation"/> against
-///         <see cref="ExpressionScope"/> each delta and reads the result.
-///         Slower (re-parses each evaluation) but needed because the
-///         expression may reference live signals.</item>
+///         <c>"to_integer ( unsigned ( addr ) )"</c>), parsed once and
+///         re-evaluated against the live signals each delta.</item>
 /// </list>
 /// Kept as a distinct type from <see cref="DeferredIndex"/> so the existing
 /// literal-int path (which the entire combinational corpus depends on) is
@@ -31,25 +28,11 @@ public class DynamicIndex
 {
     /// <summary>The vector/array signal being indexed.</summary>
     public Variable Source { get; }
-    /// <summary>The variable supplying the index value in identifier mode; null in expression mode.</summary>
-    public Variable? IndexSource { get; }
-
     /// <summary>
-    /// Bench bug #19: raw text of the index expression for re-evaluation at
-    /// runtime. Set when the index is a non-trivial expression (function
-    /// call, arithmetic on signals) that the parser couldn't reduce to a
-    /// single integer Variable. Null when the legacy IndexSource path is in
-    /// use.
+    /// The index, evaluated at run time: a variable (identifier mode) or an
+    /// expression over live signals (expression mode, parsed once).
     /// </summary>
-    public string? IndexExpression { get; }
-
-    /// <summary>
-    /// Scope of variables the index expression can reference. Captured at
-    /// parse time and passed to each freshly-constructed Operation when
-    /// <see cref="IndexExpression"/> is non-null. Null when the legacy
-    /// IndexSource path is in use.
-    /// </summary>
-    public HashSet<Variable>? ExpressionScope { get; }
+    public IndexValue Index { get; }
 
     /// <summary>Creates an identifier-mode dynamic index over <paramref name="source"/> using <paramref name="indexSource"/>.</summary>
     /// <param name="source">The vector/array signal being indexed.</param>
@@ -57,9 +40,7 @@ public class DynamicIndex
     public DynamicIndex(Variable source, Variable indexSource)
     {
         Source = source;
-        IndexSource = indexSource;
-        IndexExpression = null;
-        ExpressionScope = null;
+        Index = IndexValue.Of(indexSource);
     }
 
     /// <summary>Creates an expression-mode dynamic index over <paramref name="source"/> evaluated against <paramref name="scope"/>.</summary>
@@ -69,103 +50,23 @@ public class DynamicIndex
     public DynamicIndex(Variable source, string indexExpression, HashSet<Variable> scope)
     {
         Source = source;
-        IndexSource = null;
-        IndexExpression = indexExpression;
-        ExpressionScope = scope;
+        Index = IndexValue.Of(indexExpression, scope);
     }
-
-    // Bench bug #19 perf follow-up (2026-06-23, P3 hang): rebuilding a
-    // fresh Operation on every Evaluate() killed multi-thousand-cycle sims
-    // (P3 went from 50 µs/min on P2A to 1.5 s per 100 ns). Cache the parsed
-    // Operation and let it re-execute against the live scope each call —
-    // Operation.Execute already re-reads its operands' .Value at runtime,
-    // so the cached parse is safe.
-    private Services.Operation? _cachedOperation;
 
     /// <summary>Resolves the index at runtime and returns the selected element as a Variable.</summary>
     /// <returns>The indexed element, or an unresolved ('U') value when the index cannot be resolved.</returns>
     public Variable Evaluate()
     {
-        // Defensive null-guards: an expression like `mem(to_integer(unsigned(addr)))`
-        // can land here with Source = null when the parser captured a
-        // function-call expression as an index source rather than a real
-        // signal. Without this guard the entire SimulationRunner aborts via
-        // a swallowed NullReferenceException, leaving the user with a silent
-        // empty VCD. Return 'U' instead so the design simulates and the user
-        // sees the unsupported-index location in the waveform.
+        // Source can be null when the parser captured a function call as the
+        // indexed name; return 'U' instead of aborting the whole run.
         string vec = Source?.Value?.ToString() ?? "";
-        int dynIdx = -1;
-
-        if (IndexExpression is not null && ExpressionScope is not null)
-        {
-            // Expression mode: parse the index expression ONCE and cache;
-            // Execute re-reads operand .Value each call, so re-parsing per
-            // delta was pure overhead. The cache is per-DynamicIndex
-            // instance so different `mem(<expr1>)` and `mem(<expr2>)`
-            // sites don't share.
-            try
-            {
-                if (_cachedOperation is null)
-                {
-                    _cachedOperation = new Services.Operation(IndexExpression, ExpressionScope);
-                }
-                var result = _cachedOperation.Execute();
-                if (result is Variable v) dynIdx = TryToInt(v.Value);
-                else dynIdx = TryToInt(result);
-            }
-            catch
-            {
-                dynIdx = -1;
-            }
-        }
-        else
-        {
-            object? rawIdx = IndexSource?.Value;
-            if (rawIdx is int ri) dynIdx = ri;
-            else if (rawIdx is long li) dynIdx = (int)li;
-            else if (!int.TryParse(rawIdx?.ToString(), out dynIdx)) dynIdx = -1;
-        }
-
+        int index = Index.Evaluate();
         var srcName = Source?.Name ?? "unknown";
-        if (vec.Length == 0 || dynIdx < 0)
-            return new Variable($"{srcName}_dyn", "U", Constants.DATATYPES.STD_LOGIC);
-
-        // Bench bug #19: when the source is typed by a user array of vectors
-        // (ElementSize > 1), the index selects an element slot — not a bit.
-        // Storage convention matches ParseAggregateOrExpression's positional
-        // path: element 0 is at the start of the bitstring, each slot is
-        // ElementSize bits wide.
-        int elementSize = Source?.ElementSize ?? 0;
-        if (elementSize > 1)
-        {
-            int start = dynIdx * elementSize;
-            if (start < 0 || start + elementSize > vec.Length)
-                return new Variable($"{srcName}_dyn_{dynIdx}",
-                    new string('U', elementSize),
-                    Constants.DATATYPES.STD_LOGIC_VECTOR);
-            string slot = vec.Substring(start, elementSize);
-            return new Variable($"{srcName}_dyn_{dynIdx}", slot, Constants.DATATYPES.STD_LOGIC_VECTOR);
-        }
-
-        // Range-aware single-bit read: honour the source's declared range when
-        // present, else fall back to MSB-first (len-1-index).
-        int pos = Source is not null ? Source.IndexToOffset(dynIdx, vec.Length) : vec.Length - 1 - dynIdx;
-        string bit = (pos >= 0 && pos < vec.Length) ? vec[pos].ToString() : "U";
-        return new Variable($"{srcName}_dyn_{dynIdx}", bit, Constants.DATATYPES.STD_LOGIC);
-    }
-
-    private static int TryToInt(object? value)
-    {
-        if (value == null) return -1;
-        if (value is int i) return i;
-        if (value is long l) return (int)l;
-        string s = value.ToString() ?? string.Empty;
-        // Binary string (multi-char, only 0/1) — interpret base-2.
-        if (s.Length > 1 && s.All(c => c == '0' || c == '1'))
-        {
-            try { return System.Convert.ToInt32(s, 2); } catch { /* fall through */ }
-        }
-        if (int.TryParse(s, out int parsed)) return parsed;
-        return -1;
+        bool element = (Source?.ElementSize ?? 0) > 1;
+        int width = element ? Source!.ElementSize : 1;
+        var span = Source is null || vec.Length == 0 || index < 0 ? null : VectorIndexing.Element(Source, index, vec.Length);
+        string value = span is { } s ? vec.Substring(s.Start, s.Width) : new string('U', width);
+        return new Variable(index < 0 ? $"{srcName}_dyn" : $"{srcName}_dyn_{index}", value,
+            element ? Constants.DATATYPES.STD_LOGIC_VECTOR : Constants.DATATYPES.STD_LOGIC);
     }
 }

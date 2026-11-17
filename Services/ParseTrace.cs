@@ -115,6 +115,28 @@ public static class ParseTrace
     }
 
     /// <summary>
+    /// Consumes a parenthesised group (the stream is on its <c>(</c>) and
+    /// returns the text between the parentheses, tokens space-separated so a
+    /// range such as <c>3 downto 2</c> keeps its keyword. Used for the indexed
+    /// target of selected and conditional assignments (<c>y(0)</c>, <c>v(3 downto 2)</c>).
+    /// </summary>
+    public static string ReadParenthesized(TokenStream streamer)
+    {
+        var inner = new System.Text.StringBuilder();
+        int depth = 0, iter = 0;
+        while (streamer.Current != null)
+        {
+            string v = streamer.Current.Value;
+            Step(ref iter, streamer, CancellationToken.None);
+            streamer.MoveNext();
+            if (v == "(" && depth++ == 0) continue;
+            if (v == ")" && --depth == 0) break;
+            inner.Append(v).Append(' ');
+        }
+        return inner.ToString().Trim();
+    }
+
+    /// <summary>
     /// F-G-08 pass 4 (2026-07-17): consume a <c>wait</c> statement:
     /// <c>wait for X ns;</c>, <c>wait until cond;</c>, <c>wait on sig;</c>,
     /// or bare <c>wait;</c>. Testbench-only; not synthesizable.

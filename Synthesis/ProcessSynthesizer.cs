@@ -57,11 +57,9 @@ internal static class ProcessSynthesizer
         }
 
         // Pass 19 (2026-07-30): merge process-local variable declarations
-        // into the scope handed to the walker. Without this, a shape like
-        // `variable mem : mem_t; mem(i) := din;` couldn't lower to
-        // RAM_WRITE because TryHandleDynamicIndexWrite's base lookup
-        // searched only architecture-level signals. The merged scope is
-        // used everywhere downstream (walker + end-of-Synthesize closure).
+        // into the scope handed to the walker (e.g. `variable mem : mem_t;
+        // mem(i) := din;`). The merged scope is used everywhere downstream
+        // (walker + end-of-Synthesize closure).
         // Local vars are also tracked separately so we can classify their
         // Q nets at closure time.
         var localVars = process.Variables ?? new HashSet<Variable>();
@@ -77,16 +75,8 @@ internal static class ProcessSynthesizer
         // feedback when a branch doesn't drive the signal (the "hold"
         // semantics). For combinational, it's the placeholder before
         // the first assignment lands.
-        var running = new Dictionary<string, Net>(StringComparer.OrdinalIgnoreCase);
-        var allLhs = CollectAssignedLhs(bodyTasks);
-        foreach (var lhsName in allLhs)
-        {
-            var lhsVar = mergedScope.FirstOrDefault(v =>
-                v is not null && v.Name is not null
-                && v.Name.Equals(lhsName, StringComparison.OrdinalIgnoreCase));
-            if (lhsVar is null) continue;
-            running[lhsName] = NetForLhs(lhsVar, ctx);
-        }
+        var driven = CollectDrivenNets(bodyTasks, mergedScope, ctx);
+        var running = new Dictionary<string, Net>(driven, StringComparer.OrdinalIgnoreCase);
 
         string sensList = process.SensitiveList != null
             ? string.Join(",", process.SensitiveList
@@ -111,9 +101,7 @@ internal static class ProcessSynthesizer
 
         foreach (var (lhsName, valueNet) in running)
         {
-            var lhsVar = mergedScope.FirstOrDefault(v => v.Name.Equals(lhsName, StringComparison.OrdinalIgnoreCase));
-            if (lhsVar is null) continue;
-            var qNet = NetForLhs(lhsVar, ctx);
+            if (!driven.TryGetValue(lhsName, out var qNet)) continue;
 
             // No-op assignment? Walker may have left running[lhs] ==
             // qNet (e.g. a process that "drives" a signal but every
@@ -157,7 +145,7 @@ internal static class ProcessSynthesizer
             switch (task)
             {
                 case Operation op:
-                    if (!TryHandleDynamicIndexWrite(op, scope, ctx, running, sourceLine))
+                    if (!TryHandleDynamicIndexWrite(op, ctx, running, sourceLine))
                     {
                         HandleAssignment(op, scope, ctx, running, sourceLine);
                     }
@@ -183,7 +171,7 @@ internal static class ProcessSynthesizer
                     // through this same branch.
                     try
                     {
-                        var bound = pcall.ResolveBoundBody(null, out _, out var boundScope);
+                        var bound = pcall.ResolveBoundBody(null, out var boundScope);
                         if (bound != null && bound.Count > 0)
                         {
                             WalkTasks(bound, boundScope, ctx, running, sourceLine);
@@ -247,111 +235,35 @@ internal static class ProcessSynthesizer
     }
 
     /// <summary>
-    /// Tier 4.3 pass 17 (2026-07-29): detect a dynamic-index signal write
-    /// like <c>mem(to_integer(unsigned(addr))) &lt;= din</c> before it
-    /// falls into the regular <see cref="HandleAssignment"/> path. The
-    /// Operation constructor collapses this shape's LHS to a
-    /// <c>ConditionResult</c> placeholder (its regex only matches static
-    /// integer indices), which the assignment walker then silently drops.
-    /// Instead, emit a <see cref="CellKind.RAM_WRITE"/> cell so the RAM's
-    /// write side is visible in the schematic and update the running dict
-    /// to point at the post-write memory net.
+    /// Tier 4.3 pass 17 (2026-07-29): a write to one element of an array of
+    /// vectors at a run-time index (<c>mem(to_integer(unsigned(addr))) &lt;= din</c>,
+    /// or <c>:=</c> on a process variable) becomes a <see cref="CellKind.RAM_WRITE"/>
+    /// cell so the RAM's write side is visible in the schematic, and the running
+    /// dict points at the post-write memory net.
     /// </summary>
     /// <returns>True if this Operation was a dynamic-index write and was
     /// handled here; false to fall through to the default assignment
     /// path.</returns>
-    /// <summary>
-    /// Extracts the base signal name from a dynamic-index write's raw
-    /// text (e.g. "mem ( to_integer(unsigned(addr)) ) &lt;= din" →
-    /// "mem"). Returns null when the shape doesn't match.
-    /// </summary>
-    private static string? TryExtractDynamicIndexBase(string? rawData)
-    {
-        if (string.IsNullOrEmpty(rawData)) return null;
-        int arrow = FindAssignmentArrow(rawData, out _);
-        if (arrow <= 0) return null;
-        string lhs = rawData.Substring(0, arrow).Trim();
-        int paren = lhs.IndexOf('(');
-        if (paren <= 0 || lhs[^1] != ')') return null;
-        string baseName = lhs.Substring(0, paren).Trim();
-        string indexExpr = lhs.Substring(paren + 1, lhs.Length - paren - 2).Trim();
-        if (string.IsNullOrEmpty(baseName) || string.IsNullOrEmpty(indexExpr)) return null;
-        if (int.TryParse(indexExpr, out _)) return null; // static: legacy path
-        return baseName;
-    }
-
-    /// <summary>
-    /// Pass 19 (2026-07-30) — finds the assignment arrow (<c>&lt;=</c>
-    /// for signals, <c>:=</c> for variables) in a raw Operation line
-    /// and reports which one matched. Returns the byte offset of the
-    /// arrow (0 or negative if none found) and sets <paramref name="isVariable"/>.
-    /// Chooses the leftmost arrow so a RHS with `foo &lt;= bar` embedded
-    /// in a variable assign like `mem(i) := (a &lt;= b)` still splits at
-    /// the `:=` first.
-    /// </summary>
-    private static int FindAssignmentArrow(string rawData, out bool isVariable)
-    {
-        int sigArrow = rawData.IndexOf("<=", StringComparison.Ordinal);
-        int varArrow = rawData.IndexOf(":=", StringComparison.Ordinal);
-        if (varArrow >= 0 && (sigArrow < 0 || varArrow < sigArrow))
-        {
-            isVariable = true;
-            return varArrow;
-        }
-        isVariable = false;
-        return sigArrow;
-    }
-
-    private static bool TryHandleDynamicIndexWrite(Operation op, HashSet<Variable> scope,
+    private static bool TryHandleDynamicIndexWrite(Operation op,
         SynthesisContext ctx, Dictionary<string, Net> running, string sourceLine)
     {
-        if (string.IsNullOrEmpty(op.RawData)) return false;
-        int arrowIdx = FindAssignmentArrow(op.RawData, out bool isVariable);
-        if (arrowIdx <= 0) return false;
-
-        string lhsRaw = op.RawData.Substring(0, arrowIdx).Trim();
-        string rhsRaw = op.RawData.Substring(arrowIdx + 2).Trim();
-        if (string.IsNullOrEmpty(lhsRaw) || string.IsNullOrEmpty(rhsRaw)) return false;
-
-        // LHS must be `<baseName> ( <indexExpr> )`. Static integer indices
-        // (`mem(3) <= …`) fall through — the Operation constructor already
-        // handles them via ResultBitIndex and HandleAssignment writes them
-        // straight to the named net.
-        int firstParen = lhsRaw.IndexOf('(');
-        if (firstParen <= 0) return false;
-        int lastParen = lhsRaw.LastIndexOf(')');
-        if (lastParen != lhsRaw.Length - 1) return false;
-        string baseName = lhsRaw.Substring(0, firstParen).Trim();
-        string indexExpr = lhsRaw.Substring(firstParen + 1, lastParen - firstParen - 1).Trim();
-        if (string.IsNullOrEmpty(baseName) || string.IsNullOrEmpty(indexExpr)) return false;
-        if (int.TryParse(indexExpr, out _)) return false; // static index: legacy path handles
-
-        var baseVar = scope.FirstOrDefault(v =>
-            v is not null && v.Name is not null
-            && v.Name.Equals(baseName, StringComparison.OrdinalIgnoreCase));
-        if (baseVar is null) return false;
+        if (op.Target is not { IsPartial: true, Right: null, Left: { StaticValue: null } index } target) return false;
+        var baseVar = target.Base;
+        string baseName = baseVar.Name;
         int elemSize = baseVar.ElementSize;
         if (elemSize <= 0) return false; // not an array-of-vectors
+        bool isVariable = op.IsVariableAssignment;
 
         Net dataNet;
         try
         {
-            var dataOp = new Operation($"{baseName} <= {rhsRaw}", scope);
             var dataOut = ctx.NewInternal(elemSize, sourceLine);
-            ConcurrentAssignSynthesizer.SynthesizeInto(dataOp, dataOut, ctx);
+            ConcurrentAssignSynthesizer.SynthesizeInto(op, dataOut, ctx);   // op's items are the RHS
             dataNet = dataOut;
         }
         catch { return false; }
 
-        Net selNet;
-        try
-        {
-            var selOp = new Operation($"{baseName}_idx_sel <= {indexExpr}", scope);
-            var selOut = ctx.NewInternal(1, sourceLine);
-            ConcurrentAssignSynthesizer.SynthesizeInto(selOp, selOut, ctx);
-            selNet = selOut;
-        }
-        catch { return false; }
+        if (ConcurrentAssignSynthesizer.SelectorNet(index, ctx, sourceLine) is not { } selNet) return false;
 
         var memInNet = running.TryGetValue(baseName, out var prev)
             ? prev
@@ -397,11 +309,12 @@ internal static class ProcessSynthesizer
         // assignments to a named signal.
         if (op.Result.Name.StartsWith("Condition", StringComparison.OrdinalIgnoreCase)) return;
 
-        int width = op.Result.Type == Constants.DATATYPES.STD_LOGIC_VECTOR
-            ? Math.Max(1, op.Result.Size) : 1;
+        var part = ConcurrentAssignSynthesizer.PartTargetNet(op.Target, ctx);
+        int width = part?.Width ?? (op.Result.Type == Constants.DATATYPES.STD_LOGIC_VECTOR
+            ? Math.Max(1, op.Result.Size) : 1);
         var valNet = ctx.NewInternal(width: width, sourceLine: sourceLine);
         ConcurrentAssignSynthesizer.SynthesizeInto(op, valNet, ctx);
-        running[op.Result.Name] = valNet;
+        running[part?.Name ?? op.Result.Name] = valNet;
     }
 
     private static void HandleIf(IfStructure ifs, HashSet<Variable> scope,
@@ -691,7 +604,7 @@ internal static class ProcessSynthesizer
                     // BoundBodyCache) — same output the runtime consumes.
                     try
                     {
-                        var bound = pcall.ResolveBoundBody(null, out _, out _);
+                        var bound = pcall.ResolveBoundBody(null, out _);
                         if (bound == null || bound.Count == 0) return false;
                         if (!CanWalk(bound)) return false;
                     }
@@ -726,16 +639,18 @@ internal static class ProcessSynthesizer
     }
 
     /// <summary>
-    /// Collects every signal name assigned anywhere in the body —
-    /// used to seed the running map with the named output nets so
-    /// the MUX-chain merger has a sensible "previous value" to
-    /// fall through to when a branch doesn't drive the LHS.
+    /// The net each assignment in the body drives (its Q), keyed like the
+    /// running map: a declared signal/variable by name, a literal part of an
+    /// internal signal by its bit-select net (<c>v_idx_3</c>). Seeds the running
+    /// map so the MUX-chain merger has a "previous value" to fall through to
+    /// when a branch doesn't drive the target, and names the nets the process
+    /// finally drives.
     /// </summary>
-    private static HashSet<string> CollectAssignedLhs(IList<object> tasks)
+    private static Dictionary<string, Net> CollectDrivenNets(IList<object> tasks, HashSet<Variable> scope, SynthesisContext ctx)
     {
-        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var driven = new Dictionary<string, Net>(StringComparer.OrdinalIgnoreCase);
         Visit(tasks);
-        return set;
+        return driven;
 
         void Visit(IList<object> ts)
         {
@@ -744,18 +659,10 @@ internal static class ProcessSynthesizer
                 switch (t)
                 {
                     case Operation op when op.Result?.Name is { Length: > 0 } name
-                                         && !name.StartsWith("Condition", StringComparison.OrdinalIgnoreCase):
-                        set.Add(name);
-                        break;
-                    case Operation dynWrite when TryExtractDynamicIndexBase(dynWrite.RawData) is string dynBase:
-                        // Pass 17 (2026-07-29): dynamic-index writes land
-                        // with Op.Result.Name == "ConditionResult" because
-                        // the Operation constructor's LHS regex only
-                        // handles static integer indices. The base signal
-                        // still needs to appear in `running` so
-                        // TryHandleDynamicIndexWrite's MemOut threads
-                        // through the process-level MUX/DFF closure.
-                        set.Add(dynBase);
+                                         && !name.StartsWith("Condition", StringComparison.OrdinalIgnoreCase)
+                                         && scope.Contains(op.Result):
+                        var q = ConcurrentAssignSynthesizer.PartTargetNet(op.Target, ctx) ?? NetForLhs(op.Result, ctx);
+                        driven.TryAdd(q.Name, q);
                         break;
                     case IfStructure ifs:
                         foreach (var br in ifs.Branches) Visit(br.Tasks);

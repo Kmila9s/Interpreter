@@ -164,10 +164,8 @@ public class ProcedureCallStatement : ISControl
     /// </remarks>
     public List<object> ResolveBoundBody(
         SignalScheduler? scheduler,
-        out Dictionary<ParameterDefinition, Variable> outMap,
         out HashSet<Variable> boundScope)
     {
-        outMap = new Dictionary<ParameterDefinition, Variable>();
         boundScope = new HashSet<Variable>(_variables);
 
         var def = Interpreter.Services.FunctionRegistry.Instance.Get(ProcedureName);
@@ -203,8 +201,6 @@ public class ProcedureCallStatement : ISControl
             {
                 renameMap[formal.Name] = actualVar.Name;
                 actualSig.Add(actualVar.Name.ToLowerInvariant());
-                if (formal.Mode == ParameterMode.Out || formal.Mode == ParameterMode.InOut)
-                    outMap[formal] = actualVar;
             }
             else
             {

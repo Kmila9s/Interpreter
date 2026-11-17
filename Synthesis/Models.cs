@@ -114,9 +114,7 @@ public enum CellKind {
     /// `Sel` (index selector), `Din` (data to write) — output pin
     /// `MemOut` becomes the new memory state driving the base signal.
     /// Attrs["Element"], ["Source"], and ["N"] mirror RAM_READ. Pass 17
-    /// (2026-07-29). Before pass 17 these writes silently dropped as
-    /// Operation.ConditionResult placeholders — the RAM's write side
-    /// was invisible on the schematic.</summary>
+    /// (2026-07-29).</summary>
     RAM_WRITE,
     /// <summary>Fallback cell for a process body too tangled to decompose into
     /// discrete gates; rendered as an opaque labeled box.</summary>

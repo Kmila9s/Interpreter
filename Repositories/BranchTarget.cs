@@ -1,0 +1,79 @@
+using Interpreter.Models;
+using Interpreter.Services;
+using Parser.Models;
+using Parser.Repositories;
+
+namespace Interpreter.Repositories;
+
+/// <summary>
+/// The single target of a multi-branch assignment (<c>with … select</c>,
+/// <c>when … else</c>) and the assignment each branch performs
+/// (<c>target &lt;= value</c>). Shared by <see cref="SelectedAssignment"/> and
+/// <see cref="ConditionalAssignment"/>, which differ only in how they pick
+/// the branch.
+/// </summary>
+internal sealed class BranchTarget<TBranch> where TBranch : notnull
+{
+    private readonly HashSet<Variable> _scope;
+    private readonly Dictionary<TBranch, Operation> _assignments = new();
+
+    public BranchTarget(HashSet<Variable> scope) => _scope = scope;
+
+    /// <summary>The target as written, with any index or range (<c>y</c>, <c>y(0)</c>, <c>v(3 downto 2)</c>).</summary>
+    public string Text { get; private set; } = string.Empty;
+
+    /// <summary>The target resolved; null when undeclared.</summary>
+    public AssignmentTarget? Destination { get; private set; }
+
+    /// <summary>Records and resolves the target.</summary>
+    public void Set(string text)
+    {
+        Text = text.Trim();
+        Destination = AssignmentTarget.Resolve(Text, _scope);
+    }
+
+    /// <summary>
+    /// Reads the target from <paramref name="streamer"/>: a name, with its
+    /// index or range when present (kept so only that part is written and
+    /// sibling per-bit statements merge instead of clobbering each other).
+    /// </summary>
+    public void Read(TokenStream streamer)
+    {
+        if (streamer.Current?.Type != Constants.TYPE.IDENTIFIERS) return;
+        string name = streamer.Current.Value;
+        streamer.MoveNext();
+        Set(streamer.Current?.Value == "(" ? $"{name}({ParseTrace.ReadParenthesized(streamer)})" : name);
+    }
+
+    /// <summary>
+    /// Builds <paramref name="branch"/>'s assignment with the same input-port
+    /// (C8), part-target and type/width (C4/C5) validation as a plain
+    /// assignment, and keeps it for execution. Only a <see cref="ParserException"/>
+    /// (the intended rejection) escapes; any other ctor failure on an
+    /// unusual-but-valid value is swallowed and the assignment is built on
+    /// first use instead.
+    /// </summary>
+    public void Validate(TBranch branch, string value, int sourceLine)
+    {
+        if (Text.Length == 0 || string.IsNullOrWhiteSpace(value)) return;
+        try
+        {
+            _assignments[branch] = new Operation($"{Text} <= {value}", _scope, sourceLine, isAssignmentStatement: true);
+        }
+        catch (ParserException) { throw; }
+        catch { /* never destabilise a valid design on an unexpected ctor failure */ }
+    }
+
+    /// <summary>
+    /// Performs <paramref name="branch"/>'s assignment through the same path as
+    /// a plain assignment: whole or part target, <c>after</c> delay, scheduled
+    /// when a <paramref name="scheduler"/> is given, immediate otherwise.
+    /// </summary>
+    public void Assign(TBranch branch, string value, SignalScheduler? scheduler)
+    {
+        if (!_assignments.TryGetValue(branch, out var op))
+            _assignments[branch] = op = new Operation($"{Text} <= {value}", _scope);
+        if (scheduler != null) ScheduledOperation.Run(op, scheduler);
+        else op.Execute();
+    }
+}

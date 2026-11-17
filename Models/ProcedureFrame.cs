@@ -26,7 +26,7 @@ namespace Interpreter.Models;
 /// <c>wait until &lt;cond&gt;</c> sensitivity sets capture the caller's
 /// actual signals for correct condition-blocked wakeup.</para>
 /// <para>Reentrancy is trivially safe: each call gets its own
-/// <see cref="Tasks"/>, <see cref="BoundScope"/>, and <see cref="OutMap"/>
+/// <see cref="Tasks"/> and <see cref="BoundScope"/>
 /// via <c>ResolveBoundBody</c>. Two concurrent processes calling the
 /// same procedure never share state.</para>
 /// </remarks>
@@ -52,15 +52,6 @@ public sealed class ProcedureFrame : IProcessFrame
     /// context on errors.
     /// </summary>
     public required ProcedureCallStatement CallRef { get; init; }
-
-    /// <summary>
-    /// Formal parameter → caller-side actual <c>Variable</c>. Populated
-    /// only for Out/InOut variable formals whose actual is a caller-scope
-    /// <c>Variable</c> (not a literal or expression). Applied at
-    /// completion via <c>ApplyProcedureWriteBack</c>; never at suspend
-    /// (VHDL LRM: write-back is visible only after the procedure returns).
-    /// </summary>
-    public required Dictionary<ParameterDefinition, Variable> OutMap { get; init; }
 
     /// <summary>
     /// The caller-facing scope used when <see cref="Tasks"/> was parsed:

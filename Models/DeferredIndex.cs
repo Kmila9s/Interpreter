@@ -53,49 +53,14 @@ public class DeferredIndex
     public Variable Evaluate()
     {
         string vec = Source.Value?.ToString() ?? "";
-        if (vec.Length == 0)
-        {
-            return new Variable(
-                $"{Source.Name}_idx",
-                IsSlice ? new string('U', High - Low + 1) : "U",
-                IsSlice ? Constants.DATATYPES.STD_LOGIC_VECTOR : Constants.DATATYPES.STD_LOGIC);
-        }
-
-        // Bench bug #19: arrays of vectors (Source.ElementSize > 1) index
-        // by ELEMENT, not by bit. `rom_init(3)` returns element slot 3, an
-        // ElementSize-wide slice. Slices `(H downto L)` over such arrays
-        // aren't supported here — they're an unusual VHDL construct on an
-        // array — so we honour single-index reads only and fall through to
-        // the legacy bit path for explicit ranges.
-        if (!IsSlice && Source.ElementSize > 1)
-        {
-            int elementSize = Source.ElementSize;
-            int start = High * elementSize;
-            if (start < 0 || start + elementSize > vec.Length)
-            {
-                return new Variable($"{Source.Name}_idx_{High}",
-                    new string('U', elementSize),
-                    Constants.DATATYPES.STD_LOGIC_VECTOR);
-            }
-            string slot = vec.Substring(start, elementSize);
-            return new Variable($"{Source.Name}_idx_{High}", slot, Constants.DATATYPES.STD_LOGIC_VECTOR);
-        }
-
-        if (IsSlice)
-        {
-            // Range-aware: honour the source's declared to/downto direction and
-            // bounds. Falls back to MSB-first (len-1-index) when no range recorded.
-            var (startPos, width) = Source.SliceToSpan(High, Low, vec.Length);
-            string slice = (startPos >= 0 && startPos + width <= vec.Length)
-                ? vec.Substring(startPos, width)
-                : new string('U', width);
-            return new Variable($"{Source.Name}_idx_{High}_{Low}", slice, Constants.DATATYPES.STD_LOGIC_VECTOR);
-        }
-        else
-        {
-            int pos = Source.IndexToOffset(High, vec.Length);
-            string bit = (pos >= 0 && pos < vec.Length) ? vec[pos].ToString() : "U";
-            return new Variable($"{Source.Name}_idx_{High}", bit, Constants.DATATYPES.STD_LOGIC);
-        }
+        bool element = Source.ElementSize > 1;
+        int width = IsSlice ? VectorIndexing.RangeWidth(Source, High, Low) : (element ? Source.ElementSize : 1);
+        var span = vec.Length == 0 ? null
+            : IsSlice ? VectorIndexing.Range(Source, High, Low, vec.Length)
+            : VectorIndexing.Element(Source, High, vec.Length);
+        string value = span is { } s ? vec.Substring(s.Start, s.Width) : new string('U', width);
+        string name = VectorIndexing.PartName(Source.Name, High, IsSlice ? Low : null);
+        return new Variable(name, value,
+            IsSlice || element ? Constants.DATATYPES.STD_LOGIC_VECTOR : Constants.DATATYPES.STD_LOGIC);
     }
 }

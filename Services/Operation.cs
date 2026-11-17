@@ -104,13 +104,11 @@ public class Operation : IOperation {
         new(message, SourceLine, 0, Result?.Name);
 
     /// <summary>
-    /// When the assignment target is an indexed element of a vector signal
-    /// (e.g. <c>output(0) &lt;= …</c>), this is the integer index. Null for
-    /// whole-signal assignments. Only literal-integer indices are supported
-    /// for now — runtime/variable indices fall through to a parse failure.
-    /// Bench Phase E bug #5 fix (2026-06-03).
+    /// The assignment's target (<see cref="Result"/> plus the index or range
+    /// written, if any); null when this operation is a condition, not an
+    /// assignment to a declared object.
     /// </summary>
-    public int? ResultBitIndex { get; set; }
+    public AssignmentTarget? Target { get; private set; }
 
     /// <summary>
     /// Nanosecond inertial-delay captured from `after N &lt;unit&gt;` clauses on
@@ -159,25 +157,8 @@ public class Operation : IOperation {
             if (splitted.Length >= 2)
             {
                 string varName = splitted[0].Trim();
-
-                // Indexed-target detection: `output(0)` or `output ( 0 )` →
-                // base name "output", ResultBitIndex 0. Bench bug #5.
-                int? bitIndex = null;
-                string baseName = varName;
-                {
-                    var m = System.Text.RegularExpressions.Regex.Match(
-                        varName, @"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*(\d+)\s*\)\s*$");
-                    if (m.Success)
-                    {
-                        baseName = m.Groups[1].Value;
-                        if (int.TryParse(m.Groups[2].Value, out int parsedIdx))
-                            bitIndex = parsedIdx;
-                    }
-                }
-                var foundVar = this.Variables.Where(p => !ReferenceEquals(p, null)).FirstOrDefault(p =>
-                    !string.IsNullOrEmpty(p.Name) &&
-                    p.Name.Equals(baseName, StringComparison.OrdinalIgnoreCase));
-                if (foundVar is not null) ResultBitIndex = bitIndex;
+                Target = AssignmentTarget.Resolve(varName, this.Variables);
+                var foundVar = Target?.Base;
 
                 if (foundVar is null)
                 {
@@ -246,7 +227,10 @@ public class Operation : IOperation {
         // v1.19.0 (P4/C4+C5): type/width validation for a single-atom assignment
         // (gated like C8 so comparisons are never mistaken for assignments).
         if (isAssignmentStatement)
+        {
+            ValidatePartialTarget();
             ValidateAssignmentTypeWidth();
+        }
 
         if (_profileStopwatch != null)
         {
@@ -256,13 +240,14 @@ public class Operation : IOperation {
     }
 
     /// <summary>
-    /// Executes the operation.
+    /// Evaluates the expression (assignment right-hand side or condition)
+    /// against its operands' current values and returns the result without
+    /// writing anything. Shared by <see cref="Execute"/> and
+    /// <see cref="ScheduledOperation.Run"/>.
     /// </summary>
-    /// <returns>The result of the operation.</returns>
-    public object Execute(){
+    public object Evaluate()
+    {
         Stack<Variable> variables = new();
-        if (Result.PortType == Constants.PortType.IN)
-            throw new InvalidOperationException($"Input ports are not elegible for assignations: {Result.Name}");
 
         foreach(var item in Items){
             if(item is Variable newVar){
@@ -349,8 +334,28 @@ public class Operation : IOperation {
             }
         }
         if (variables.Count != 1)
-            throw new InvalidOperationException($"Malformed expression: stack not reduced to a single result: {_rawData}");
-        Result.Value = variables.Pop().Value;
+            throw new InvalidOperationException(
+                $"Malformed expression: stack not reduced to a single result ({variables.Count} items left). RHS=`{RawData}` Target=`{Result?.Name}`");
+        return variables.Pop().Value;
+    }
+
+    /// <summary>The target must be writable: VHDL forbids assigning an input port.</summary>
+    internal void EnsureWritable()
+    {
+        if (Result is { IsPort: true, PortType: Constants.PortType.IN })
+            throw new InvalidOperationException($"Input ports are not eligible for assignments: {Result.Name}");
+    }
+
+    /// <summary>
+    /// Evaluates and writes the result immediately (sequential executor and
+    /// condition evaluation). A part target writes only its part.
+    /// </summary>
+    public object Execute()
+    {
+        EnsureWritable();
+        var value = Evaluate();
+        if (Target is { IsPartial: true } part) part.Assign(null, value, SourceLine, 0, immediate: true);
+        else Result.Value = value;
         return Result;
     }
 
@@ -522,7 +527,7 @@ public class Operation : IOperation {
             {
                 Constants.DATATYPES type = _finder.GetDataType(currentItem);
                 // v0.17.0: Use atomic counter instead of expensive Guid.NewGuid()
-                item = new Variable($"Literal-{Interlocked.Increment(ref _literalCounter)}", currentItem, type);
+                item = new Variable($"Literal-{Interlocked.Increment(ref _literalCounter)}", currentItem, type) { IsConstant = true };
             }
             else if (_variableRegex.IsMatch(currentItem))
             {
@@ -1170,6 +1175,36 @@ public class Operation : IOperation {
     /// <c>Items</c> — <see cref="Execute()"/> switches on the type and
     /// invokes <c>Evaluate</c> per fire.
     /// </remarks>
+    /// <summary>The assignment's right-hand side as written (empty when there is no <c>&lt;=</c>/<c>:=</c>).</summary>
+    private string RawRhs
+    {
+        get
+        {
+            int opIdx = _rawData.IndexOf("<=", StringComparison.Ordinal);
+            if (opIdx < 0) opIdx = _rawData.IndexOf(":=", StringComparison.Ordinal);
+            return opIdx >= 0 ? _rawData[(opIdx + 2)..].Trim() : string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// G17/G49 (v3.1.1): a part target with literal indices must lie inside
+    /// its object, and a range target takes a value of exactly its width
+    /// when that width is certain (as GHDL checks).
+    /// </summary>
+    private void ValidatePartialTarget()
+    {
+        if (Target is not { IsPartial: true, StaticIndices: { } idx } || Result.Size <= 0) return;
+        if (VectorIndexing.Range(Result, idx.Left, idx.Right, Result.Size) == null)
+            throw ResultError(idx.Left == idx.Right
+                ? $"index {idx.Left} out of range of \"{Result.Name}\""
+                : $"range {idx.Left}..{idx.Right} out of range of \"{Result.Name}\"");
+        if (idx.Left == idx.Right || Result.ElementSize > 1) return;
+
+        int targetWidth = VectorIndexing.RangeWidth(Result, idx.Left, idx.Right);
+        if (ExpressionWidthInference.TryComputeWidth(RawRhs, Variables) is int w && w != targetWidth)
+            throw ResultError($"width mismatch: {targetWidth}-bit slice of \"{Result.Name}\" assigned a {w}-bit value");
+    }
+
     /// <summary>
     /// v1.17.0 (P3): build a usable <see cref="Variable"/> from a package
     /// constant resolved out of <see cref="PackageRegistry"/>. The scanner
@@ -1192,10 +1227,10 @@ public class Operation : IOperation {
     /// </summary>
     private void ValidateAssignmentTypeWidth()
     {
-        // LHS must be a real, whole-signal declared target (not a stub, not the
-        // BOOLEAN ConditionResult a comparison/sliced-target resolves to, not an
-        // indexed single-bit target whose width is 1, not undetermined).
-        if (Result is null || Result.IsStub || ResultBitIndex is not null) return;
+        // LHS must be a real, whole declared target (not a stub, not the BOOLEAN
+        // ConditionResult of a comparison, not a part target — checked by
+        // ValidatePartialTarget — and not undetermined).
+        if (Result is null || Result.IsStub || Target is { IsPartial: true }) return;
         if (string.Equals(Result.Name, "ConditionResult", StringComparison.Ordinal)) return;
         var lhsType = Result.Type;
         if (lhsType == Constants.DATATYPES.UNKNOWN) return;
@@ -1213,9 +1248,7 @@ public class Operation : IOperation {
         // The raw source RHS (after the assignment operator). The engine re-joins
         // tokens with spaces, e.g. `a ( 22 downto 0 )`. Shared by the single-atom
         // char-literal reclassification and the expression-width path below.
-        int opIdx = _rawData.IndexOf("<=", StringComparison.Ordinal);
-        if (opIdx < 0) opIdx = _rawData.IndexOf(":=", StringComparison.Ordinal);
-        string rawRhs = opIdx >= 0 ? _rawData[(opIdx + 2)..].Trim() : string.Empty;
+        string rawRhs = RawRhs;
 
         // ---- Single-atom RHS (one Variable; existing behaviour, unchanged) ----
         if (Items.Length == 1 && Items[0] is Variable rhs)
@@ -1534,6 +1567,9 @@ public class Operation : IOperation {
         return (true, deferred.deferred!.Evaluate());
     }
 
+    /// <summary>True for an operator or a constant (literals, declared constants, generics): an operand whose value never changes during the run.</summary>
+    private static bool IsConstantOperand(object item) => item is Operator || item is Variable { IsConstant: true };
+
     /// <summary>
     /// Parses `name(N)` or `name(H downto L)` and returns a
     /// <see cref="Models.DeferredIndex"/> that re-reads the source variable's
@@ -1589,19 +1625,15 @@ public class Operation : IOperation {
                 }
                 else if (expr.Contains("-") || expr.Contains("+") || expr.Contains("*") || expr.Contains("/"))
                 {
-                    // It's an arithmetic expression
+                    // Arithmetic over constants only (`N-1`) folds to a fixed
+                    // index; one over a signal or variable
+                    // (`to_integer(unsigned(sel)) + 1`) stays a run-time index
+                    // (below) instead of freezing the operands' parse-time values.
                     try
                     {
                         Operation op = new(expr, Variables);
-                        var result = op.Execute();
-                        if (result is Variable v)
-                        {
-                            startIndex = Convert.ToInt32(v.Value);
-                        }
-                        else
-                        {
-                            startIndex = Convert.ToInt32(result);
-                        }
+                        if (op.Items.All(IsConstantOperand))
+                            startIndex = Convert.ToInt32(op.Evaluate());
                     }
                     catch { /* ignore errors */ }
                 }

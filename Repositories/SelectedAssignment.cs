@@ -53,11 +53,10 @@ public class SelectedAssignment : ISControl
     private readonly HashSet<Variable> _variables;
     /// <summary>The token stream used for parsing the selected assignment, or null if constructed explicitly.</summary>
     private readonly TokenStream? _streamer;
-    /// <summary>True when the target carried an index expression <c>target(…)</c>, whether or
-    /// not it resolved to a literal <see cref="TargetBitIndex"/>. A non-literal index (e.g. a
-    /// generate loop variable, <c>q(i)</c>) means the element can't be reliably typed, so the
-    /// type/width validation is skipped for it.</summary>
-    private bool _targetWasIndexed;
+    /// <summary>The target and each choice's assignment.</summary>
+    private readonly BranchTarget<SelectionChoice> _target;
+    /// <summary>The selector, parsed on first use and re-evaluated against live values.</summary>
+    private Operation? _selector;
 
     /// <summary>
     /// Gets the selector expression.
@@ -67,21 +66,15 @@ public class SelectedAssignment : ISControl
     /// <summary>
     /// Gets the target signal name.
     /// </summary>
-    public string TargetName { get; private set; } = string.Empty;
-
-    /// <summary>
-    /// Integer bit index when the selected assignment targets a single
-    /// element of a vector signal (e.g. <c>y(0) &lt;= …</c>). Null when
-    /// the assignment targets the whole signal. Only literal-integer
-    /// indices are captured; runtime indices fall through to whole-signal.
-    /// Bench bug #5 / #9 fix (2026-06-03).
-    /// </summary>
-    public int? TargetBitIndex { get; private set; }
+    public string TargetName => Target?.Name ?? _target.Text;
 
     /// <summary>
     /// Gets the target variable.
     /// </summary>
-    public Variable? Target { get; private set; }
+    public Variable? Target => _target.Destination?.Base;
+
+    /// <summary>The written target resolved (whole, or the bit/range written); null when undeclared.</summary>
+    public AssignmentTarget? Destination => _target.Destination;
 
     /// <summary>
     /// Gets the list of selection choices.
@@ -97,6 +90,7 @@ public class SelectedAssignment : ISControl
     {
         _variables = variables;
         _streamer = streamer;
+        _target = new BranchTarget<SelectionChoice>(variables);
     }
 
     /// <summary>
@@ -110,8 +104,8 @@ public class SelectedAssignment : ISControl
         _variables = variables;
         _streamer = null;
         SelectorExpression = selectorExpression;
-        TargetName = targetName;
-        Target = variables.FirstOrDefault(v => v.Name.Equals(targetName, StringComparison.OrdinalIgnoreCase));
+        _target = new BranchTarget<SelectionChoice>(variables);
+        _target.Set(targetName);
     }
 
     /// <summary>
@@ -131,10 +125,8 @@ public class SelectedAssignment : ISControl
         if (Target is null || string.IsNullOrEmpty(SelectorExpression) || Choices.Count == 0)
             return Task.CompletedTask;
 
-        // Evaluate selector
-        Operation selectorOp = new(SelectorExpression, _variables);
-        var selectorResult = selectorOp.Execute();
-        string selectorValue = ExtractValue(selectorResult);
+        _selector ??= new Operation(SelectorExpression, _variables);
+        string selectorValue = ExtractValue(_selector.Evaluate());
 
         SelectionChoice? matched = null;
         SelectionChoice? defaultChoice = null;
@@ -161,7 +153,7 @@ public class SelectedAssignment : ISControl
         }
 
         var chosen = matched ?? defaultChoice;
-        if (chosen != null) AssignValue(chosen.ValueExpression, scheduler);
+        if (chosen != null) _target.Assign(chosen, chosen.ValueExpression, scheduler);
 
         return Task.CompletedTask;
     }
@@ -198,131 +190,9 @@ public class SelectedAssignment : ISControl
     {
         var a = CleanValue(choiceVal);
         var b = CleanValue(selectorValue);
-        if (TryParseInt(a, out long ai) && TryParseInt(b, out long bi))
+        if (HdlLiteral.TryParseInt(a, out long ai) && HdlLiteral.TryParseInt(b, out long bi))
             return ai == bi;
         return a.Equals(b, StringComparison.OrdinalIgnoreCase);
-    }
-
-    /// <summary>
-    /// Parse decimal, binary bit-string (all 0/1), or hex (0x…, x"…") into
-    /// a long. Empty/mixed strings return false so the caller falls back to
-    /// string comparison. Guards STATUS §1 with…select mixed alternatives.
-    /// </summary>
-    private static bool TryParseInt(string s, out long value)
-    {
-        value = 0;
-        if (string.IsNullOrEmpty(s)) return false;
-        // Bit-string: all 0/1 → binary. Guard against being fooled by
-        // decimal integers that happen to be `0` or `1`.
-        bool allBits = s.All(c => c == '0' || c == '1');
-        if (allBits)
-        {
-            try { value = Convert.ToInt64(s, 2); return true; }
-            catch { /* fall through */ }
-        }
-        if (long.TryParse(s, System.Globalization.NumberStyles.Integer,
-                          System.Globalization.CultureInfo.InvariantCulture, out value))
-            return true;
-        // Simple hex: "0x…" or "x…".
-        var h = s;
-        if (h.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) h = h.Substring(2);
-        else if (h.StartsWith("x", StringComparison.OrdinalIgnoreCase)) h = h.Substring(1);
-        else if (h.StartsWith("X", StringComparison.OrdinalIgnoreCase)) h = h.Substring(1);
-        else return false;
-        return long.TryParse(h, System.Globalization.NumberStyles.HexNumber,
-                             System.Globalization.CultureInfo.InvariantCulture, out value);
-    }
-
-    /// <summary>
-    /// Assigns a value to the target signal. When <paramref name="scheduler"/>
-    /// is non-null, routes through the SignalScheduler so the change goes
-    /// into SignalHistory and respects VHDL delta-cycle semantics. The
-    /// scheduler-less path is the legacy fallback used by tests and callers
-    /// that haven't been wired into the engine yet.
-    /// </summary>
-    private void AssignValue(string valueExpression, Services.SignalScheduler? scheduler = null)
-    {
-        if (Target is null)
-            return;
-
-        // Strip `after N <unit>` from the value expression and capture the
-        // delay in nanoseconds so we can route through ScheduleAfterNs.
-        // Without this the AFTER clause was silently dropped and the
-        // assignment fired in the current delta — bench bug #8.
-        long afterNs = 0;
-        string valExpr = valueExpression;
-        {
-            var m = System.Text.RegularExpressions.Regex.Match(
-                valueExpression,
-                @"\bafter\s+(\d+)\s*(fs|ps|ns|us|ms|sec|s)?\b",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-            if (m.Success && long.TryParse(m.Groups[1].Value, out long n))
-            {
-                string unit = m.Groups[2].Success ? m.Groups[2].Value.ToLowerInvariant() : "ns";
-                afterNs = unit switch
-                {
-                    "fs" => n / 1_000_000L,
-                    "ps" => n / 1_000L,
-                    "ns" => n,
-                    "us" => n * 1_000L,
-                    "ms" => n * 1_000_000L,
-                    "sec" or "s" => n * 1_000_000_000L,
-                    _ => n,
-                };
-                valExpr = valueExpression.Substring(0, m.Index).Trim();
-            }
-        }
-
-        Operation valueOp = new(valExpr, _variables);
-        var result = valueOp.Execute();
-        object value = (result is Variable varResult) ? varResult.Value : result!;
-
-        if (scheduler != null)
-        {
-            if (TargetBitIndex is int bitIdx)
-            {
-                // Per-bit selected assignment: splice via ScheduleBitWrite
-                // so sibling per-bit `with…select` blocks (one per output
-                // bit of a demux/decoder) merge instead of clobbering.
-                string s = value?.ToString() ?? "0";
-                char bit = s.TrimStart('\'').TrimEnd('\'').Trim() is { Length: > 0 } str ? str[^1] : '0';
-                if (afterNs > 0)
-                {
-                    // After-delay with bit-target: build a full-vector
-                    // future value by splicing the bit into the current
-                    // signal value and schedule the whole result.
-                    string current = Target.Value as string ?? string.Empty;
-                    int width = Math.Max(Target.Size, current.Length);
-                    if (width == 0) width = bitIdx + 1;
-                    if (current.Length < width) current = current.PadLeft(width, '0');
-                    // Range-aware per-bit write (after-delay path): honour the
-                    // target's declared range, else fall back to width-1-bitIdx.
-                    int pos = Target.IndexToOffset(bitIdx, width);
-                    if (pos >= 0 && pos < current.Length)
-                    {
-                        var chars = current.ToCharArray();
-                        chars[pos] = bit;
-                        scheduler.ScheduleAfterNs(Target, new string(chars), afterNs);
-                    }
-                }
-                else
-                {
-                    scheduler.ScheduleBitWrite(Target, bitIdx, bit);
-                }
-            }
-            else if (afterNs > 0)
-            {
-                scheduler.ScheduleAfterNs(Target, value, afterNs);
-            }
-            else
-            {
-                scheduler.Schedule(Target, value);
-            }
-        }
-        else
-        {
-            Target.Value = value;
-        }
     }
 
     /// <summary>
@@ -357,22 +227,7 @@ public class SelectedAssignment : ISControl
             _streamer.MoveNext();
         }
 
-        // Parse target
-        if (_streamer.Current?.Type == IDENTIFIERS)
-        {
-            TargetName = _streamer.Current.Value;
-            Target = _variables.FirstOrDefault(v => v.Name.Equals(TargetName, StringComparison.OrdinalIgnoreCase));
-            _streamer.MoveNext();
-        }
-
-        // Capture array indexing like `y(0)` so the assignment lands on
-        // the right bit. Previously this just skipped the index tokens,
-        // making per-bit selected assignments collapse to whole-signal
-        // writes that clobbered each other. Bench bug #5/#9 fix.
-        if (_streamer.Current?.Value == "(")
-        {
-            ParseTargetIndex();
-        }
+        _target.Read(_streamer);
 
         // Expect '<='
         if (_streamer.Current?.Value == "<=")
@@ -386,79 +241,7 @@ public class SelectedAssignment : ISControl
         // v1.22.0 (item 3): extend the input-port (C8) and type/width (C4/C5)
         // checks — which until now only reached plain concurrent + process
         // assignments — to this selected (with…select) form.
-        ValidateChoiceAssignments(sourceLine);
-    }
-
-    /// <summary>
-    /// Runs the same input-port (C8) and type/width (C4/C5) validation that a
-    /// plain concurrent assignment gets, by constructing a <em>gated,
-    /// validation-only</em> <see cref="Services.Operation"/>
-    /// (<c>"target &lt;= value"</c>, <c>isAssignmentStatement: true</c>) for each
-    /// choice value and discarding it. The ctor resolves the real target from
-    /// <see cref="_variables"/> and throws a <see cref="ParserException"/> on a
-    /// violation. Only that intended rejection escapes — any other ctor failure
-    /// on an unusual-but-valid value expression is swallowed, so a valid design
-    /// is never destabilised. The target index is preserved (e.g. <c>y(0)</c>)
-    /// so an indexed write is treated as a single-bit assignment and the width
-    /// check is skipped (otherwise <c>y &lt;= '1'</c> would false-trip C4).
-    /// </summary>
-    private void ValidateChoiceAssignments(int sourceLine)
-    {
-        if (string.IsNullOrEmpty(TargetName)) return;
-
-        // A non-literal index (e.g. a generate loop variable, `q(i)`) can't be
-        // reduced to a reliable element type/width, so skip the check rather than
-        // compare a scalar value against the whole vector (false C4).
-        if (_targetWasIndexed && TargetBitIndex is null) return;
-
-        string targetStr = TargetBitIndex is int idx
-            ? $"{TargetName}({idx})"
-            : TargetName;
-
-        foreach (var choice in Choices)
-        {
-            if (string.IsNullOrWhiteSpace(choice.ValueExpression))
-                continue;
-
-            try
-            {
-                _ = new Operation($"{targetStr} <= {choice.ValueExpression}",
-                                  _variables, sourceLine, isAssignmentStatement: true);
-            }
-            catch (ParserException) { throw; }
-            catch { /* never destabilise a valid design on an unexpected ctor failure */ }
-        }
-    }
-
-    /// <summary>
-    /// Parses array indexing like `(0)`. Captures a literal-integer index
-    /// into <see cref="TargetBitIndex"/>; falls back to no-index (whole-
-    /// signal write) when the inner expression isn't a plain integer.
-    /// </summary>
-    private void ParseTargetIndex()
-    {
-        if (_streamer?.Current?.Value != "(") return;
-        _targetWasIndexed = true;
-        _streamer.MoveNext();
-
-        // Collect tokens until the matching closing paren.
-        var inner = new StringBuilder();
-        int depth = 1;
-        while (_streamer.Current != null)
-        {
-            if (_streamer.Current.Value == "(") { depth++; inner.Append('('); _streamer.MoveNext(); continue; }
-            if (_streamer.Current.Value == ")")
-            {
-                depth--;
-                if (depth == 0) { _streamer.MoveNext(); break; }
-                inner.Append(')'); _streamer.MoveNext(); continue;
-            }
-            inner.Append(_streamer.Current.Value);
-            _streamer.MoveNext();
-        }
-
-        if (int.TryParse(inner.ToString().Trim(), out int idx))
-            TargetBitIndex = idx;
+        foreach (var choice in Choices) _target.Validate(choice, choice.ValueExpression, sourceLine);
     }
 
     /// <summary>

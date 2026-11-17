@@ -1425,6 +1425,37 @@ while (_streamer.Current != null)
 
 ## 10. Changelog
 
+### Version 3.1.1 (2026-11-16)
+
+*   **One assignment target (G02–G08, G17, G49 static, G50).** `AssignmentTarget`
+    resolves every left-hand side — whole, bit, element or range, literal or
+    run-time index — for plain, selected, conditional and procedure
+    assignments, and is the one place that turns an assignment into a write
+    (immediate `:=`, next delta, or `after`). `IndexValue` is the shared
+    run-time index; `VectorIndexing` the single index→characters mapping for
+    reads and writes. `SignalScheduler` updates carry an optional range and
+    are applied in statement order (the separate bit-write channel is gone).
+    RAM writes `mem(to_integer(addr)) <= din` now work.
+*   `Operation.Evaluate()` is the one evaluation loop (shared by `Execute` and
+    `ScheduledOperation.Run`). Literal part targets are checked at analysis:
+    out of range or slice width mismatch → error at the statement's line.
+*   `with … select` / `when … else` share `BranchTarget` (target, validation,
+    execution); conditions and selectors are parsed once.
+*   Arrays of vectors record their declared bounds and direction, so
+    `array (1 to N)` / `downto` arrays index and initialise (named and
+    positional aggregates) like GHDL. Nested `(others => (others => '0'))`
+    initialises every element (G51).
+*   Index arithmetic folds at parse time only over constants (literals,
+    constants, generics carry `IsConstant`); `rom(to_integer(sel) + 1)` is
+    re-evaluated at run time instead of freezing `sel`'s initial value.
+*   Synthesis: literal part targets drive their bit-select net
+    (`VectorIndexing.PartName`, `x_idx_H[_L]`); run-time index selectors share
+    `SelectorNet`; RAM_WRITE reads its target from `Operation.Target`.
+*   `HdlLiteral`: the single reader of integer literals (binary/decimal/hex)
+    and of the `(others=>X)` marker. Removed: `ResultBitIndex`,
+    `TargetBitIndex`, `ScheduleBitWrite`, the no-op procedure write-back
+    (`ProcedureFrame.OutMap`).
+
 ### Version 3.1.0 (2026-11-16)
 
 *   `ISimulationRunner.Error`: the error that aborted the last run (or null),
