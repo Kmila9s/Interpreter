@@ -64,22 +64,14 @@ public sealed class AssertStatement : ISControl
 
         _streamer.Expect(Constants.TYPE.KEYWORDS); // consume 'assert'
 
-        // Condition: everything up to `report`, `severity`, or `;`.
-        // Track insideString so a `;` inside a string literal (rare inside
-        // a condition but possible via concatenation) doesn't truncate.
+        // Condition: everything up to `report`, `severity`, or `;` (a string
+        // literal is one token, so a `;` inside one never truncates it).
         var cond = new StringBuilder();
-        bool insideString = false;
         while (_streamer.Current != null)
         {
             var val = _streamer.Current.Value ?? string.Empty;
-            int qc = 0; foreach (var c in val) if (c == '"') qc++;
-            if (qc % 2 == 1) insideString = !insideString;
-
-            if (!insideString)
-            {
-                var low = val.ToLowerInvariant();
-                if (val == ";" || low == "report" || low == "severity") break;
-            }
+            var low = val.ToLowerInvariant();
+            if (val == ";" || low == "report" || low == "severity") break;
             cond.Append(val).Append(' ');
             _streamer.MoveNext();
         }
@@ -89,18 +81,10 @@ public sealed class AssertStatement : ISControl
         if (_streamer.Current?.Value?.ToLowerInvariant() == "report")
         {
             _streamer.MoveNext(); // consume 'report'
-            bool inS = false;
             while (_streamer.Current != null)
             {
                 var val = _streamer.Current.Value ?? string.Empty;
-                int qc = 0; foreach (var c in val) if (c == '"') qc++;
-                if (qc % 2 == 1) inS = !inS;
-
-                if (!inS)
-                {
-                    var low = val.ToLowerInvariant();
-                    if (val == ";" || low == "severity") break;
-                }
+                if (val == ";" || val.Equals("severity", StringComparison.OrdinalIgnoreCase)) break;
                 _reportTokens.Add(val);
                 _streamer.MoveNext();
             }

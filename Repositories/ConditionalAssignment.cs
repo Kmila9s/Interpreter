@@ -70,6 +70,9 @@ public class ConditionalAssignment : ISControl
     /// <summary>The written target resolved (whole, or the bit/range written); null when undeclared.</summary>
     public AssignmentTarget? Destination => _target.Destination;
 
+    /// <summary>True for an aggregate target <c>(a, b) &lt;= …</c> (G55).</summary>
+    public bool HasAggregateTarget => _target.IsAggregate;
+
     /// <summary>
     /// Gets the list of conditional branches.
     /// </summary>
@@ -114,7 +117,7 @@ public class ConditionalAssignment : ISControl
     /// </summary>
     public Task ExecuteAsync(Services.SignalScheduler? scheduler)
     {
-        if (Target is null || Branches.Count == 0)
+        if (!_target.IsDeclared || Branches.Count == 0)
             return Task.CompletedTask;
 
         foreach (var branch in Branches)

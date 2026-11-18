@@ -46,7 +46,10 @@ public class ScheduledOperation
 
         // Whole or part target, `after N ns` delay, or immediate variable
         // (`:=`) semantics: one place decides how the value is written.
-        if (operation.Target is { } target)
+        if (operation.AggregateTarget is { } aggregate)
+            aggregate.Assign(scheduler, computedValue, operation.SourceLine,
+                             operation.AfterDelayNs, operation.IsVariableAssignment);
+        else if (operation.Target is { } target)
             target.Assign(scheduler, computedValue, operation.SourceLine,
                           operation.AfterDelayNs, operation.IsVariableAssignment);
         else if (operation.IsVariableAssignment)

@@ -517,7 +517,7 @@ class Program
         int architectureCount = 0;
 
         bool inPackage = false;
-        bool inConfiguration = false;
+        var configurations = new ConfigurationLineSkipper();
         // v0.13.0 Fix: Track function/procedure nesting depth to prevent premature architecture end
         // Issue: 'end FunctionName;' was being confused with 'end ArchitectureName;'
         // Solution: Count function/procedure starts and ends, only check for architecture end when depth is 0
@@ -580,21 +580,8 @@ class Program
                 continue;
             }
 
-            // Skip configuration declarations
-            if (comparer.StartsWith("configuration "))
-            {
-                inConfiguration = true;
-                continue;
-            }
-            if (inConfiguration)
-            {
-                // Check for end of configuration
-                if (comparer.StartsWith("end ") && comparer.EndsWith(";"))
-                {
-                    inConfiguration = false;
-                }
-                continue;
-            }
+            // Skip configuration declarations (a nested `end for;` no longer ends them, G20).
+            if (configurations.Consume(comparer)) continue;
 
             // Skip library and use statements
             if (comparer.StartsWith("library ") || comparer.StartsWith("use "))

@@ -20,6 +20,7 @@ internal static class ConditionalAssignSynthesizer
         // mishandle two-sided null. Use `is null` to bypass the
         // overload. (Without this, `ca.Target == null` returns false
         // even when Target is null, leading to NREs downstream.)
+        if (ca.HasAggregateTarget) ctx.AddDiagnostic("Unsupported", Synthesizer.AggregateTargetNote);
         if (ca.Target is null || ca.Branches.Count == 0) return;
 
         // Resolve LHS net.

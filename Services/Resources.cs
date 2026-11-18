@@ -489,11 +489,9 @@ public class Resources
 
             if (task is Operation op)
             {
-                // Operation has a Result variable that represents the assigned signal
-                if (!ReferenceEquals(op.Result, null) && op.Result.PortType == Constants.PortType.OUT)
-                {
-                    signals.Add(op.Result);
-                }
+                // The assigned signal(s): the target, or each element of an aggregate target.
+                foreach (var written in op.WrittenObjects)
+                    if (written.PortType == Constants.PortType.OUT) signals.Add(written);
             }
             else if (task is IfStructure ifStruct)
             {

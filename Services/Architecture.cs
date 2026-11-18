@@ -415,6 +415,8 @@ public class Architecture : ISControl
                                 }
                                 return;
                             case "entity":
+                            case "component":       // `u : component c port map …` (G24)
+                            case "configuration":   // `u : configuration work.cfg port map …` (G20)
                                 // Direct-entity instantiation with the VHDL-2008 form:
                                 //   label : entity <lib>.<name>[(<arch>)] [generic map (...)] port map (...);
                                 // Without this case, the `default:` swallowed the `entity`
@@ -816,8 +818,18 @@ public class Architecture : ISControl
     {
         var instance = new ComponentInstance { InstanceName = instanceLabel };
 
+        // `component c` names the component as a bare `c` does (G24).
+        if (_streamer.Current?.Value?.ToLower() == "component") _streamer.MoveNext();
+
+        // `configuration [lib.]cfg`: the configuration names the unit instantiated (G20).
+        if (_streamer.Current?.Value?.ToLower() == "configuration")
+        {
+            _streamer.MoveNext();
+            instance.EntityName = (_streamer.Current?.Value ?? string.Empty).Split('.')[^1];
+            _streamer.MoveNext();
+        }
         // Check for 'entity' keyword (direct entity instantiation)
-        if (_streamer.Current?.Value?.ToLower() == "entity")
+        else if (_streamer.Current?.Value?.ToLower() == "entity")
         {
             _streamer.MoveNext(); // consume 'entity'
 

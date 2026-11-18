@@ -1425,6 +1425,37 @@ while (_streamer.Current != null)
 
 ## 10. Changelog
 
+### Version 3.1.4 (2026-11-18) — elaboration
+
+*   **Design library (G18–G22).** `DesignLibrary` holds what GHDL's work library
+    would after analysing the files in order (`SourceOrder`: the caller's order,
+    else sorted relative path): entities, every architecture of each from any file,
+    configuration declarations and each architecture's configuration
+    specifications. The architecture is the named one, else the **last analysed**
+    (was the first in the entity's file). Instances bind by `(arch)`, a
+    configuration declaration, a specification (`for u1|all|others : c use …`) or
+    by default; `u : component c` and `u : configuration work.cfg` are recognised;
+    a configuration can be the top. Specifications no longer become a 32-bit
+    signal. A missing named architecture is an analysis error.
+    `SourceElaborator` keeps only the inlining (`ElaborateOrNull(files, entry)`,
+    `ResolveEntityName`, `CompanionUnits` for files parsed on their own);
+    `VhdlUnitText` holds the shared unit-text helpers.
+*   **Generate with instances (G57).** `GenerateUnroller` unrolls for/if generates
+    holding instances or local declarations: one copy per iteration, parameter
+    replaced, locals and labels `{label}__{i}__name` — each iteration has its own
+    instance signals. Ranges and conditions fold with `StaticExpression`.
+    `SplitArchitecture` counts `if/case … generate` once.
+*   **Aggregate targets (G55).** `(a, b(1 downto 0)) <= v` and `(x, y) := v` in
+    every context (concurrent, process, `when … else`, `with … select`, `after`):
+    `AggregateTarget` splits the value left to right in the same update; width
+    checked like GHDL. Qualified expressions `T'(e)` evaluate as `(e)`. The named
+    form is "not supported yet" (it crashes GHDL 6.0.0). Synthesis notes aggregate
+    targets as unsupported.
+*   String literals are whole tokens (G56): the quote-parity workarounds in
+    report/assert/textio/call arguments are gone; `a & b` in a report joins
+    without a blank. `ConfigurationLineSkipper` is the single configuration skip
+    of the line parsers (a nested `end for;` no longer ends it).
+
 ### Version 3.1.3 (2026-11-18) — strict parser and sequential semantics
 
 *   **One sequential reader (G25, G26, G33).** `SequentialStatementReader`
