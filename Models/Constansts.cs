@@ -78,16 +78,6 @@ public enum PrecedencesArithOperators : int {
 }
 
 /// <summary>
-/// Specifies the type of a given operation.
-/// </summary>
-public enum OperationType : int {
-    /// <summary>An assignment operation.</summary>
-    ASSIGNATION,
-    /// <summary>An unknown or unidentified operation.</summary>
-    UNKNOWN
-}
-
-/// <summary>
 /// Contains regular expressions used to identify different types of operations in the code.
 /// </summary>
 public class OperationsRegex {
@@ -115,18 +105,4 @@ public class OperationsRegex {
     /// nested calls) inside a slice or edge-detect argument.</summary>
     public const string BalancedExpression =
         @"(?:[^()]+|\((?>[^()]+|\((?<expP>)|\)(?<-expP>))*(?(expP)(?!))\))+";
-
-    /// <summary>Regex to detect a VHDL signal assignment (&lt;=) or variable assignment (:=).</summary>
-    /// <remarks>v0.16.1: Added support for := variable assignments used in processes and procedures.
-    /// 2026-06-03 (bench bug #5): Also accept an indexed/sliced target like `output(0) &lt;= …` —
-    /// the previous regex's single `\s?` couldn't span `name ( 0 ) ` so per-bit assignments
-    /// were classified as UNKNOWN and silently dropped during architecture synthesis.</remarks>
-    // Pass 17 (2026-07-29): allow nested parens in the LHS index — the
-    // previous `[^()]*` rejected `mem(to_integer(unsigned(addr))) <= din`
-    // as UNKNOWN, silently dropping RAM-write statements at parse time.
-    // Pass 18 (2026-07-30): swap greedy `\(.*\)` for the shared balanced-
-    // paren fragment so the LHS bound is exact (no cross-statement
-    // runaway on `);` inside comments or strings).
-    public static string ASSIGNATION =
-        @"[A-Za-z_][_a-zA-Z0-9]*" + BalancedIndexSuffix + @"\s*(\<\=|:\=)\s?.+";
 }

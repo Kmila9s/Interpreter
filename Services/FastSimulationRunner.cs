@@ -186,6 +186,7 @@ public class FastSimulationRunner : IDisposable, ISimulationRunner
             // Always visit tick 0 first (initial process wakes + combinational
             // settling live there), then jump to each subsequent event tick.
             int visited = 0;
+            ulong? endTick = null;
             for (ulong tick = 0; tick < totalTicks; )
             {
                 if (_cts.IsCancellationRequested)
@@ -234,6 +235,7 @@ public class FastSimulationRunner : IDisposable, ISimulationRunner
 
                 _engine.AdvanceTime(tick);
                 await _engine.RunTimeStepAsync();
+                if (_engine.EndRequest is not null) { endTick = tick; break; }
 
                 // Progress by sim-time position (event ticks are sparse, so the
                 // bar advances in jumps — fine for a headless "fast" run).
@@ -261,9 +263,12 @@ public class FastSimulationRunner : IDisposable, ISimulationRunner
 
             // Seal the end of the window so the trace spans the full duration
             // even for stable designs (identical to SimulationRunner).
-            if (totalTicks > 0 && _engine?.History != null)
+            if (SimulationRunner.SealRun(_engine, allSignals, totalTicks, endTick) is { } failure)
             {
-                _engine.History.RecordChanges(allSignals, (long)(totalTicks - 1) * 1000);
+                Error = failure;
+                OnError?.Invoke(Error);
+                OnSimulationEnded?.Invoke(false);
+                return;
             }
 
             OnProgressChanged?.Invoke(100.0);

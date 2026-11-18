@@ -1454,6 +1454,24 @@ public class VariableSyntetizer : ISControl
     }
 
     /// <summary>
+    /// Registers the procedures of a package body (text after <c>package body X is</c>)
+    /// with their bodies, the same way an architecture-local procedure is registered,
+    /// so a call to a package procedure runs its body instead of being dropped.
+    /// </summary>
+    public static void RegisterPackageBodyProcedures(string packageBodyText)
+    {
+        var streamer = TokenStream.FromLines(packageBodyText.Split('\n'));
+        var parser = new VariableSyntetizer(streamer, new HashSet<Variable>());
+        while (streamer.Current != null)
+        {
+            bool isDeclaration = streamer.Current.Value.Equals("procedure", StringComparison.OrdinalIgnoreCase)
+                && !Interpreter.Repositories.EndClause.Is(streamer.Previous, "end");
+            if (isDeclaration) parser.SkipProcedureDeclaration();
+            else streamer.MoveNext();
+        }
+    }
+
+    /// <summary>
     /// Parses a type declaration and registers it in the type registry.
     /// Handles: enumeration types, array types, record types
     /// </summary>

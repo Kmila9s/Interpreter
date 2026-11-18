@@ -1,5 +1,6 @@
 using System.Text;
 using Interpreter.Interfaces;
+using Interpreter.Models;
 using Interpreter.Services;
 using Parser.Models;
 using Parser.Repositories;
@@ -153,6 +154,8 @@ public sealed class AssertStatement : ISControl
             ? ParseTrace.RenderReportTokens(_reportTokens, _variables)
             : "Assertion violation";
         ReportBus.Instance.Emit($"[assert-{Severity}] {msg}");
+        // `severity failure` ends the simulation with an error (GHDL: "simulation failed").
+        if (Severity == "failure") throw new SimulationEndException(true, msg);
         return Task.CompletedTask;
     }
 

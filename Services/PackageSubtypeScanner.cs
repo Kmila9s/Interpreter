@@ -33,6 +33,11 @@ public static class PackageSubtypeScanner
         @"\bpackage\s+(?<name>\w+)\s+is\b(?<body>[\s\S]*?)\bend(?:\s+package)?(?:\s+\k<name>)?\s*;",
         RegexOptions.IgnoreCase | RegexOptions.Multiline);
 
+    // package body X is … — up to `end package body`, or the next design unit.
+    private static readonly Regex PackageBodyRe = new(
+        @"\bpackage\s+body\s+(?<name>\w+)\s+is\b(?<body>[\s\S]*?)(?:\bend\s+package\s+body\b|^\s*(?:library|use|entity|architecture|package|configuration)\b|\z)",
+        RegexOptions.IgnoreCase | RegexOptions.Multiline);
+
     // subtype NAME is (signed|unsigned|std_logic_vector|bit_vector) (HI downto LO);
     // Bounds allow simple arithmetic: literals, constants, and `NAME±LITERAL`.
     // Non-greedy on the operand halves so the outer `)` boundary catches.
@@ -170,6 +175,10 @@ public static class PackageSubtypeScanner
                         registry.RegisterConstant(literal, pkgName);
             }
         }
+
+        // Package bodies: register their procedures (with bodies) for call sites.
+        foreach (Match body in PackageBodyRe.Matches(src))
+            VariableSyntetizer.RegisterPackageBodyProcedures(body.Groups["body"].Value);
     }
 
     /// <summary>

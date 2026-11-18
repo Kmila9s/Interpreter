@@ -1,5 +1,6 @@
 using System.Text;
 using Interpreter.Interfaces;
+using Interpreter.Models;
 using Interpreter.Services;
 using Parser.Models;
 using Parser.Repositories;
@@ -9,7 +10,7 @@ namespace Interpreter.Repositories;
 /// <summary>
 /// F-G-11 (2026-07-18): represents and executes a VHDL <c>report</c>
 /// statement. Prior to F-G-11 every report was silently skipped via
-/// <see cref="Interpreter.Services.ParseTrace.SkipToSemicolonInclusive"/>,
+/// a skip-to-<c>;</c> helper,
 /// which meant testbench self-checking sweeps produced no observable output.
 ///
 /// Supported forms:
@@ -36,6 +37,9 @@ public sealed class ReportStatement : ISControl
 
     /// <summary>Raw expression text captured between <c>report</c> and the terminating <c>;</c> (severity clause included when present).</summary>
     public string RawExpression { get; private set; } = string.Empty;
+
+    /// <summary>Severity level (<c>note</c> when omitted, per the LRM).</summary>
+    public string Severity { get; private set; } = "note";
 
     /// <summary>Individual tokens of the expression, for best-effort evaluation at <see cref="ExecuteAsync"/> time.</summary>
     private readonly List<string> _tokens = new();
@@ -83,7 +87,10 @@ public sealed class ReportStatement : ISControl
             {
                 _streamer.MoveNext(); // 'severity'
                 if (_streamer.Current != null && _streamer.Current.Value != ";")
+                {
+                    Severity = _streamer.Current.Value.ToLowerInvariant();
                     _streamer.MoveNext(); // level (note / warning / error / failure)
+                }
                 continue;
             }
 
@@ -115,6 +122,8 @@ public sealed class ReportStatement : ISControl
         var rendered = ParseTrace.RenderReportTokens(_tokens, _variables);
         if (string.IsNullOrEmpty(rendered)) rendered = RawExpression;
         ReportBus.Instance.Emit(rendered);
+        // `severity failure` ends the simulation with an error, as in GHDL.
+        if (Severity == "failure") throw new SimulationEndException(true, rendered);
         return Task.CompletedTask;
     }
 

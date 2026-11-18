@@ -1425,6 +1425,45 @@ while (_streamer.Current != null)
 
 ## 10. Changelog
 
+### Version 3.1.3 (2026-11-18) — strict parser and sequential semantics
+
+*   **One sequential reader (G25, G26, G33).** `SequentialStatementReader`
+    replaces the seven copies in `Process`, `IfStructure`, `CaseStructure`,
+    the three loops and `FunctionExecutor`; `SimpleStatement` is the single
+    shape validator of an assignment or procedure call (shared with the
+    concurrent region). Junk (`count <= count + 1; by one`, `foo bar;`,
+    `count + 1;`), a reserved word as a statement and calls to undeclared
+    procedures are `ParserException`s at GHDL's line — nothing is skipped.
+    Type/width/input-port checks now run in every sequential context.
+    `EndClause` is the one strict reader of `end <kw> [label];`.
+*   **Labels, exit and next (G27).** `lbl:` on any sequential statement,
+    labeled loops, `exit/next lbl [when c]`, label checks at analysis
+    (`exit` outside a loop, mismatched `end … lbl`). In the engine one
+    `RunNestedTaskAsync`/`RunFrameAsync` dispatch replaces six copies;
+    frames are popped when exit/next/return leave them; exit/next raised
+    after a resume are delivered through the frame stack; sensitivity-list
+    loops catch exit/next (an `exit` used to abort the run). `ILoopStructure`,
+    `LoopControlException.Targets` (one label rule).
+*   **Concurrent region and generate (G28–G30).** Concurrent `assert`,
+    `postponed assert/process`, procedure calls (equivalent process
+    `Process.Implicit`, sensitive to the signals they read), `lbl: with`,
+    `lbl: y <= …` (no longer a bogus instance). Generate bodies use the same
+    readers (`ConcurrentStatements`, `SimpleStatement`); a parse error in a
+    generate is no longer black-boxed; the engine flattens generates
+    (their processes are now scheduled). `OperationDetector` removed.
+*   **std.env and textio (G31).** `std.env.stop/finish` end the run with
+    success at the current time (`DeltaCycleEngine.EndRequest`,
+    `SimulationRunner.SealRun` for both runners); `severity failure` ends it
+    with an error. `write`/`hwrite`/`writeline(output, …)` print on the
+    report channel. `wait` reads `on`/`until`/`for` clauses; `wait for` takes
+    time expressions and constants (`TimeValue`); `wait on`/`until` also wake
+    on stimulus events.
+*   **VHDL-2008 sequential (G32):** `when … else` and `with … select` inside
+    processes. Package-body procedures are registered with their bodies.
+*   Not supported yet, reported with a line: aggregate targets (G55),
+    conditional variable assignment, textio input, wait with condition and
+    timeout.
+
 ### Version 3.1.2 (2026-11-16) — records
 
 *   **Records end to end (G01, G09–G16).** One subtype-indication parser

@@ -74,47 +74,6 @@ public static class ParseTrace
     }
 
     /// <summary>
-    /// F-G-08 pass 4 (2026-07-17): consume tokens through the next <c>;</c>.
-    /// Stops early at <c>end</c> as a safety net so a missing semicolon
-    /// doesn't drift into the next statement. Mirrors
-    /// <c>Process.SkipToSemicolonInclusive</c> so nested body dispatchers
-    /// (IfStructure / CaseStructure / WhileLoop / ForLoop / SimpleLoop) can
-    /// reuse the same testbench-statement skip. Without this, a
-    /// <c>wait for … ns;</c> or <c>report … ;</c> nested inside one of those
-    /// bodies mis-dispatches its <c>for</c> as a for-loop header and the
-    /// range parser then swallows unbounded tokens.
-    /// </summary>
-    public static void SkipToSemicolonInclusive(TokenStream streamer)
-    {
-        int iter = 0;
-        // Track whether we're currently inside a string literal — the
-        // tokenizer splits `"TB: end of stimulus"` across whitespace into
-        // fragments `"TB:`, `end`, `of`, `stimulus"`, so a naive `end`
-        // early-exit stops mid-string when a report/assert message contains
-        // the word "end". A fragment with an unmatched `"` toggles the state.
-        bool insideString = false;
-        while (streamer.Current != null)
-        {
-            string v = streamer.Current.Value ?? string.Empty;
-            if (!insideString)
-            {
-                if (v == ";") break;
-                if (v.ToLower() == "end") break;
-            }
-            // Toggle insideString when we cross an unmatched double-quote.
-            int quoteCount = 0;
-            foreach (var c in v) if (c == '"') quoteCount++;
-            if (quoteCount % 2 == 1) insideString = !insideString;
-            Step(ref iter, streamer, CancellationToken.None);
-            streamer.MoveNext();
-        }
-        if (streamer.Current?.Value == ";")
-        {
-            streamer.MoveNext();
-        }
-    }
-
-    /// <summary>
     /// Consumes a parenthesised group (the stream is on its <c>(</c>) and
     /// returns the text between the parentheses, tokens space-separated so a
     /// range such as <c>3 downto 2</c> keeps its keyword. Used for the indexed
@@ -134,17 +93,6 @@ public static class ParseTrace
             inner.Append(v).Append(' ');
         }
         return inner.ToString().Trim();
-    }
-
-    /// <summary>
-    /// F-G-08 pass 4 (2026-07-17): consume a <c>wait</c> statement:
-    /// <c>wait for X ns;</c>, <c>wait until cond;</c>, <c>wait on sig;</c>,
-    /// or bare <c>wait;</c>. Testbench-only; not synthesizable.
-    /// </summary>
-    public static void SkipWaitStatement(TokenStream streamer)
-    {
-        streamer.MoveNext(); // consume 'wait'
-        SkipToSemicolonInclusive(streamer);
     }
 
     /// <summary>
@@ -289,7 +237,7 @@ public static class ParseTrace
         // Form 1: <caller>(<name>) — no slice.
         if (tokens[startIdx + 3] == ")")
         {
-            result = FormatVariable(v, wholeBitstring: null, caller);
+            result = FormatValue(v.Value, null, caller);
             consumed = 4;
             return true;
         }
@@ -326,14 +274,13 @@ public static class ParseTrace
         if (startChar < 0 || lengthChars <= 0 || startChar + lengthChars > size) return false;
         string sliceBits = raw.Substring(startChar, lengthChars);
 
-        result = FormatVariable(v, wholeBitstring: sliceBits, caller);
+        result = FormatValue(v.Value, sliceBits, caller);
         consumed = 9;
         return true;
     }
 
     /// <summary>
-    /// F-G-15+ (2026-07-18): renders a <see cref="Variable"/>'s current
-    /// value according to the caller (<c>to_string</c>, <c>to_hstring</c>,
+    /// F-G-15+ (2026-07-18): renders a value according to the caller (<c>to_string</c>, <c>to_hstring</c>,
     /// <c>to_bstring</c>) and VHDL type conventions.
     ///
     /// <para>When <paramref name="wholeBitstring"/> is non-null, treat the
@@ -352,13 +299,14 @@ public static class ParseTrace
     /// <item><description><c>to_bstring</c> — explicit binary; same as
     /// <c>to_string</c> for vectors, forces binary for integers.</description></item>
     /// </list>
+    /// Shared by <c>report</c> and the textio <c>write</c>/<c>hwrite</c>.
     /// </summary>
-    private static string FormatVariable(Variable v, string? wholeBitstring, string caller)
+    internal static string FormatValue(object? value, string? wholeBitstring, string caller)
     {
         // If we have an explicit bit-string (from a slice), format that
         // as bits or hex depending on caller; else look at Value's type.
         string? bits = wholeBitstring;
-        if (bits == null && v.Value is string s && LooksLikeBitString(s))
+        if (bits == null && value is string s && LooksLikeBitString(s))
             bits = s;
 
         if (bits != null)
@@ -370,8 +318,8 @@ public static class ParseTrace
             };
         }
 
-        // Scalar / non-vector Variable.
-        object? val = v.Value;
+        // Scalar / non-vector value.
+        object? val = value;
         if (val is bool b)
         {
             return b ? "true" : "false";   // VHDL LRM lowercase truth

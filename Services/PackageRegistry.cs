@@ -305,6 +305,20 @@ public class PackageRegistry
     }
 
     /// <summary>
+    /// True when <paramref name="name"/> names a predefined/IEEE function, a
+    /// registered subprogram, a package function/procedure/constant, or anything
+    /// declared in the analysed source — the single "is it declared?" rule behind
+    /// <c>no declaration for "x"</c> (expressions and procedure calls).
+    /// </summary>
+    public static bool IsKnownName(string name) =>
+        StandardFunctions.IsStandardFunction(name)
+        || FunctionRegistry.Instance.IsKnown(name)
+        || Instance.ContainsFunction(name)
+        || Instance.ContainsProcedure(name)
+        || Instance.ContainsConstant(name)
+        || Instance.IsDeclaredName(name);
+
+    /// <summary>
     /// v1.17.0 (P3): true when <paramref name="name"/> was seen in a declaration
     /// position in the analysed source. See <see cref="_declaredNames"/>.
     /// </summary>

@@ -70,8 +70,8 @@ public class CaseStructure : ISControl
     private readonly HashSet<Variable> _variables = new();
     /// <summary>The token stream used for parsing the case structure.</summary>
     private readonly TokenStream _streamer;
-    /// <summary>Detector used to classify operations found inside branch bodies.</summary>
-    private readonly OperationDetector _detector = new();
+    /// <summary>Reader of the branch bodies (null until <see cref="Syntetize"/> for a stand-alone case).</summary>
+    private SequentialStatementReader? _reader;
     /// <summary>The raw name of the selector expression as parsed from the token stream.</summary>
     private string _selectorName = string.Empty;
     /// <summary>The resolved selector variable, or null if it could not be found in scope.</summary>
@@ -193,6 +193,12 @@ public class CaseStructure : ISControl
         _streamer = Tokenizer;
     }
 
+    /// <summary>Creates a case statement read by <paramref name="reader"/> (stream on <c>case</c>).</summary>
+    public CaseStructure(SequentialStatementReader reader) : this(reader.Scope, reader.Stream)
+    {
+        _reader = reader;
+    }
+
     /// <summary>
     /// Executes the case structure asynchronously.
     /// </summary>
@@ -270,6 +276,7 @@ public class CaseStructure : ISControl
     public void Syntetize()
     {
         Interpreter.Services.ParseTrace.Log($"CaseStructure @{(_streamer.Current?.Line ?? 0) + 1}");
+        _reader ??= new SequentialStatementReader(_streamer, _variables);
         _streamer.Expect(KEYWORDS); // consume 'case'
         // VHDL-2008 matching-case (Tier 4.2, 2026-07-28) — the lexer splits
         // `case?` into two tokens (`case` + `?`) because `?` is a special
@@ -328,27 +335,13 @@ public class CaseStructure : ISControl
         _streamer.Expect(KEYWORDS); // consume 'is'
         if (IsMatching && _streamer.Current?.Value == "?") _streamer.MoveNext();
 
-        // Parse all 'when' branches
-        // Safety: limit iterations to prevent infinite loop
-        int mainIterations = 0;
-        int maxMainIterations = 10000;
-
-        while (_streamer.Current?.Value?.ToLower() != "end" && _streamer.Current != null && mainIterations < maxMainIterations)
+        // Parse all 'when' branches (each one consumes its tokens).
+        while (_streamer.Current?.Value?.ToLower() != "end")
         {
-            mainIterations++;
-
-            if (_streamer.Current?.Value?.ToLower() == "when")
-            {
-                SyntetizeWhenBranch();
-            }
-            else
-            {
-                _streamer.MoveNext();
-            }
+            if (_streamer.Current?.Value?.ToLower() != "when")
+                throw new ParserException("'when' expected in a case statement", _streamer.Current ?? _streamer.Previous);
+            SyntetizeWhenBranch();
         }
-
-        if (mainIterations >= maxMainIterations)
-            throw new InvalidOperationException($"Case statement main loop exceeded maximum iterations. Last token: {_streamer.Current?.Value}");
 
         // C7 (duplicate choice): VHDL forbids the same value appearing in two
         // branches ("choice already covered"). Compare by value so `"00"` and a
@@ -496,7 +489,7 @@ public class CaseStructure : ISControl
     /// </summary>
     private void SyntetizeWhenBranch()
     {
-        int condLine = _streamer.Current?.Line ?? 0; // line of 'when' keyword (#5)
+        int condLine = _streamer.Current?.SourceLine ?? 0; // 1-based line of the when keyword (#5)
         _streamer.Expect(KEYWORDS); // consume 'when'
 
         var branch = new CaseWhenBranch { ConditionLine = condLine };
@@ -592,198 +585,6 @@ public class CaseStructure : ISControl
     /// Synthesizes the body of a when branch.
     /// </summary>
     /// <param name="branch">The branch whose body is being synthesized.</param>
-    private void SyntetizeBranchBody(CaseWhenBranch branch)
-    {
-        int branchIterations = 0;
-        int maxBranchIterations = 10000;
-
-        while (!IsEndOfBranch() && branchIterations < maxBranchIterations)
-        {
-            branchIterations++;
-            if (_streamer.Current?.Type == KEYWORDS)
-            {
-                var keyword = _streamer.Current.Value.ToLower();
-                switch (keyword)
-                {
-                    case "if":
-                        IfStructure ifStructure = new(_variables, _streamer);
-                        ifStructure.Syntetize();
-                        branch.Tasks.Add(ifStructure);
-                        ConsumeEndKeyword("if");
-                        break;
-
-                    case "case":
-                        CaseStructure nestedCase = new(_variables, _streamer);
-                        nestedCase.Syntetize();
-                        branch.Tasks.Add(nestedCase);
-                        ConsumeEndKeyword("case");
-                        break;
-
-                    case "for":
-                        ForLoopStructure forLoop = new(_variables, _streamer);
-                        forLoop.Syntetize();
-                        branch.Tasks.Add(forLoop);
-                        ConsumeEndKeyword("loop");
-                        break;
-
-                    case "while":
-                        WhileLoopStructure whileLoop = new(_variables, _streamer);
-                        whileLoop.Syntetize();
-                        branch.Tasks.Add(whileLoop);
-                        ConsumeEndKeyword("loop");
-                        break;
-
-                    case "loop":
-                        SimpleLoopStructure simpleLoop = new(_variables, _streamer);
-                        simpleLoop.Syntetize();
-                        branch.Tasks.Add(simpleLoop);
-                        ConsumeEndKeyword("loop");
-                        break;
-
-                    case "exit":
-                        ExitStatement exitStmt = new(_variables, _streamer);
-                        exitStmt.Syntetize();
-                        branch.Tasks.Add(exitStmt);
-                        break;
-
-                    case "next":
-                        NextStatement nextStmt = new(_variables, _streamer);
-                        nextStmt.Syntetize();
-                        branch.Tasks.Add(nextStmt);
-                        break;
-
-                    case "null":
-                        NullStatement nullStmt = new(_streamer);
-                        nullStmt.Syntetize();
-                        branch.Tasks.Add(nullStmt);
-                        break;
-
-                    case "return":
-                        ReturnStatement returnStmt = new(_variables, _streamer);
-                        returnStmt.Syntetize();
-                        branch.Tasks.Add(returnStmt);
-                        break;
-
-                    // F-G-13d (Phase 2, 2026-07-22): capture the wait as a
-                    // real task so the engine's process-aware case-arm
-                    // executor can yield here. Mirrors F-G-13c on the
-                    // loop repositories.
-                    case "wait":
-                        var _wait = new WaitForStatement(_streamer, _variables);
-                        _wait.Syntetize();
-                        branch.Tasks.Add(_wait);
-                        break;
-                    case "report":
-                        // F-G-11b (2026-07-18): execute reports nested inside
-                        // a case when-branch.
-                        var _rpt = new ReportStatement(_variables, _streamer);
-                        _rpt.Syntetize();
-                        branch.Tasks.Add(_rpt);
-                        break;
-                    case "assert":
-                        // F-G-16 (2026-07-18): execute asserts nested inside a case when-branch.
-                        var _ass = new AssertStatement(_variables, _streamer);
-                        _ass.Syntetize();
-                        branch.Tasks.Add(_ass);
-                        break;
-
-                    default:
-                        _streamer.MoveNext();
-                        break;
-                }
-            }
-            else
-            {
-                // Phase 3 (2026-07-22): dispatch procedure calls before
-                // falling to assignment parsing (mirror IfStructure).
-                if (ProcedureCallStatement.IsProcedureCall(_streamer, _variables))
-                {
-                    var _call = new ProcedureCallStatement(_variables, _streamer);
-                    _call.Syntetize();
-                    if (_call.IsValid) branch.Tasks.Add(_call);
-                }
-                else
-                {
-                    SyntetizeAssignment(branch);
-                }
-            }
-        }
-
-        if (branchIterations >= maxBranchIterations)
-            throw new InvalidOperationException("Case branch body parsing exceeded maximum iterations");
-    }
-
-    /// <summary>
-    /// Checks if we've reached the end of the current branch.
-    /// </summary>
-    /// <returns>True if the current token is 'when', 'end', or the stream is exhausted.</returns>
-    private bool IsEndOfBranch()
-    {
-        if (_streamer.Current == null) return true;
-        var value = _streamer.Current.Value.ToLower();
-        return value == "when" || value == "end";
-    }
-
-    /// <summary>
-    /// Consumes 'end keyword ;' tokens.
-    /// </summary>
-    /// <param name="keyword">The keyword expected after 'end' (e.g., "if", "loop", "case").</param>
-    private void ConsumeEndKeyword(string keyword)
-    {
-        if (_streamer.Current?.Value.ToLower() == "end")
-        {
-            _streamer.MoveNext();
-            if (_streamer.Current?.Value.ToLower() == keyword)
-            {
-                _streamer.MoveNext();
-            }
-            // VHDL-2008 matching-case: `end case?;`
-            if (_streamer.Current?.Value == "?") _streamer.MoveNext();
-            if (_streamer.Current?.Value == ";")
-            {
-                _streamer.MoveNext();
-            }
-        }
-    }
-
-    /// <summary>
-    /// Synthesizes a simple assignment statement.
-    /// </summary>
-    /// <param name="branch">The branch to add the parsed assignment to.</param>
-    private void SyntetizeAssignment(CaseWhenBranch branch)
-    {
-        // Phase B+ Deep AST (follow-up): capture the assignment's source
-        // line BEFORE the streamer consumes the LHS token.
-        int assignLine = _streamer.Current?.Line ?? 0;
-
-        var rawDataBuilder = new StringBuilder();
-        int assignIterations = 0;
-        int maxAssignIterations = 1000;
-
-        while (_streamer.Current?.Value != ";" && !IsEndOfBranch() && _streamer.Current != null && assignIterations < maxAssignIterations)
-        {
-            assignIterations++;
-            rawDataBuilder.Append(_streamer.Current?.Value + " ");
-            _streamer.MoveNext();
-        }
-
-        if (assignIterations >= maxAssignIterations)
-            throw new InvalidOperationException("Case assignment parsing exceeded maximum iterations");
-
-        string operation = rawDataBuilder.ToString().Trim();
-        if (string.IsNullOrEmpty(operation)) return;
-
-        if (_streamer.Current?.Value == ";")
-        {
-            _streamer.MoveNext();
-        }
-
-        var type = _detector.GetOperationType(operation);
-        if (type == OperationType.ASSIGNATION)
-        {
-            Operation op = new(operation, _variables, sourceLine: assignLine);
-            branch.Tasks.Add(op);
-        }
-    }
-
+    private void SyntetizeBranchBody(CaseWhenBranch branch) =>
+        _reader!.ReadUntil(branch.Tasks, "when", "end");
 }

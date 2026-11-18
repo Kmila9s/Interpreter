@@ -1,4 +1,3 @@
-using System.Text;
 using Interpreter.Interfaces;
 using Interpreter.Models;
 using Interpreter.Repositories;
@@ -10,7 +9,7 @@ namespace Interpreter.Services;
 /// <summary>
 /// Represents a VHDL process.
 /// </summary>
-public class Process : ISControl
+public partial class Process : ISControl
 {
     /// <summary>
     /// Gets the sensitive list of the process.
@@ -38,7 +37,12 @@ public class Process : ISControl
     /// </summary>
     public HashSet<Variable> Variables => _variables;
     private readonly TokenStream _streamer;
-    private readonly OperationDetector _detector = new();
+
+    /// <summary>
+    /// The process label (<c>lbl : process</c>), or null. A closing
+    /// <c>end process lbl;</c> must repeat it.
+    /// </summary>
+    public string? Label { get; init; }
 
     /// <summary>
     /// F-G-13 MVP (2026-07-18): program counter for the wait-scheduled
@@ -103,6 +107,44 @@ public class Process : ISControl
 
     /// <summary>User types visible to the declarative part (record/array/enum variables).</summary>
     private readonly TypeRegistry? _types;
+
+    /// <summary>
+    /// Every signal of <paramref name="scope"/> named in <paramref name="texts"/> —
+    /// the implicit sensitivity of an equivalent process or of <c>wait until</c>.
+    /// String literals are ignored; constants are not signals.
+    /// </summary>
+    internal static IEnumerable<Variable> SignalsNamedIn(IEnumerable<string> texts, HashSet<Variable> scope)
+    {
+        foreach (var text in texts)
+            foreach (System.Text.RegularExpressions.Match m in NameRegex().Matches(StringLiteralRegex().Replace(text, "")))
+            {
+                var signal = scope.FirstOrDefault(v => v is not null && !v.IsConstant && v.Name.Equals(m.Value, StringComparison.OrdinalIgnoreCase));
+                if (signal is not null) yield return signal;
+            }
+    }
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"[A-Za-z_]\w*")]
+    private static partial System.Text.RegularExpressions.Regex NameRegex();
+
+    [System.Text.RegularExpressions.GeneratedRegex("\"[^\"]*\"")]
+    private static partial System.Text.RegularExpressions.Regex StringLiteralRegex();
+
+    /// <summary>
+    /// The equivalent process of a concurrent statement (LRM §11.4/§11.5: concurrent
+    /// assertion and procedure call): runs <paramref name="statement"/> at
+    /// initialisation and on every event of the signals the statement reads.
+    /// </summary>
+    /// <param name="scope">Objects visible to the statement.</param>
+    /// <param name="statement">The sequential form of the concurrent statement.</param>
+    /// <param name="reads">Texts the statement reads (condition, arguments): every signal named in them is in the sensitivity list.</param>
+    /// <param name="label">The statement label, or null.</param>
+    public static Process Implicit(HashSet<Variable> scope, object statement, IEnumerable<string> reads, string? label)
+    {
+        var process = new Process(scope, null!) { Label = label };
+        process.Tasks.Add(statement);
+        process.SensitiveList.UnionWith(SignalsNamedIn(reads, scope));
+        return process;
+    }
 
     /// <summary>
     /// Executes the process asynchronously.
@@ -194,7 +236,7 @@ public class Process : ISControl
         // so a process with waits only inside an if body ran through
         // its full body once at t=0 with the waits behaving as zero-delay
         // yields — no time actually advanced.
-        if (!HasWait && ContainsNestedWait(Tasks)) HasWait = true;
+        HasWait = ContainsNestedWait(Tasks);
         progress.ReportPhase(1f, $"Process complete ({Tasks.Count} tasks)", ProcessingPhase.ParsingProcess);
     }
 
@@ -314,268 +356,16 @@ public class Process : ISControl
 
 
     /// <summary>
-    /// Synthesizes the behavior of the process.
+    /// Synthesizes the statement part of the process and its closing
+    /// <c>end [postponed] process [label];</c>.
     /// </summary>
     /// <param name="cancellationToken">Cancellation token.</param>
     public void SyntetizeBehaviour(CancellationToken cancellationToken)
     {
-        // Combine all available variables: signals/ports and local process variables
+        // Signals/ports plus the process-local variables.
         HashSet<Variable> allVariables = [.. SignalsPorts, .. _variables];
-
-        int iterations = 0;
-        const int maxIterations = 10000;
-
-        while (_streamer.Current?.Value.ToLower() != "end" && iterations < maxIterations)
-        {
-            iterations++;
-            // Check for cancellation at each iteration
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (ParseTrace.Enabled)
-                ParseTrace.Log($"Process.body iter={iterations} tok='{_streamer.Current?.Value}' @{(_streamer.Current?.Line ?? 0) + 1}");
-
-            if (_streamer.Current?.Type == KEYWORDS)
-            {
-                switch (_streamer.Current.Value.ToLower())
-                {
-                    case "if":
-                        IfStructure ifStructure = new(allVariables, _streamer);
-                        ifStructure.Syntetize();
-                        Tasks.Add(ifStructure);
-                        // Consume 'end if ;'
-                        ConsumeEndKeyword("if");
-                        break;
-
-                    case "case":
-                        CaseStructure caseStructure = new(allVariables, _streamer);
-                        caseStructure.Syntetize();
-                        Tasks.Add(caseStructure);
-                        // Consume 'end case ;'
-                        ConsumeEndKeyword("case");
-                        break;
-
-                    case "for":
-                        ForLoopStructure forLoop = new(allVariables, _streamer);
-                        forLoop.Syntetize();
-                        Tasks.Add(forLoop);
-                        // Consume 'end loop ;'
-                        ConsumeEndKeyword("loop");
-                        break;
-
-                    case "while":
-                        WhileLoopStructure whileLoop = new(allVariables, _streamer);
-                        whileLoop.Syntetize();
-                        Tasks.Add(whileLoop);
-                        // Consume 'end loop ;'
-                        ConsumeEndKeyword("loop");
-                        break;
-
-                    case "loop":
-                        // Simple loop (infinite until exit)
-                        SimpleLoopStructure simpleLoop = new(allVariables, _streamer);
-                        simpleLoop.Syntetize();
-                        Tasks.Add(simpleLoop);
-                        // Consume 'end loop ;'
-                        ConsumeEndKeyword("loop");
-                        break;
-
-                    case "exit":
-                        ExitStatement exitStmt = new(allVariables, _streamer);
-                        exitStmt.Syntetize();
-                        Tasks.Add(exitStmt);
-                        break;
-
-                    case "next":
-                        NextStatement nextStmt = new(allVariables, _streamer);
-                        nextStmt.Syntetize();
-                        Tasks.Add(nextStmt);
-                        break;
-
-                    case "null":
-                        NullStatement nullStmt = new(_streamer);
-                        nullStmt.Syntetize();
-                        Tasks.Add(nullStmt);
-                        break;
-
-                    case "return":
-                        ReturnStatement returnStmt = new(allVariables, _streamer);
-                        returnStmt.Syntetize();
-                        Tasks.Add(returnStmt);
-                        break;
-
-                    case "wait":
-                        // F-G-13 (2026-07-18): capture the wait as a
-                        // WaitForStatement task so the delta engine can
-                        // yield the process here and schedule its resume
-                        // at current_tick + delay. F-G-13b (Session 23):
-                        // pass `allVariables` so `wait until <cond>` can
-                        // compile the condition into an Operation and
-                        // extract the referenced-signals sensitivity set.
-                        var waitStmt = new Interpreter.Repositories.WaitForStatement(_streamer, allVariables);
-                        waitStmt.Syntetize();
-                        Tasks.Add(waitStmt);
-                        HasWait = true;
-                        break;
-
-                    case "report":
-                        // F-G-11 (2026-07-18): capture and execute at runtime
-                        // via ReportBus. Prior to F-G-11 this was skipped so
-                        // testbench self-checking sweeps produced no output.
-                        var reportStmt = new Interpreter.Repositories.ReportStatement(allVariables, _streamer);
-                        reportStmt.Syntetize();
-                        Tasks.Add(reportStmt);
-                        break;
-
-                    case "assert":
-                        // F-G-16 (2026-07-18): evaluate condition + emit the
-                        // report message when false. Prior to F-G-16 this
-                        // was skipped.
-                        var assertStmt = new Interpreter.Repositories.AssertStatement(allVariables, _streamer);
-                        assertStmt.Syntetize();
-                        Tasks.Add(assertStmt);
-                        break;
-
-                    default:
-                        // Skip unknown keywords
-                        _streamer.MoveNext();
-                        break;
-                }
-            }
-            else
-            {
-                // F-G-12 (2026-07-18): dispatch procedure calls before
-                // falling through to signal/variable assignment. Detection:
-                // current token is an identifier whose name is registered
-                // in FunctionRegistry as a procedure (IsPure=false). Without
-                // this, `press_key(KEY_1);` / `begin_case("A1");` used to
-                // trip SyntetizeAssignment which then drifted through the
-                // arg list without effect.
-                if (Interpreter.Repositories.ProcedureCallStatement
-                    .IsProcedureCall(_streamer, allVariables))
-                {
-                    var call = new Interpreter.Repositories.ProcedureCallStatement(
-                        allVariables, _streamer);
-                    call.Syntetize();
-                    if (call.IsValid) Tasks.Add(call);
-                }
-                else
-                {
-                    // For simple assignments (signal <= value or variable := value)
-                    SyntetizeAssignment(allVariables);
-                }
-            }
-        }
-
-        // Consume 'end process ;' — the closing ';' is required by VHDL.
-        if (_streamer.Current?.Value.ToLower() != "end")
-            throw new ParserException(
-                "'end process;' expected to close the process", _streamer.Current ?? _streamer.Previous);
-        _streamer.MoveNext(); // consume 'end'
-        if (_streamer.Current?.Value.ToLower() == "process")
-        {
-            _streamer.MoveNext(); // consume 'process'
-        }
-        // Optional process label after 'end process'
-        if (_streamer.Current?.Type == IDENTIFIERS)
-        {
-            _streamer.MoveNext();
-        }
-        if (_streamer.Current?.Value != ";")
-            throw new ParserException(
-                "';' expected after 'end process'", _streamer.Current ?? _streamer.Previous);
-        _streamer.MoveNext(); // consume ';'
+        new SequentialStatementReader(_streamer, allVariables, SequentialBody.Process, cancellationToken)
+            .ReadUntil(Tasks, "end");
+        EndClause.Consume(_streamer, "process", Label, allowPostponed: true);
     }
-
-    /// <summary>
-    /// Consumes a VHDL <c>wait</c> statement up to and including its terminating
-    /// <c>;</c>. Handles all forms: <c>wait;</c>, <c>wait for X ns;</c>,
-    /// <c>wait until cond;</c>, <c>wait on sig_list;</c>, and combinations.
-    /// </summary>
-    /// <remarks>
-    /// Testbench-only — not synthesizable. Without this, <c>wait for DELAY</c>
-    /// caused the process synthesizer to misclassify the trailing <c>for</c> as
-    /// a ForLoop, then keep growing an expression buffer until OOM.
-    /// </remarks>
-    private void SkipWaitStatement()
-    {
-        // F-G-08 pass 4 (2026-07-17): delegate to the shared helper which
-        // correctly tracks in-string state so `end` inside a fragmented
-        // string literal (`report "TB: end of stimulus"` etc.) doesn't
-        // cause an early exit that leaves the process body mid-parse.
-        ParseTrace.SkipWaitStatement(_streamer);
-    }
-
-    /// <summary>
-    /// Skips tokens up to and including the next <c>;</c>. Delegates to the
-    /// shared <see cref="ParseTrace.SkipToSemicolonInclusive"/> helper so
-    /// Process and the nested-body dispatchers use identical semantics —
-    /// including the F-G-08 pass 4 fix that treats a fragmented string
-    /// literal's contents (words like <c>end</c>) as opaque.
-    /// </summary>
-    private void SkipToSemicolonInclusive()
-    {
-        ParseTrace.SkipToSemicolonInclusive(_streamer);
-    }
-
-    /// <summary>
-    /// Consumes 'end keyword ;' tokens.
-    /// </summary>
-    private void ConsumeEndKeyword(string keyword)
-    {
-        // `end <keyword> ;` is required by VHDL — a missing terminator is a
-        // syntax error, not something to tolerate silently.
-        if (_streamer.Current?.Value.ToLower() != "end")
-            throw new ParserException(
-                $"'end {keyword};' expected", _streamer.Current ?? _streamer.Previous);
-        _streamer.MoveNext(); // consume 'end'
-        if (_streamer.Current?.Value.ToLower() != keyword)
-            throw new ParserException(
-                $"'{keyword}' expected after 'end'", _streamer.Current ?? _streamer.Previous);
-        _streamer.MoveNext(); // consume keyword
-        // VHDL-2008 matching-case closes with `end case?;` — accept the
-        // optional trailing `?` between keyword and semicolon.
-        if (_streamer.Current?.Value == "?") _streamer.MoveNext();
-        if (_streamer.Current?.Value != ";")
-            throw new ParserException(
-                $"';' expected after 'end {keyword}'", _streamer.Current ?? _streamer.Previous);
-        _streamer.MoveNext(); // consume ';'
-    }
-
-    /// <summary>
-    /// Synthesizes a simple assignment statement.
-    /// </summary>
-    private void SyntetizeAssignment(HashSet<Variable> variables)
-    {
-        // Phase B+ Deep AST (follow-up): capture the LHS line. Process
-        // bodies were the biggest pedagogical gap before this — DFF /
-        // shift-register / fix-latch lessons all assign inside processes,
-        // and without this they'd fall back to the regex map and
-        // over-highlight every branch.
-        int assignLine = _streamer.Current?.Line ?? 0;
-
-        var rawDataBuilder = new StringBuilder();
-        while (_streamer.Current?.Value != ";" && _streamer.Current?.Value.ToLower() != "end")
-        {
-            rawDataBuilder.Append(_streamer.Current?.Value + " ");
-            _streamer.MoveNext();
-        }
-
-        string operation = rawDataBuilder.ToString().Trim();
-        if (string.IsNullOrEmpty(operation)) return;
-
-        if (_streamer.Current?.Value == ";")
-        {
-            _streamer.MoveNext(); // consume ';'
-        }
-
-        var type = _detector.GetOperationType(operation);
-        switch (type)
-        {
-            case OperationType.ASSIGNATION:
-                Operation op = new(operation, variables, sourceLine: assignLine, isAssignmentStatement: true);
-                Tasks.Add(op);
-                break;
-        }
-    }
-
 }
