@@ -204,7 +204,7 @@ public class SelectedAssignment : ISControl
 
         // Capture the statement's source line up-front (before tokens are
         // consumed) for the gated validation pass at the end of this method.
-        int sourceLine = _streamer.Current?.Line ?? 0;
+        int sourceLine = _streamer.Current?.SourceLine ?? 0;
 
         // Expect 'with'
         if (_streamer.Current?.Value.ToLower() == "with")

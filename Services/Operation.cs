@@ -1288,6 +1288,7 @@ public class Operation : IOperation {
         if (Items.Length == 1 && Items[0] is Variable rhs)
         {
             if (rhs.IsStub || rhs.Type == Constants.DATATYPES.UNKNOWN) return;
+            if (rhs.HasPlaceholderType) return;
             string rhsVal = rhs.Value?.ToString() ?? string.Empty;
             if (rhsVal.StartsWith("(others", StringComparison.OrdinalIgnoreCase)) return; // aggregate → width = LHS by construction
 
@@ -1478,15 +1479,7 @@ public class Operation : IOperation {
         // like a call (rom_data(addr)) are NOT undefined: they are known to a
         // registry, so they keep the legacy black-box stub below. Mirrors the
         // known-callable predicate already used by ParseFunctionCall.
-        bool knownCallable =
-            StandardFunctions.IsStandardFunction(functionName)
-            || Services.FunctionRegistry.Instance.IsKnown(functionName)
-            || PackageRegistry.Instance.ContainsFunction(functionName)
-            || PackageRegistry.Instance.ContainsProcedure(functionName)
-            || PackageRegistry.Instance.ContainsConstant(functionName)
-            // declared somewhere in the source (a subprogram or indexed array/
-            // constant) but not evaluated into a live registry during this pass.
-            || PackageRegistry.Instance.IsDeclaredName(functionName);
+        bool knownCallable = PackageRegistry.IsKnownName(functionName);
         if (!knownCallable)
         {
             throw new Parser.Models.ParserException(
@@ -1501,6 +1494,7 @@ public class Operation : IOperation {
             Constants.DATATYPES.STD_LOGIC_VECTOR
         );
         resultVar.PortType = Constants.PortType.OUT;
+        resultVar.HasPlaceholderType = true; // black-box result: the real type is unknown
 
         return (true, resultVar);
     }

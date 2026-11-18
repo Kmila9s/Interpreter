@@ -55,7 +55,7 @@ namespace Interpreter.Repositories;
 /// updating the loop variable each iteration before executing the body tasks.
 /// </para>
 /// </remarks>
-public class ForLoopStructure : ISControl
+public class ForLoopStructure : ILoopStructure
 {
     /// <summary>The variables in scope during range evaluation and loop body execution.</summary>
     private readonly HashSet<Variable> _variables;
@@ -77,8 +77,8 @@ public class ForLoopStructure : ISControl
     public Variable? LoopVar => _loopVar;
     /// <summary>The token stream used for parsing the for loop structure.</summary>
     private readonly TokenStream _streamer;
-    /// <summary>Detector used to classify operations found inside the loop body.</summary>
-    private readonly OperationDetector _detector = new();
+    /// <summary>Reader of the loop body (null until <see cref="Syntetize"/> for a stand-alone loop).</summary>
+    private SequentialStatementReader? _reader;
 
     /// <summary>
     /// Gets the loop variable name.
@@ -116,6 +116,12 @@ public class ForLoopStructure : ISControl
         _streamer = Tokenizer;
     }
 
+    /// <summary>Creates a loop read by <paramref name="reader"/> (stream on its first keyword).</summary>
+    public ForLoopStructure(SequentialStatementReader reader) : this(reader.Scope, reader.Stream)
+    {
+        _reader = reader;
+    }
+
     /// <summary>
     /// Gets or sets the optional loop label for targeted exit/next statements.
     /// </summary>
@@ -135,66 +141,11 @@ public class ForLoopStructure : ISControl
         Variable loopVar = _loopVar ?? new Variable(
             LoopVariableName, RangeStart.ToString(), Constants.DATATYPES.INTEGER);
 
-        // Create temporary variable set with loop variable
-        HashSet<Variable> loopVariables = [.. _variables, loopVar];
-
-        if (IsAscending)
+        int step = IsAscending ? 1 : -1;
+        for (int i = RangeStart; IsAscending ? i <= RangeEnd : i >= RangeEnd; i += step)
         {
-            for (int i = RangeStart; i <= RangeEnd; i++)
-            {
-                loopVar.Value = i.ToString();
-                try
-                {
-                    Executer executer = new(Tasks);
-                    await executer.ExecuteAsync();
-                }
-                catch (ExitException ex)
-                {
-                    // Check if this exit is for us (no label or matching label)
-                    if (string.IsNullOrEmpty(ex.Label) || ex.Label == LoopLabel)
-                    {
-                        break; // Exit the loop
-                    }
-                    throw; // Re-throw for outer loop
-                }
-                catch (NextException ex)
-                {
-                    // Check if this next is for us (no label or matching label)
-                    if (string.IsNullOrEmpty(ex.Label) || ex.Label == LoopLabel)
-                    {
-                        continue; // Continue to next iteration
-                    }
-                    throw; // Re-throw for outer loop
-                }
-            }
-        }
-        else
-        {
-            for (int i = RangeStart; i >= RangeEnd; i--)
-            {
-                loopVar.Value = i.ToString();
-                try
-                {
-                    Executer executer = new(Tasks);
-                    await executer.ExecuteAsync();
-                }
-                catch (ExitException ex)
-                {
-                    if (string.IsNullOrEmpty(ex.Label) || ex.Label == LoopLabel)
-                    {
-                        break;
-                    }
-                    throw;
-                }
-                catch (NextException ex)
-                {
-                    if (string.IsNullOrEmpty(ex.Label) || ex.Label == LoopLabel)
-                    {
-                        continue;
-                    }
-                    throw;
-                }
-            }
+            loopVar.Value = i.ToString();
+            if (!await LoopPass.RunAsync(Tasks, LoopLabel)) break;
         }
     }
 
@@ -210,11 +161,9 @@ public class ForLoopStructure : ISControl
         LoopVariableName = _streamer.Current?.Value ?? "";
         _streamer.MoveNext(); // consume variable name
 
-        // Expect 'in'
-        if (_streamer.Current?.Value.ToLower() == "in")
-        {
-            _streamer.MoveNext(); // consume 'in'
-        }
+        if (_streamer.Current?.Value.ToLower() != "in")
+            throw new ParserException("'in' expected after the loop parameter", _streamer.Current ?? _streamer.Previous);
+        _streamer.MoveNext(); // consume 'in'
 
         // Special case: <signal>'range / <signal>'reverse_range — the
         // tokenizer emits these as a single VECTORS_ATTRIBUTES token, and
@@ -251,10 +200,7 @@ public class ForLoopStructure : ISControl
             if (reverse) { RangeStart = effRight; RangeEnd = effLeft; IsAscending = effDownto; }
             else         { RangeStart = effLeft;  RangeEnd = effRight; IsAscending = !effDownto; }
 
-            if (_streamer.Current?.Value.ToLower() == "loop")
-            {
-                _streamer.MoveNext();
-            }
+            ExpectLoopKeyword();
 
             Variable loopVar2 = new(LoopVariableName, RangeStart.ToString(), Constants.DATATYPES.INTEGER);
             _loopVar = loopVar2;
@@ -281,11 +227,7 @@ public class ForLoopStructure : ISControl
         // Parse range end
         RangeEnd = ParseRangeValue();
 
-        // Expect 'loop'
-        if (_streamer.Current?.Value.ToLower() == "loop")
-        {
-            _streamer.MoveNext(); // consume 'loop'
-        }
+        ExpectLoopKeyword();
 
         // Create loop variable for inner scope. Stash it on the structure
         // so ExecuteAsync can re-use the same instance instead of forking
@@ -354,202 +296,19 @@ public class ForLoopStructure : ISControl
         return 0;
     }
 
+    /// <summary>Consumes the <c>loop</c> that ends the iteration scheme (required).</summary>
+    private void ExpectLoopKeyword()
+    {
+        if (_streamer.Current?.Value.ToLower() != "loop")
+            throw new ParserException("'loop' expected after the for range", _streamer.Current ?? _streamer.Previous);
+        _streamer.MoveNext();
+    }
+
     /// <summary>
     /// Synthesizes the loop body.
     /// </summary>
     /// <param name="loopVariables">The variables in scope including the loop variable.</param>
-    private void SyntetizeLoopBody(HashSet<Variable> loopVariables)
-    {
-        int iterations = 0;
-        const int maxIterations = 5000;
-        while (!IsEndOfLoop() && iterations < maxIterations)
-        {
-            iterations++;
-            if (_streamer.Current?.Type == KEYWORDS)
-            {
-                var keyword = _streamer.Current.Value.ToLower();
-                switch (keyword)
-                {
-                    case "if":
-                        IfStructure ifStructure = new(loopVariables, _streamer);
-                        ifStructure.Syntetize();
-                        Tasks.Add(ifStructure);
-                        ConsumeEndKeyword("if");
-                        break;
-
-                    case "case":
-                        CaseStructure caseStructure = new(loopVariables, _streamer);
-                        caseStructure.Syntetize();
-                        Tasks.Add(caseStructure);
-                        ConsumeEndKeyword("case");
-                        break;
-
-                    case "for":
-                        ForLoopStructure nestedFor = new(loopVariables, _streamer);
-                        nestedFor.Syntetize();
-                        Tasks.Add(nestedFor);
-                        ConsumeEndKeyword("loop");
-                        break;
-
-                    case "while":
-                        WhileLoopStructure nestedWhile = new(loopVariables, _streamer);
-                        nestedWhile.Syntetize();
-                        Tasks.Add(nestedWhile);
-                        ConsumeEndKeyword("loop");
-                        break;
-
-                    case "loop":
-                        SimpleLoopStructure nestedLoop = new(loopVariables, _streamer);
-                        nestedLoop.Syntetize();
-                        Tasks.Add(nestedLoop);
-                        ConsumeEndKeyword("loop");
-                        break;
-
-                    case "exit":
-                        ExitStatement exitStmt = new(loopVariables, _streamer);
-                        exitStmt.Syntetize();
-                        Tasks.Add(exitStmt);
-                        break;
-
-                    case "next":
-                        NextStatement nextStmt = new(loopVariables, _streamer);
-                        nextStmt.Syntetize();
-                        Tasks.Add(nextStmt);
-                        break;
-
-                    case "null":
-                        NullStatement nullStmt = new(_streamer);
-                        nullStmt.Syntetize();
-                        Tasks.Add(nullStmt);
-                        break;
-
-                    case "return":
-                        ReturnStatement returnStmt = new(loopVariables, _streamer);
-                        returnStmt.Syntetize();
-                        Tasks.Add(returnStmt);
-                        break;
-
-                    // F-G-08 pass 4 (2026-07-17): testbench-only statements.
-                    // Prevents wait/report/assert nested in a for-loop body
-                    // from mis-dispatching to for/case/if via their keyword
-                    // fall-through.
-                    case "wait":
-                        // F-G-13c (Session 23, 2026-07-18): capture the
-                        // wait as a real task so the engine's resumable
-                        // for-loop executor can yield the process here.
-                        // Prior to F-G-13c this was silently dropped, so
-                        // stimulus sweeps like `for i in … loop … wait
-                        // for T; end loop` fired every iteration at delta 0.
-                        var _wait = new WaitForStatement(_streamer, loopVariables);
-                        _wait.Syntetize();
-                        Tasks.Add(_wait);
-                        break;
-                    case "report":
-                        // F-G-11b (2026-07-18): execute reports nested inside
-                        // a for-loop body.
-                        var _rpt = new ReportStatement(loopVariables, _streamer);
-                        _rpt.Syntetize();
-                        Tasks.Add(_rpt);
-                        break;
-                    case "assert":
-                        // F-G-16 (2026-07-18): execute asserts nested inside a for-loop body.
-                        var _ass = new AssertStatement(loopVariables, _streamer);
-                        _ass.Syntetize();
-                        Tasks.Add(_ass);
-                        break;
-
-                    default:
-                        _streamer.MoveNext();
-                        break;
-                }
-            }
-            else
-            {
-                // Phase 3 (Session 26, 2026-07-22): dispatch procedure calls
-                // nested inside a for-loop body before falling to assignment
-                // parsing. Mirrors Process.SyntetizeBehaviour identifier
-                // fallback. Without this, `step_state(state, 20 ns);` inside
-                // the loop body was consumed by SyntetizeAssignment which
-                // silently discarded it.
-                if (ProcedureCallStatement.IsProcedureCall(_streamer, loopVariables))
-                {
-                    var _call = new ProcedureCallStatement(loopVariables, _streamer);
-                    _call.Syntetize();
-                    if (_call.IsValid) Tasks.Add(_call);
-                }
-                else
-                {
-                    SyntetizeAssignment(loopVariables);
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// Checks if we've reached the end of the loop.
-    /// </summary>
-    /// <returns>True if the current token is 'end' or the stream is exhausted.</returns>
-    private bool IsEndOfLoop()
-    {
-        if (_streamer.Current == null) return true;
-        return _streamer.Current.Value.ToLower() == "end";
-    }
-
-    /// <summary>
-    /// Consumes 'end keyword ;' tokens.
-    /// </summary>
-    /// <param name="keyword">The keyword expected after 'end' (e.g., "if", "loop", "case").</param>
-    private void ConsumeEndKeyword(string keyword)
-    {
-        if (_streamer.Current?.Value.ToLower() == "end")
-        {
-            _streamer.MoveNext();
-            if (_streamer.Current?.Value.ToLower() == keyword)
-            {
-                _streamer.MoveNext();
-            }
-            // VHDL-2008 matching-case: `end case?;`
-            if (_streamer.Current?.Value == "?") _streamer.MoveNext();
-            if (_streamer.Current?.Value == ";")
-            {
-                _streamer.MoveNext();
-            }
-        }
-    }
-
-    /// <summary>
-    /// Synthesizes a simple assignment statement.
-    /// </summary>
-    /// <param name="variables">The variables in scope for expression evaluation.</param>
-    private void SyntetizeAssignment(HashSet<Variable> variables)
-    {
-        // Phase B+ Deep AST (follow-up): capture the LHS line.
-        int assignLine = _streamer.Current?.Line ?? 0;
-
-        var rawDataBuilder = new StringBuilder();
-        int iterations = 0;
-        const int maxIterations = 1000;
-        while (_streamer.Current?.Value != ";" && !IsEndOfLoop() && iterations < maxIterations)
-        {
-            iterations++;
-            rawDataBuilder.Append(_streamer.Current?.Value + " ");
-            _streamer.MoveNext();
-        }
-
-        string operation = rawDataBuilder.ToString().Trim();
-        if (string.IsNullOrEmpty(operation)) return;
-
-        if (_streamer.Current?.Value == ";")
-        {
-            _streamer.MoveNext();
-        }
-
-        var type = _detector.GetOperationType(operation);
-        if (type == OperationType.ASSIGNATION)
-        {
-            Operation op = new(operation, variables, sourceLine: assignLine);
-            Tasks.Add(op);
-        }
-    }
-
+    private void SyntetizeLoopBody(HashSet<Variable> loopVariables) =>
+        (_reader ?? new SequentialStatementReader(_streamer, _variables))
+            .WithScope(loopVariables).InLoop(LoopLabel).ReadUntil(Tasks, "end");
 }

@@ -1,6 +1,24 @@
 namespace Interpreter.Models;
 
 /// <summary>
+/// Base of <see cref="ExitException"/> and <see cref="NextException"/>: carries the
+/// optional loop label and the single rule deciding which loop handles it.
+/// </summary>
+public abstract class LoopControlException(string? label, string message) : Exception(message)
+{
+    /// <summary>The loop label named by the statement; null targets the innermost loop.</summary>
+    public string? Label { get; } = label;
+
+    /// <summary>
+    /// True when a loop labeled <paramref name="loopLabel"/> handles this statement:
+    /// an unlabeled exit/next targets the innermost loop, a labeled one the loop with
+    /// that label (VHDL identifiers are case-insensitive).
+    /// </summary>
+    public bool Targets(string? loopLabel) =>
+        string.IsNullOrEmpty(Label) || string.Equals(Label, loopLabel, StringComparison.OrdinalIgnoreCase);
+}
+
+/// <summary>
 /// Exception thrown by the 'exit' statement to exit from a loop.
 /// </summary>
 /// <remarks>
@@ -16,23 +34,8 @@ namespace Interpreter.Models;
 /// to implement proper VHDL loop exit semantics.
 /// </para>
 /// </remarks>
-public class ExitException : Exception
-{
-    /// <summary>
-    /// Gets the optional label of the loop to exit.
-    /// When null, exits the innermost enclosing loop.
-    /// </summary>
-    public string? Label { get; }
-
-    /// <summary>
-    /// Initializes a new instance of the <see cref="ExitException"/> class.
-    /// </summary>
-    /// <param name="label">Optional label of the loop to exit.</param>
-    public ExitException(string? label = null) : base("Exit statement executed")
-    {
-        Label = label;
-    }
-}
+public sealed class ExitException(string? label = null)
+    : LoopControlException(label, "Exit statement executed");
 
 /// <summary>
 /// Exception thrown by the 'next' statement to skip to the next iteration of a loop.
@@ -50,23 +53,8 @@ public class ExitException : Exception
 /// and proceed to the next iteration.
 /// </para>
 /// </remarks>
-public class NextException : Exception
-{
-    /// <summary>
-    /// Gets the optional label of the loop to continue.
-    /// When null, continues the innermost enclosing loop.
-    /// </summary>
-    public string? Label { get; }
-
-    /// <summary>
-    /// Initializes a new instance of the <see cref="NextException"/> class.
-    /// </summary>
-    /// <param name="label">Optional label of the loop to continue.</param>
-    public NextException(string? label = null) : base("Next statement executed")
-    {
-        Label = label;
-    }
-}
+public sealed class NextException(string? label = null)
+    : LoopControlException(label, "Next statement executed");
 
 /// <summary>
 /// Exception thrown by the 'return' statement to return from a function or procedure.
@@ -97,4 +85,18 @@ public class ReturnException : Exception
     {
         Value = value;
     }
+}
+
+/// <summary>
+/// The design asked the simulation to end (<c>std.env.stop</c>/<c>finish</c>, or a
+/// <c>severity failure</c> assertion/report). Raised by the statement, caught by the
+/// engine (<see cref="Interpreter.Services.DeltaCycleEngine.EndRequest"/>): the run
+/// ends at the current time, without applying the updates of the current delta, as GHDL does.
+/// </summary>
+/// <param name="failed">True for a <c>severity failure</c> (the run fails with <paramref name="message"/>).</param>
+/// <param name="message">Why the simulation ended.</param>
+public sealed class SimulationEndException(bool failed, string message) : Exception(message)
+{
+    /// <summary>True when the run ends as a failure.</summary>
+    public bool Failed { get; } = failed;
 }

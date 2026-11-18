@@ -50,8 +50,6 @@ public class GenerateBlock : ISControl
     private readonly HashSet<Variable> _variables;
     /// <summary>The token stream used for parsing the generate block.</summary>
     private readonly TokenStream? _streamer;
-    /// <summary>Detector used to classify operations found inside the generate body.</summary>
-    private readonly OperationDetector _detector = new();
 
     /// <summary>
     /// Gets the label of the generate block.
@@ -408,107 +406,43 @@ public class GenerateBlock : ISControl
     }
 
     /// <summary>
-    /// Parses a concurrent statement.
+    /// After a label: <c>entity …</c>, <c>component …</c>, <c>configuration …</c> or
+    /// <c>name generic|port map …</c> — a component instantiation.
     /// </summary>
-    /// <param name="stream">The token stream to parse from.</param>
-    /// <param name="variables">The variables in scope for this iteration.</param>
-    private void ParseConcurrentStatement(TokenStream stream, HashSet<Variable> variables)
-    {
-        // Phase B+ Deep AST (follow-up): capture the LHS line before the
-        // streamer walks through the statement.
-        int assignLine = stream.Current?.Line ?? 0;
-        var first = stream.Current;
-
-        var rawDataBuilder = new StringBuilder();
-        // C11 (v1.24.0) state, mirroring the architecture path. This loop starts AT
-        // the target, so the statement's OWN first '<=' is the assignment operator
-        // and is exempted; only a LATER stray operator signals a missing ';'.
-        int genParenDepth = 0;
-        bool genInCondition = false;
-        bool genSeenAssignOp = false;
-        // A depth-0 ':' (not ':=') means this statement is a DECLARATION
-        // (`name : type [:= init]`) or a labeled assignment/instantiation, not a
-        // plain concurrent assignment — suppress stray-operator detection then, so a
-        // declaration's `:=` init is never mistaken for a missing ';'.
-        bool genSawColon = false;
-        var genTokens = new List<Token>();
-        while (stream.Current?.Value != ";")
-        {
-            if (stream.Current == null)
-                throw new ValidationException(
-                    $"Unexpected end of input in concurrent assignment for '{first?.Value}' — missing ';'?",
-                    stream.Previous);
-
-            var curTok = stream.Current;
-            var cur = curTok.Value;
-            if (cur == "(") genParenDepth++;
-            else if (cur == ")") genParenDepth--;
-            else if (genParenDepth == 0 && cur == ":") genSawColon = true;
-            else if (genParenDepth == 0 && cur.Equals("when", StringComparison.OrdinalIgnoreCase)) genInCondition = true;
-            else if (genParenDepth == 0 && cur.Equals("else", StringComparison.OrdinalIgnoreCase)) genInCondition = false;
-            else if (genParenDepth == 0 && !genSeenAssignOp && cur == "<=") genSeenAssignOp = true;
-            else if (!genSawColon && ConcurrentAssignmentTermination.IsStrayAssignmentOperator(
-                         curTok, genParenDepth, genInCondition, genTokens))
-                throw new ValidationException(
-                    $"';' expected to terminate the assignment to '{first?.Value}' (found '{cur}' — missing ';'?)",
-                    curTok);
-
-            rawDataBuilder.Append(cur + " ");
-            genTokens.Add(curTok);
-            stream.MoveNext();
-        }
-        stream.MoveNext(); // consume ';'
-
-        string operation = rawDataBuilder.ToString().Trim();
-        if (string.IsNullOrEmpty(operation))
-            return;
-
-        var type = _detector.GetOperationType(operation);
-        if (type == OperationType.ASSIGNATION)
-        {
-            // Check for conditional assignment
-            if (operation.Contains("when", StringComparison.OrdinalIgnoreCase))
-            {
-                var condAssign = ConditionalAssignment.TryParse(operation, variables, assignLine);
-                if (condAssign != null)
-                {
-                    Tasks.Add(condAssign);
-                    return;
-                }
-            }
-
-            // v1.24.0: gate as an assignment statement so C8/C4/C5 apply to
-            // generate-block assignments too — but ONLY for a genuine concurrent
-            // assignment. A statement carrying a depth-0 ':' is a declaration
-            // (`name : type := init`) or a labeled form that merely reached here;
-            // gating it would mis-fire C4/C5 on its type/init, so leave it ungated
-            // (its pre-existing behaviour).
-            Operation op = new(operation, variables, sourceLine: assignLine, isAssignmentStatement: !genSawColon);
-            Tasks.Add(op);
-        }
-    }
+    private static bool IsInstantiation(TokenStream stream) =>
+        EndClause.Is(stream.Current, "entity") || EndClause.Is(stream.Current, "component")
+        || EndClause.Is(stream.Current, "configuration")
+        || (stream.Current?.Type == IDENTIFIERS && (EndClause.Is(stream.Peek(), "port") || EndClause.Is(stream.Peek(), "generic")));
 
     /// <summary>
-    /// Consumes 'end keyword ;'.
+    /// A concurrent signal assignment or procedure call of a generate body, with an
+    /// optional label — read by the same <see cref="SimpleStatement"/> as the
+    /// architecture body.
     /// </summary>
-    /// <param name="stream">The token stream to consume from.</param>
-    /// <param name="keyword">The keyword expected after 'end' (e.g., "if", "loop").</param>
-    private static void ConsumeEndKeyword(TokenStream stream, string keyword)
+    private void ParseConcurrentStatement(TokenStream stream, HashSet<Variable> variables)
     {
-        if (stream.Current?.Value.ToLower() == "end")
+        string? label = null;
+        if (stream.Current is { Type: IDENTIFIERS } head && stream.Peek()?.Value == ":")
         {
+            label = head.Value;
             stream.MoveNext();
-            if (stream.Current?.Value.ToLower() == keyword)
-            {
-                stream.MoveNext();
-            }
-            // VHDL-2008 matching-case: `end case?;`
-            if (stream.Current?.Value == "?") stream.MoveNext();
-            if (stream.Current?.Value == ";")
-            {
-                stream.MoveNext();
-            }
+            stream.MoveNext();
         }
+        if (label is not null && IsInstantiation(stream))
+        {
+            // A component instance in a generate body is flattened by SourceElaborator
+            // when it can be; one it left here is not modelled yet (G57).
+            while (stream.Current is not null && stream.Current.Value != ";") stream.MoveNext();
+            stream.MoveNext();
+            return;
+        }
+        if (ConcurrentStatements.IsProcedureCall(stream))
+        {
+            Tasks.Add(ConcurrentStatements.ProcedureCall(stream, variables, label));
+            return;
+        }
+        var st = SimpleStatement.Read(stream, StatementRegion.Concurrent);
+        Tasks.Add(ConcurrentStatements.AssignmentTask(st.Text, variables, st.First.SourceLine));
     }
 
     /// <summary>
@@ -647,9 +581,21 @@ public class GenerateBlock : ISControl
                     Tasks.Add(selAssign);
                     break;
                 }
-                default:
+                case "assert" or "postponed":
+                    Tasks.Add(ConcurrentStatements.ProcessOrAssert(stream, variables, null));
+                    break;
+                case "begin":
+                    stream.MoveNext(); // end of the generate's declarative part
+                    break;
+                case "signal" or "constant" or "variable" or "type" or "subtype" or "attribute" or "alias" or "component":
+                    // Generate-local declarations are not modelled yet (G57): skip the
+                    // declaration as a whole instead of reading its pieces as statements.
+                    while (stream.Current is not null && stream.Current.Value != ";") stream.MoveNext();
                     stream.MoveNext();
                     break;
+                default:
+                    throw new ParserException(
+                        $"unexpected token '{stream.Current.Value}' in a concurrent statement list", stream.Current);
             }
         }
         else if (stream.Current.Type == IDENTIFIERS)
@@ -662,15 +608,16 @@ public class GenerateBlock : ISControl
             // assignments are NOT special-cased — they fall through to
             // ParseConcurrentStatement, whose leading-':' guard handles them.
             if (IsLabeledStatement(stream, out string stmtKeyword)
-                && (stmtKeyword is "process" or "if" or "for" or "with"))
+                && (stmtKeyword is "process" or "if" or "for" or "with" or "assert" or "postponed"))
             {
+                string stmtLabel = stream.Current!.Value;
                 stream.MoveNext(); // consume label
                 stream.MoveNext(); // consume ':'
                 switch (stmtKeyword)
                 {
                     case "process":
                     {
-                        Process labeledProc = new(variables, stream);
+                        Process labeledProc = new(variables, stream) { Label = stmtLabel };
                         labeledProc.Syntetize();
                         Tasks.Add(labeledProc);
                         break;
@@ -692,6 +639,9 @@ public class GenerateBlock : ISControl
                         Tasks.Add(labeledSel);
                         break;
                     }
+                    case "assert" or "postponed":
+                        Tasks.Add(ConcurrentStatements.ProcessOrAssert(stream, variables, stmtLabel));
+                        break;
                 }
             }
             else
@@ -701,7 +651,7 @@ public class GenerateBlock : ISControl
         }
         else
         {
-            stream.MoveNext();
+            ParseConcurrentStatement(stream, variables);
         }
     }
 
@@ -722,7 +672,7 @@ public class GenerateBlock : ISControl
             IfStructure ifStruct = new(variables, stream);
             ifStruct.Syntetize();
             Tasks.Add(ifStruct);
-            ConsumeEndKeyword(stream, "if");
+            EndClause.Consume(stream, "if");
         }
     }
 

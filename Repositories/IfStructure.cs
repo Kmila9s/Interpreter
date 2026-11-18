@@ -72,8 +72,8 @@ public class IfStructure : ISControl
     private readonly HashSet<Variable> _variables = new();
     /// <summary>The token stream used for parsing the if structure.</summary>
     private readonly TokenStream _streamer;
-    /// <summary>Detector used to classify operations found inside branch bodies.</summary>
-    private readonly OperationDetector _detector = new();
+    /// <summary>Reader of the branch bodies (null until <see cref="Syntetize"/> for a stand-alone if).</summary>
+    private SequentialStatementReader? _reader;
 
     /// <summary>
     /// Gets the list of tasks or operations to be executed if the condition is true.
@@ -94,6 +94,12 @@ public class IfStructure : ISControl
     {
         _variables = Variables;
         _streamer = Tokenizer;
+    }
+
+    /// <summary>Creates an if statement read by <paramref name="reader"/> (stream on <c>if</c>).</summary>
+    public IfStructure(SequentialStatementReader reader) : this(reader.Scope, reader.Stream)
+    {
+        _reader = reader;
     }
 
     /// <summary>
@@ -133,8 +139,9 @@ public class IfStructure : ISControl
     public void Syntetize()
     {
         ParseTrace.Log($"IfStructure @{(_streamer.Current?.Line ?? 0) + 1}");
+        _reader ??= new SequentialStatementReader(_streamer, _variables);
         // Parse the main 'if' branch
-        SyntetizeIfBranch();
+        SyntetizeConditionalBranch();
 
         // Continue parsing elsif and else branches
         while (_streamer.Current != null)
@@ -143,7 +150,7 @@ public class IfStructure : ISControl
 
             if (currentValue == "elsif")
             {
-                SyntetizeElsifBranch();
+                SyntetizeConditionalBranch();
             }
             else if (currentValue == "else")
             {
@@ -168,58 +175,26 @@ public class IfStructure : ISControl
     }
 
     /// <summary>
-    /// Synthesizes the main 'if' branch.
+    /// Synthesizes an <c>if</c> or <c>elsif</c> branch: the condition up to <c>then</c>, then the body.
     /// </summary>
-    private void SyntetizeIfBranch()
+    private void SyntetizeConditionalBranch()
     {
-        int condLine = _streamer.Current?.Line ?? 0; // line of 'if' keyword (#5)
-        _streamer.Expect(KEYWORDS); // consume 'if'
+        var keyword = _streamer.Current!;
+        var branch = new IfBranch { ConditionLine = keyword.SourceLine }; // line of 'if'/'elsif' (#5)
+        _streamer.MoveNext(); // consume 'if' / 'elsif'
 
-        var branch = new IfBranch { ConditionLine = condLine };
-
-        // Parse condition (up to 'then')
         var rawDataBuilder = new StringBuilder();
         while (_streamer.Current?.Value.ToLower() != "then")
         {
-            rawDataBuilder.Append(_streamer.Current?.Value + " ");
+            if (_streamer.Current is null)
+                throw new ParserException($"'then' expected after the '{keyword.Value}' condition", _streamer.Previous);
+            rawDataBuilder.Append(_streamer.Current.Value + " ");
             _streamer.MoveNext();
         }
-        _streamer.Expect(KEYWORDS); // consume 'then'
+        _streamer.MoveNext(); // consume 'then'
 
-        string conditionRaw = rawDataBuilder.ToString().Trim();
-        branch.Condition = new Operation(conditionRaw, _variables);
-
-        // Parse body
+        branch.Condition = new Operation(rawDataBuilder.ToString().Trim(), _variables);
         SyntetizeBranchBody(branch);
-
-        Branches.Add(branch);
-    }
-
-    /// <summary>
-    /// Synthesizes an 'elsif' branch.
-    /// </summary>
-    private void SyntetizeElsifBranch()
-    {
-        int condLine = _streamer.Current?.Line ?? 0; // line of 'elsif' keyword (#5)
-        _streamer.Expect(KEYWORDS); // consume 'elsif'
-
-        var branch = new IfBranch { ConditionLine = condLine };
-
-        // Parse condition (up to 'then')
-        var rawDataBuilder = new StringBuilder();
-        while (_streamer.Current?.Value.ToLower() != "then")
-        {
-            rawDataBuilder.Append(_streamer.Current?.Value + " ");
-            _streamer.MoveNext();
-        }
-        _streamer.Expect(KEYWORDS); // consume 'then'
-
-        string conditionRaw = rawDataBuilder.ToString().Trim();
-        branch.Condition = new Operation(conditionRaw, _variables);
-
-        // Parse body
-        SyntetizeBranchBody(branch);
-
         Branches.Add(branch);
     }
 
@@ -242,223 +217,6 @@ public class IfStructure : ISControl
     /// Synthesizes the body of a branch until 'elsif', 'else', or 'end' is found.
     /// </summary>
     /// <param name="branch">The branch whose body is being synthesized.</param>
-    private void SyntetizeBranchBody(IfBranch branch)
-    {
-        int iterations = 0;
-        const int maxIterations = 5000;
-        while (!IsEndOfBranch() && iterations < maxIterations)
-        {
-            iterations++;
-            var currentValue = _streamer.Current?.Value.ToLower();
-
-            if (_streamer.Current?.Type == KEYWORDS)
-            {
-                switch (currentValue)
-                {
-                    case "if":
-                        // Nested if statement - recursively parse and add to branch tasks
-                        IfStructure nestedIf = new(_variables, _streamer);
-                        nestedIf.Syntetize();
-                        branch.Tasks.Add(nestedIf);
-                        // Consume 'end if ;' tokens after nested structure
-                        ConsumeEndKeyword("if");
-                        break;
-
-                    case "case":
-                        // Nested case statement - allows case statements inside if/elsif/else branches
-                        // Added in v0.13.0 to support complex control flow nesting
-                        CaseStructure nestedCase = new(_variables, _streamer);
-                        nestedCase.Syntetize();
-                        branch.Tasks.Add(nestedCase);
-                        // Consume 'end case ;' tokens after nested structure
-                        ConsumeEndKeyword("case");
-                        break;
-
-                    case "for":
-                        ForLoopStructure forLoop = new(_variables, _streamer);
-                        forLoop.Syntetize();
-                        branch.Tasks.Add(forLoop);
-                        ConsumeEndKeyword("loop");
-                        break;
-
-                    case "while":
-                        WhileLoopStructure whileLoop = new(_variables, _streamer);
-                        whileLoop.Syntetize();
-                        branch.Tasks.Add(whileLoop);
-                        ConsumeEndKeyword("loop");
-                        break;
-
-                    case "loop":
-                        SimpleLoopStructure simpleLoop = new(_variables, _streamer);
-                        simpleLoop.Syntetize();
-                        branch.Tasks.Add(simpleLoop);
-                        ConsumeEndKeyword("loop");
-                        break;
-
-                    case "exit":
-                        ExitStatement exitStmt = new(_variables, _streamer);
-                        exitStmt.Syntetize();
-                        branch.Tasks.Add(exitStmt);
-                        break;
-
-                    case "next":
-                        NextStatement nextStmt = new(_variables, _streamer);
-                        nextStmt.Syntetize();
-                        branch.Tasks.Add(nextStmt);
-                        break;
-
-                    case "null":
-                        NullStatement nullStmt = new(_streamer);
-                        nullStmt.Syntetize();
-                        branch.Tasks.Add(nullStmt);
-                        break;
-
-                    case "return":
-                        ReturnStatement returnStmt = new(_variables, _streamer);
-                        returnStmt.Syntetize();
-                        branch.Tasks.Add(returnStmt);
-                        break;
-
-                    // F-G-13d (Phase 2, 2026-07-22): capture the wait as a
-                    // real task so the engine's process-aware if-branch
-                    // executor can yield here (mirrors F-G-13c in
-                    // ForLoopStructure/WhileLoopStructure/SimpleLoopStructure).
-                    // Prior to F-G-13d this was silently skipped via
-                    // ParseTrace.SkipWaitStatement — testbenches with
-                    // `if halt then wait; end if;` looped forever.
-                    case "wait":
-                        var _wait = new WaitForStatement(_streamer, _variables);
-                        _wait.Syntetize();
-                        branch.Tasks.Add(_wait);
-                        break;
-                    case "report":
-                        // F-G-11b (2026-07-18): execute reports nested inside
-                        // an if/elsif/else branch.
-                        var _rpt = new ReportStatement(_variables, _streamer);
-                        _rpt.Syntetize();
-                        branch.Tasks.Add(_rpt);
-                        break;
-                    case "assert":
-                        // F-G-16 (2026-07-18): execute asserts nested inside an if/elsif/else branch.
-                        var _ass = new AssertStatement(_variables, _streamer);
-                        _ass.Syntetize();
-                        branch.Tasks.Add(_ass);
-                        break;
-
-                    default:
-                        // Other keywords - skip
-                        _streamer.MoveNext();
-                        break;
-                }
-            }
-            else
-            {
-                // Phase 3 (2026-07-22): dispatch procedure calls before
-                // falling to assignment parsing. Without this, a
-                // `press_key(state);` inside an if-branch was silently
-                // consumed by SyntetizeAssingation and dropped.
-                if (ProcedureCallStatement.IsProcedureCall(_streamer, _variables))
-                {
-                    var _call = new ProcedureCallStatement(_variables, _streamer);
-                    _call.Syntetize();
-                    if (_call.IsValid) branch.Tasks.Add(_call);
-                }
-                else
-                {
-                    // Simple assignations
-                    SyntetizeAssingation(branch);
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// Checks if we've reached the end of the current branch (elsif, else, or end).
-    /// </summary>
-    /// <returns>True if the current token is 'elsif', 'else', 'end', or the stream is exhausted.</returns>
-    private bool IsEndOfBranch()
-    {
-        if (_streamer.Current == null) return true;
-
-        var currentValue = _streamer.Current.Value.ToLower();
-        return currentValue == "elsif" ||
-               currentValue == "else" ||
-               currentValue == "end";
-    }
-
-    /// <summary>
-    /// Consumes 'end keyword ;' tokens after a nested structure.
-    /// </summary>
-    /// <param name="keyword">The keyword expected after 'end' (e.g., "if", "loop", "case").</param>
-    private void ConsumeEndKeyword(string keyword)
-    {
-        // `end <keyword> ;` is required by VHDL — a missing terminator is a
-        // syntax error, not something to tolerate silently.
-        if (_streamer.Current?.Value.ToLower() != "end")
-            throw new ParserException(
-                $"'end {keyword};' expected", _streamer.Current ?? _streamer.Previous);
-        _streamer.MoveNext(); // consume 'end'
-        if (_streamer.Current?.Value.ToLower() != keyword)
-            throw new ParserException(
-                $"'{keyword}' expected after 'end'", _streamer.Current ?? _streamer.Previous);
-        _streamer.MoveNext(); // consume keyword
-        // VHDL-2008 matching-case: `end case?;`
-        if (_streamer.Current?.Value == "?") _streamer.MoveNext();
-        if (_streamer.Current?.Value != ";")
-            throw new ParserException(
-                $"';' expected after 'end {keyword}'", _streamer.Current ?? _streamer.Previous);
-        _streamer.MoveNext(); // consume ';'
-    }
-
-    /// <summary>
-    /// Synthesizes a simple assignment statement within a branch.
-    /// </summary>
-    /// <param name="branch">The branch to add the parsed assignment to.</param>
-    private void SyntetizeAssingation(IfBranch branch)
-    {
-        // Phase B+ Deep AST (follow-up 2026-05-19): capture the line of the
-        // assignment's LHS token before the streamer consumes it. Works for
-        // every `sig <= …` inside an if/elsif/else branch, which was the
-        // biggest pedagogical gap of the first AST pass.
-        int assignLine = _streamer.Current?.Line ?? 0;
-
-        var rawDataBuilder = new StringBuilder();
-        int iterations = 0;
-        const int maxIterations = 1000;
-        while (_streamer.Current?.Value != ";" && !IsEndOfBranch() && iterations < maxIterations)
-        {
-            iterations++;
-            rawDataBuilder.Append(_streamer.Current?.Value + " ");
-            _streamer.MoveNext();
-        }
-
-        string operation = rawDataBuilder.ToString().Trim();
-        if (string.IsNullOrEmpty(operation)) return;
-
-        if (_streamer.Current?.Value == ";")
-        {
-            _streamer.MoveNext(); // consume ';'
-        }
-
-        var type = _detector.GetOperationType(operation);
-        switch (type)
-        {
-            case OperationType.ASSIGNATION:
-                Operation op = new(operation, _variables, sourceLine: assignLine);
-                branch.Tasks.Add(op);
-                break;
-        }
-    }
-
-    /// <summary>
-    /// Synthesizes simple assignment statements within the if block (for backwards compatibility).
-    /// </summary>
-    public void SyntetizeAssingations()
-    {
-        if (Branches.Count > 0)
-        {
-            SyntetizeAssingation(Branches[0]);
-        }
-    }
-
+    private void SyntetizeBranchBody(IfBranch branch) =>
+        _reader!.ReadUntil(branch.Tasks, "elsif", "else", "end");
 }

@@ -58,14 +58,14 @@ namespace Interpreter.Repositories;
 /// during simulation. A warning is issued if this limit is reached.
 /// </para>
 /// </remarks>
-public class WhileLoopStructure : ISControl
+public class WhileLoopStructure : ILoopStructure
 {
     /// <summary>The variables in scope during condition and loop body evaluation.</summary>
     private readonly HashSet<Variable> _variables;
     /// <summary>The token stream used for parsing the while loop structure.</summary>
     private readonly TokenStream _streamer;
-    /// <summary>Detector used to classify operations found inside the loop body.</summary>
-    private readonly OperationDetector _detector = new();
+    /// <summary>Reader of the loop body (null until <see cref="Syntetize"/> for a stand-alone loop).</summary>
+    private SequentialStatementReader? _reader;
 
     /// <summary>
     /// Gets the condition operation for the while loop.
@@ -103,6 +103,12 @@ public class WhileLoopStructure : ISControl
         _streamer = Tokenizer;
     }
 
+    /// <summary>Creates a loop read by <paramref name="reader"/> (stream on its first keyword).</summary>
+    public WhileLoopStructure(SequentialStatementReader reader) : this(reader.Scope, reader.Stream)
+    {
+        _reader = reader;
+    }
+
     /// <summary>
     /// Executes the while loop asynchronously.
     /// </summary>
@@ -111,9 +117,8 @@ public class WhileLoopStructure : ISControl
         if (Condition == null) return;
 
         int iterations = 0;
-        bool shouldExit = false;
 
-        while (iterations < MaxIterations && !shouldExit)
+        while (iterations < MaxIterations)
         {
             // Re-evaluate condition each iteration
             Operation conditionOp = new(ConditionString, _variables);
@@ -133,33 +138,7 @@ public class WhileLoopStructure : ISControl
                 break;
             }
 
-            // Execute loop body
-            try
-            {
-                Executer executer = new(Tasks);
-                await executer.ExecuteAsync();
-            }
-            catch (ExitException ex)
-            {
-                // Check if this exit is for us (no label or matching label)
-                if (string.IsNullOrEmpty(ex.Label) || ex.Label == LoopLabel)
-                {
-                    shouldExit = true;
-                    break;
-                }
-                throw; // Re-throw for outer loop
-            }
-            catch (NextException ex)
-            {
-                // Check if this next is for us (no label or matching label)
-                if (string.IsNullOrEmpty(ex.Label) || ex.Label == LoopLabel)
-                {
-                    iterations++;
-                    continue; // Continue to next iteration
-                }
-                throw; // Re-throw for outer loop
-            }
-
+            if (!await LoopPass.RunAsync(Tasks, LoopLabel)) break;
             iterations++;
         }
 
@@ -181,7 +160,9 @@ public class WhileLoopStructure : ISControl
         var conditionBuilder = new StringBuilder();
         while (_streamer.Current?.Value.ToLower() != "loop")
         {
-            conditionBuilder.Append(_streamer.Current?.Value + " ");
+            if (_streamer.Current is null)
+                throw new ParserException("'loop' expected after the while condition", _streamer.Previous);
+            conditionBuilder.Append(_streamer.Current.Value + " ");
             _streamer.MoveNext();
         }
 
@@ -201,187 +182,7 @@ public class WhileLoopStructure : ISControl
     /// <summary>
     /// Synthesizes the loop body.
     /// </summary>
-    private void SyntetizeLoopBody()
-    {
-        while (!IsEndOfLoop())
-        {
-            if (_streamer.Current?.Type == KEYWORDS)
-            {
-                var keyword = _streamer.Current.Value.ToLower();
-                switch (keyword)
-                {
-                    case "if":
-                        IfStructure ifStructure = new(_variables, _streamer);
-                        ifStructure.Syntetize();
-                        Tasks.Add(ifStructure);
-                        ConsumeEndKeyword("if");
-                        break;
-
-                    case "case":
-                        CaseStructure caseStructure = new(_variables, _streamer);
-                        caseStructure.Syntetize();
-                        Tasks.Add(caseStructure);
-                        ConsumeEndKeyword("case");
-                        break;
-
-                    case "for":
-                        ForLoopStructure nestedFor = new(_variables, _streamer);
-                        nestedFor.Syntetize();
-                        Tasks.Add(nestedFor);
-                        ConsumeEndKeyword("loop");
-                        break;
-
-                    case "while":
-                        WhileLoopStructure nestedWhile = new(_variables, _streamer);
-                        nestedWhile.Syntetize();
-                        Tasks.Add(nestedWhile);
-                        ConsumeEndKeyword("loop");
-                        break;
-
-                    case "loop":
-                        SimpleLoopStructure nestedLoop = new(_variables, _streamer);
-                        nestedLoop.Syntetize();
-                        Tasks.Add(nestedLoop);
-                        ConsumeEndKeyword("loop");
-                        break;
-
-                    case "exit":
-                        ExitStatement exitStmt = new(_variables, _streamer);
-                        exitStmt.Syntetize();
-                        Tasks.Add(exitStmt);
-                        break;
-
-                    case "next":
-                        NextStatement nextStmt = new(_variables, _streamer);
-                        nextStmt.Syntetize();
-                        Tasks.Add(nextStmt);
-                        break;
-
-                    case "null":
-                        NullStatement nullStmt = new(_streamer);
-                        nullStmt.Syntetize();
-                        Tasks.Add(nullStmt);
-                        break;
-
-                    case "return":
-                        ReturnStatement returnStmt = new(_variables, _streamer);
-                        returnStmt.Syntetize();
-                        Tasks.Add(returnStmt);
-                        break;
-
-                    // F-G-08 pass 4 (2026-07-17): testbench-only statements.
-                    // Same shape as Process.SyntetizeBehaviour's handler —
-                    // without this a `wait for N ns;` nested in a while loop
-                    // (e.g. a clock-generator process) mis-dispatched its
-                    // trailing `for` as a for-loop header and hung the parser.
-                    case "wait":
-                        // F-G-13c (Session 23, 2026-07-18): capture the
-                        // wait as a real task so the engine's resumable
-                        // while-loop executor can yield here (the classic
-                        // clock-generator idiom is `while X loop clk<=…;
-                        // wait for T; end loop`).
-                        var _wait = new WaitForStatement(_streamer, _variables);
-                        _wait.Syntetize();
-                        Tasks.Add(_wait);
-                        break;
-                    case "report":
-                        // F-G-11b (2026-07-18): execute reports nested inside
-                        // a while-loop body too, not just at process top level.
-                        var _rpt = new ReportStatement(_variables, _streamer);
-                        _rpt.Syntetize();
-                        Tasks.Add(_rpt);
-                        break;
-                    case "assert":
-                        // F-G-16 (2026-07-18): execute asserts nested inside a while-loop body.
-                        var _ass = new AssertStatement(_variables, _streamer);
-                        _ass.Syntetize();
-                        Tasks.Add(_ass);
-                        break;
-
-                    default:
-                        _streamer.MoveNext();
-                        break;
-                }
-            }
-            else
-            {
-                // Phase 3 (2026-07-22): dispatch procedure calls before
-                // falling to assignment parsing (mirror ForLoopStructure).
-                if (ProcedureCallStatement.IsProcedureCall(_streamer, _variables))
-                {
-                    var _call = new ProcedureCallStatement(_variables, _streamer);
-                    _call.Syntetize();
-                    if (_call.IsValid) Tasks.Add(_call);
-                }
-                else
-                {
-                    SyntetizeAssignment();
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// Checks if we've reached the end of the loop.
-    /// </summary>
-    /// <returns>True if the current token is 'end' or the stream is exhausted.</returns>
-    private bool IsEndOfLoop()
-    {
-        if (_streamer.Current == null) return true;
-        return _streamer.Current.Value.ToLower() == "end";
-    }
-
-    /// <summary>
-    /// Consumes 'end keyword ;' tokens.
-    /// </summary>
-    /// <param name="keyword">The keyword expected after 'end' (e.g., "if", "loop", "case").</param>
-    private void ConsumeEndKeyword(string keyword)
-    {
-        if (_streamer.Current?.Value.ToLower() == "end")
-        {
-            _streamer.MoveNext();
-            if (_streamer.Current?.Value.ToLower() == keyword)
-            {
-                _streamer.MoveNext();
-            }
-            // VHDL-2008 matching-case: `end case?;`
-            if (_streamer.Current?.Value == "?") _streamer.MoveNext();
-            if (_streamer.Current?.Value == ";")
-            {
-                _streamer.MoveNext();
-            }
-        }
-    }
-
-    /// <summary>
-    /// Synthesizes a simple assignment statement.
-    /// </summary>
-    private void SyntetizeAssignment()
-    {
-        // Phase B+ Deep AST (follow-up): capture the LHS line.
-        int assignLine = _streamer.Current?.Line ?? 0;
-
-        var rawDataBuilder = new StringBuilder();
-        while (_streamer.Current?.Value != ";" && !IsEndOfLoop())
-        {
-            rawDataBuilder.Append(_streamer.Current?.Value + " ");
-            _streamer.MoveNext();
-        }
-
-        string operation = rawDataBuilder.ToString().Trim();
-        if (string.IsNullOrEmpty(operation)) return;
-
-        if (_streamer.Current?.Value == ";")
-        {
-            _streamer.MoveNext();
-        }
-
-        var type = _detector.GetOperationType(operation);
-        if (type == OperationType.ASSIGNATION)
-        {
-            Operation op = new(operation, _variables, sourceLine: assignLine);
-            Tasks.Add(op);
-        }
-    }
-
+    private void SyntetizeLoopBody() =>
+        (_reader ?? new SequentialStatementReader(_streamer, _variables))
+            .InLoop(LoopLabel).ReadUntil(Tasks, "end");
 }

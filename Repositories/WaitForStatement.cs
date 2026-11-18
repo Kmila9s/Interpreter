@@ -25,8 +25,8 @@ namespace Interpreter.Repositories;
 /// in the sensitivity set; on each delta-cycle signal change, the engine
 /// re-evaluates the stored condition and wakes the process when it becomes
 /// true.</description></item>
-/// <item><description><c>wait on &lt;sig&gt;;</c> — captured as terminal
-/// for now (follow-up).</description></item>
+/// <item><description><c>wait on &lt;sig&gt;, …;</c> — <see cref="IsCondition"/> with the
+/// listed signals as <see cref="Sensitivity"/> and no condition: any event wakes it.</description></item>
 /// </list>
 ///
 /// The execute path is a no-op — the delta engine special-cases
@@ -88,151 +88,96 @@ public sealed class WaitForStatement : ISControl
     }
 
     /// <summary>
-    /// Parses starting AT the <c>wait</c> keyword. Consumes through the
-    /// terminating <c>;</c>. On any parse anomaly falls back to
-    /// <see cref="IsTerminal"/> = true so the process at least halts
-    /// cleanly instead of consuming forever.
+    /// Parses <c>wait [on s1, s2] [until cond] [for time];</c> (LRM §10.2), consuming
+    /// the terminating <c>;</c>. Clause order is the LRM one; anything else is a
+    /// <see cref="ParserException"/>.
     /// </summary>
     public void Syntetize()
     {
         if (_streamer == null) return;
-
+        var waitToken = _streamer.Current;
         _streamer.MoveNext(); // consume 'wait'
 
-        var current = _streamer.Current?.Value?.ToLowerInvariant();
-        if (current == null || current == ";")
+        var on = new List<Token>();
+        var until = new List<string>();
+        var forTokens = new List<Token>();
+        string clause = string.Empty;
+        while (_streamer.Current is { } cur && cur.Value != ";")
         {
-            // Bare `wait;` — terminal.
-            IsTerminal = true;
-            if (_streamer.Current?.Value == ";") _streamer.MoveNext();
-            return;
-        }
-
-        if (current == "for")
-        {
-            _streamer.MoveNext(); // consume 'for'
-
-            // Amount token.
-            var amountStr = _streamer.Current?.Value ?? "0";
-            if (!long.TryParse(amountStr, out long amount))
+            string low = cur.Value.ToLowerInvariant();
+            bool next = low switch
             {
-                // Fall back: treat as terminal so we don't run away.
-                IsTerminal = true;
-                while (_streamer.Current != null && _streamer.Current.Value != ";")
-                    _streamer.MoveNext();
-                if (_streamer.Current?.Value == ";") _streamer.MoveNext();
-                return;
-            }
-            _streamer.MoveNext(); // consume amount
-
-            // Unit token.
-            var unit = _streamer.Current?.Value?.ToLowerInvariant() ?? "ns";
-            long factor = unit switch
-            {
-                "fs"  => 0,                      // sub-ns rounds to 0 — the engine's tick resolution is ns-scale
-                "ps"  => 0,
-                "ns"  => 1,
-                "us"  => 1_000,
-                "ms"  => 1_000_000,
-                "sec" => 1_000_000_000,
-                "min" => 60_000_000_000,
-                "hr"  => 3_600_000_000_000,
-                _     => 1,
+                "on" => clause == string.Empty,
+                "until" => clause is "" or "on",
+                "for" => clause is "" or "on" or "until",
+                _ => false,
             };
-            DelayNs = amount * factor;
-            IsTimed = DelayNs > 0;
-            IsTerminal = !IsTimed;
-            _streamer.MoveNext(); // consume unit
-
-            if (_streamer.Current?.Value == ";") _streamer.MoveNext();
-            return;
-        }
-
-        if (current == "until")
-        {
-            // F-G-13b (2026-07-18): `wait until <cond>;` — capture the raw
-            // condition tokens between `until` and the terminating `;`,
-            // then build an Operation just like an if-branch condition.
-            _streamer.MoveNext(); // consume 'until'
-            var tokens = new List<string>();
-            while (_streamer.Current != null && _streamer.Current.Value != ";")
+            if (next) { clause = low; _streamer.MoveNext(); continue; }
+            switch (clause)
             {
-                var v = _streamer.Current.Value;
-                if (!string.IsNullOrEmpty(v)) tokens.Add(v);
-                _streamer.MoveNext();
+                case "on": if (cur.Value != ",") on.Add(cur); break;
+                case "until": until.Add(cur.Value); break;
+                case "for": forTokens.Add(cur); break;
+                default:
+                    throw new ParserException("'on', 'until', 'for' or ';' expected after 'wait'", cur);
             }
-            if (_streamer.Current?.Value == ";") _streamer.MoveNext();
-
-            if (tokens.Count == 0 || _variables == null)
-            {
-                // Malformed or no variable set to bind against — fall back
-                // to terminal so the process halts cleanly.
-                IsTerminal = true;
-                return;
-            }
-
-            string conditionRaw = string.Join(" ", tokens);
-            try
-            {
-                Condition = new Operation(conditionRaw, _variables);
-            }
-            catch
-            {
-                IsTerminal = true;
-                return;
-            }
-
-            // Sensitivity extraction: any variable name whose token
-            // appears in the raw condition. Case-insensitive (matches the
-            // Operation binding behaviour). This is a name-scan rather
-            // than an AST walk so it survives DeferredFunction wrappers
-            // like `rising_edge(clk)` — the `clk` token still appears.
-            // Tier 4.1 (2026-07-28): attribute tokens like `clk'event`
-            // arrive glued into one token via VECTORS_ATTRIBUTES; strip the
-            // `'attr` suffix so the underlying signal still registers in
-            // the wait's sensitivity set.
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var raw in tokens)
-            {
-                if (string.IsNullOrEmpty(raw) || !char.IsLetter(raw[0])) continue;
-                int apos = raw.IndexOf('\'');
-                string t = apos > 0 ? raw[..apos] : raw;
-                if (!seen.Add(t)) continue;
-                var match = _variables.FirstOrDefault(v =>
-                    !ReferenceEquals(v, null) &&
-                    !string.IsNullOrEmpty(v.Name) &&
-                    v.Name.Equals(t, StringComparison.OrdinalIgnoreCase));
-                if (match is not null) Sensitivity.Add(match);
-            }
-
-            if (Sensitivity.Count == 0)
-            {
-                // Nothing to wake on → the process would spin forever
-                // waiting on a static condition. Treat as terminal to
-                // match the bare-wait halt semantics.
-                IsTerminal = true;
-                return;
-            }
-
-            IsCondition = true;
-            return;
-        }
-
-        // `wait on <sig>;` — capture as terminal for now (follow-up work).
-        IsTerminal = true;
-        while (_streamer.Current != null && _streamer.Current.Value != ";")
             _streamer.MoveNext();
-        if (_streamer.Current?.Value == ";") _streamer.MoveNext();
+        }
+        if (_streamer.Current is null)
+            throw new ParserException("';' expected at the end of the wait statement", _streamer.Previous);
+        _streamer.MoveNext(); // consume ';'
+
+        if (forTokens.Count > 0 && (on.Count > 0 || until.Count > 0))
+            throw new ParserException("a wait with both a condition and a timeout is not supported yet", waitToken);
+        if (forTokens.Count > 0) { SetDelay(forTokens); return; }
+        if (on.Count == 0 && until.Count == 0) { IsTerminal = true; return; } // bare `wait;`
+        SetCondition(on, until);
+    }
+
+    /// <summary><c>wait for &lt;time expression&gt;;</c>.</summary>
+    private void SetDelay(List<Token> tokens)
+    {
+        string text = string.Join(' ', tokens.Select(t => t.Value));
+        if (!Interpreter.Models.TimeValue.TryEvaluateNs(text, _variables, out double ns))
+            throw new ParserException($"time expression '{text}' is not supported in a wait statement yet", tokens[0]);
+        DelayNs = (long)Math.Round(ns, MidpointRounding.AwayFromZero);
+        IsTimed = DelayNs > 0;
+        IsTerminal = !IsTimed;
+    }
+
+    /// <summary><c>wait on … [until …];</c> / <c>wait until …;</c>.</summary>
+    private void SetCondition(List<Token> on, List<string> until)
+    {
+        if (_variables == null) { IsTerminal = true; return; }
+        if (until.Count > 0) Condition = new Operation(string.Join(" ", until), _variables);
+
+        if (on.Count > 0)
+        {
+            foreach (var name in on)
+            {
+                var sig = _variables.FirstOrDefault(v => v is not null && v.Name.Equals(name.Value, StringComparison.OrdinalIgnoreCase))
+                    ?? throw ParserException.UndeclaredVariable(name.Value, name);
+                Sensitivity.Add(sig);
+            }
+        }
+        else
+        {
+            // Implicit sensitivity of `wait until`: every signal named in the condition.
+            Sensitivity.UnionWith(Process.SignalsNamedIn(until, _variables));
+        }
+
+        // Nothing can wake the process: it halts, like a bare wait.
+        if (Sensitivity.Count == 0) { IsTerminal = true; return; }
+        IsCondition = true;
     }
 
     /// <summary>
-    /// F-G-13b: evaluates the stored <see cref="Condition"/> and returns
-    /// true when it holds. Called from the delta engine on each signal
-    /// change involving a member of <see cref="Sensitivity"/>.
+    /// True when the process may resume: the <c>until</c> condition holds, or —
+    /// for <c>wait on</c> without a condition — any event on the sensitivity set.
     /// </summary>
     public bool EvaluateCondition()
     {
-        if (Condition == null) return false;
+        if (Condition == null) return IsCondition;
         var result = Condition.Execute() as Variable;
         return result?.Value is bool b && b;
     }

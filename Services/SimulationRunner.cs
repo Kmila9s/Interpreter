@@ -60,6 +60,20 @@ public class SimulationRunner : IDisposable, ISimulationRunner
     }
 
     /// <summary>
+    /// Seals the trace at the last simulated tick — the end of the window, or the
+    /// tick where the design ended the run (<c>std.env.stop</c>/<c>finish</c>,
+    /// <c>severity failure</c>) — so it spans the whole run even for a stable
+    /// design. Returns the error of a <c>severity failure</c> end, else null.
+    /// Shared by both runners.
+    /// </summary>
+    internal static string? SealRun(DeltaCycleEngine engine, IEnumerable<Variable> allSignals, ulong totalTicks, ulong? endTick)
+    {
+        ulong last = endTick ?? (totalTicks > 0 ? totalTicks - 1 : 0);
+        if (totalTicks > 0) engine.History.RecordChanges(allSignals, (long)last * 1000);
+        return engine.EndRequest is { Failed: true } failure ? $"severity failure: {failure.Message}" : null;
+    }
+
+    /// <summary>
     /// Phase B (2026-05-19): fires once per <see cref="RunAsync"/> right
     /// after <see cref="_engine"/> is constructed + initialised. Lets the UI
     /// (Editor's Replay tab) grab a reference to the engine for the live
@@ -217,6 +231,7 @@ public class SimulationRunner : IDisposable, ISimulationRunner
                 .ToDictionary(g => g.Key, g => g.ToList());
 
             // Main simulation loop
+            ulong? endTick = null;
             for (ulong tick = 0; tick < totalTicks; tick++)
             {
                 // Check cancellation
@@ -277,6 +292,7 @@ public class SimulationRunner : IDisposable, ISimulationRunner
                 // Advance time and run delta cycles
                 _engine.AdvanceTime(tick);
                 await _engine.RunTimeStepAsync();
+                if (_engine.EndRequest is not null) { endTick = tick; break; }
 
                 // Report progress every percent change
                 double percent = (double)(tick + 1) / totalTicks * 100.0;
@@ -301,9 +317,12 @@ public class SimulationRunner : IDisposable, ISimulationRunner
             // collapses to a single-tick strip even if totalTicks was 100k.
             // Recording every signal at the final tick makes the trace span
             // the full run duration as the student expects.
-            if (totalTicks > 0 && _engine?.History != null)
+            if (SealRun(_engine, allSignals, totalTicks, endTick) is { } failure)
             {
-                _engine.History.RecordChanges(allSignals, (long)(totalTicks - 1) * 1000);
+                Error = failure;
+                OnError?.Invoke(Error);
+                OnSimulationEnded?.Invoke(false);
+                return;
             }
 
             OnProgressChanged?.Invoke(100.0);

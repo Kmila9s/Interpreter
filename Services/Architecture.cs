@@ -67,7 +67,6 @@ public class Architecture : ISControl
 
     private Tokenizer _tokenizer = new();
     private TokenStream _streamer = default!;
-    private readonly OperationDetector _detector = new();
 
     /// <summary>
     /// Delta cycle engine for proper VHDL simulation semantics.
@@ -364,9 +363,14 @@ public class Architecture : ISControl
                         switch (keyword)
                         {
                             case "process":
-                                Process process = new(comparators, _streamer, CustomTypes);
-                                process.Syntetize(cancellationToken);
-                                Tasks.Add(process);
+                            case "postponed":
+                            case "assert":
+                                Tasks.Add(ConcurrentStatements.ProcessOrAssert(_streamer, comparators, label, CustomTypes, cancellationToken));
+                                return;
+                            case "with":
+                                SelectedAssignment labeledSelect = new(comparators, _streamer);
+                                labeledSelect.Syntetize();
+                                Tasks.Add(labeledSelect);
                                 return;
                             case "block":
                                 // VHDL block statement (guarded or plain, possibly nested).
@@ -388,7 +392,7 @@ public class Architecture : ISControl
                                 // A genuine validation rejection (missing ';', assign to an
                                 // input port, type/width mismatch) must surface; only a
                                 // synthesis-complexity failure is blackboxed.
-                                catch (ValidationException) { throw; }
+                                catch (ParserException) { throw; }
                                 catch
                                 {
                                     SkipGenerateBody(label);
@@ -404,7 +408,7 @@ public class Architecture : ISControl
                                 }
                                 // A genuine validation rejection must surface; only a
                                 // synthesis-complexity failure is blackboxed.
-                                catch (ValidationException) { throw; }
+                                catch (ParserException) { throw; }
                                 catch
                                 {
                                     SkipGenerateBody(label);
@@ -434,9 +438,23 @@ public class Architecture : ISControl
                                 }
                                 return;
                             default:
-                                _streamer.MoveNext();
-                                return;
+                                throw new ParserException(
+                                    $"unexpected token '{_streamer.Current.Value}' after the label '{label}'", _streamer.Current);
                         }
+                    }
+                    // `lbl: name;` with a declared procedure is a call; any other `lbl: name …`
+                    // stays a component instantiation (`u: comp;` has no map).
+                    else if (ConcurrentStatements.IsProcedureCall(_streamer)
+                             && ProcedureCallStatement.IsProcedureCall(_streamer, comparators))
+                    {
+                        Tasks.Add(ConcurrentStatements.ProcedureCall(_streamer, comparators, label));
+                        return;
+                    }
+                    else if (SimpleStatement.PeekAfterTarget(_streamer)?.Value == "<=")
+                    {
+                        // `lbl: y <= …;` — a labeled concurrent signal assignment.
+                        SyntetizeAssingations();
+                        return;
                     }
                     else if (_streamer.Current?.Type == IDENTIFIERS)
                     {
@@ -472,16 +490,16 @@ public class Architecture : ISControl
                 switch (_streamer.Current.Value.ToLower())
                 {
                     case "process":
-                        Process process = new(comparators, _streamer, CustomTypes);
-                        process.Syntetize(cancellationToken);
-                        Tasks.Add(process);
+                    case "postponed":
+                    case "assert":
+                        Tasks.Add(ConcurrentStatements.ProcessOrAssert(_streamer, comparators, null, CustomTypes, cancellationToken));
                         break;
                     case "if":
                         IfStructure ifStructure = new(comparators, _streamer);
                         ifStructure.Syntetize();
                         Tasks.Add(ifStructure);
                         // Consume 'end if ;' after the if structure
-                        ConsumeEndIf();
+                        EndClause.Consume(_streamer, "if");
                         break;
                     case "with":
                         // With...select statement
@@ -490,10 +508,13 @@ public class Architecture : ISControl
                         Tasks.Add(selectedAssign);
                         break;
                     default:
-                        // Skip unknown keywords
-                        _streamer.MoveNext();
+                        SyntetizeAssingations(); // reports the misplaced reserved word
                         break;
                 }
+            }
+            else if (ConcurrentStatements.IsProcedureCall(_streamer))
+            {
+                Tasks.Add(ConcurrentStatements.ProcedureCall(_streamer, comparators, null));
             }
             else
             {
@@ -572,7 +593,7 @@ public class Architecture : ISControl
             _blockStack.Pop();
             pushed = false;
 
-            ConsumeEndBlock(label);
+            EndClause.Consume(_streamer, "block", label);
         }
         catch (OperationCanceledException)
         {
@@ -619,21 +640,6 @@ public class Architecture : ISControl
             sb.Append(val).Append(' ');
         }
         return sb.ToString().Trim();
-    }
-
-    /// <summary>
-    /// Consumes <c>end block [label] ;</c> after a block body.
-    /// </summary>
-    private void ConsumeEndBlock(string label)
-    {
-        if (_streamer.Current?.Value.ToLower() == "end")
-            _streamer.MoveNext();               // 'end'
-        if (_streamer.Current?.Value.ToLower() == "block")
-            _streamer.MoveNext();               // 'block'
-        if (_streamer.Current?.Type == IDENTIFIERS && _streamer.Current?.Value == label)
-            _streamer.MoveNext();               // optional trailing label
-        if (_streamer.Current?.Value == ";")
-            _streamer.MoveNext();               // ';'
     }
 
     /// <summary>
@@ -800,27 +806,6 @@ public class Architecture : ISControl
             }
             _streamer.MoveNext();
         }
-    }
-
-    /// <summary>
-    /// Consumes the 'end if ;' tokens after an if structure.
-    /// </summary>
-    private void ConsumeEndIf()
-    {
-        // `end if ;` is required by VHDL — a missing terminator is a syntax
-        // error, not something to tolerate silently.
-        if (_streamer.Current?.Value?.ToLower() != "end")
-            throw new ParserException(
-                "'end if;' expected to close the if statement", _streamer.Current ?? _streamer.Previous);
-        _streamer.MoveNext(); // consume 'end'
-        if (_streamer.Current?.Value?.ToLower() != "if")
-            throw new ParserException(
-                "'if' expected after 'end'", _streamer.Current ?? _streamer.Previous);
-        _streamer.MoveNext(); // consume 'if'
-        if (_streamer.Current?.Value != ";")
-            throw new ParserException(
-                "';' expected after 'end if'", _streamer.Current ?? _streamer.Previous);
-        _streamer.MoveNext(); // consume ';'
     }
 
     /// <summary>
@@ -1076,198 +1061,25 @@ public class Architecture : ISControl
 
     private void SyntetizeAssingationsInner()
     {
-        // Strict shape: a concurrent statement must look like
-        //   <signal>{ ( <index> ) | .<field> } ( <= | := ) <expr> ;
-        //   <procedure_name>[ ( <args> ) ] ;
-        // Anything else (e.g. two identifiers in a row at depth 0 like the
-        // `MHz bit2 <= q2` shape produced when garbage gets pasted after a
-        // `;`) means the line is malformed. Catching it here surfaces a
-        // precise Monaco marker via Editor.razor's ParserException catch
-        // instead of building a quietly-different Operation that the
-        // simulator silently mis-evaluates.
-
-        var first = _streamer.Current;
-        if (first == null)
-            throw new ParserException(
-                "Unexpected end of input where a concurrent statement was expected",
-                _streamer.Previous);
-        if (first.Type != IDENTIFIERS && first.Type != QUALIFIED_IDENTIFIERS)
-            throw new ParserException(
-                $"Unexpected token '{first.Value}' — expected a signal name to start a concurrent statement",
-                first);
-
-        var rawDataBuilder = new StringBuilder();
-        rawDataBuilder.Append(first.Value).Append(' ');
-        _streamer.MoveNext();
-
-        // Optional selectors: `bus(7 downto 0) <= ...`, `mem(i)(j) <= ...`,
-        // `m(i).lo <= ...` — balanced parentheses and `.field` tokens.
-        while (_streamer.Current?.Value == "(" || _streamer.Current?.IsFieldSelector == true)
-        {
-            if (_streamer.Current.IsFieldSelector)
-            {
-                rawDataBuilder.Append(_streamer.Current.Value).Append(' ');
-                _streamer.MoveNext();
-                continue;
-            }
-            int depth = 0;
-            do
-            {
-                if (_streamer.Current == null)
-                    throw new ParserException(
-                        "Unterminated parenthesized expression after signal name",
-                        _streamer.Previous);
-                if (_streamer.Current.Value == "(") depth++;
-                else if (_streamer.Current.Value == ")") depth--;
-                rawDataBuilder.Append(_streamer.Current.Value).Append(' ');
-                _streamer.MoveNext();
-            } while (depth > 0);
-        }
-
-        // Now the next token MUST be `<=`, `:=`, or `;` (bare procedure call).
-        var sep = _streamer.Current;
-        if (sep == null)
-            throw new ParserException(
-                $"Statement starting with '{first.Value}' is missing its assignment operator or terminator",
-                _streamer.Previous);
-
-        bool isProcedureCall = sep.Type == OPERATORS && sep.Value == ";";
-        bool isAssignment    = sep.Type == OPERATORS && (sep.Value == "<=" || sep.Value == ":=");
-
-        if (!isProcedureCall && !isAssignment)
-            throw new ParserException(
-                $"Unexpected token '{sep.Value}' after '{first.Value}' — expected '<=', ':=', or ';'",
-                sep);
-
-        // A concurrent statement's target is always a signal; ':=' (variable
-        // assignment) is illegal here — VHDL requires '<='.
-        if (isAssignment && sep.Value == ":=")
-            throw new ParserException(
-                $"':=' cannot assign to signal '{first.Value}' in a concurrent statement; use '<='",
-                sep);
-
-        if (isProcedureCall)
-        {
-            // Bare procedure call: just record the LHS so downstream
-            // classifiers see the same operation string as before (no
-            // assignment operator, no RHS). The existing detector treats
-            // this as a no-op below.
-            _streamer.MoveNext(); // consume ;
-            string procOp = rawDataBuilder.ToString().Trim();
-            _ = _detector.GetOperationType(procOp);
-            return;
-        }
-
-        // Assignment. Snapshot the LHS (target + any index) before the operator so a
-        // guarded RHS can be rewritten independently below. For non-guarded
-        // assignments this reproduces the previous `"<lhs> <op> <rhs>"` string exactly.
-        string lhs = rawDataBuilder.ToString().Trim();
-        string assignOp = sep.Value; // "<=" or ":="
-        _streamer.MoveNext();
-
-        // VHDL guarded assignment: `target <= guarded <waveform>;`. The `guarded`
-        // qualifier means the driver is active only while the enclosing guarded
-        // block's guard is true. Strip the keyword here; the waveform is gated below.
-        bool isGuarded = false;
-        if (_streamer.Current?.Type == KEYWORDS &&
-            _streamer.Current.Value.Equals("guarded", StringComparison.OrdinalIgnoreCase))
-        {
-            isGuarded = true;
-            _streamer.MoveNext();
-        }
-
-        var rhsBuilder = new StringBuilder();
-        int rhsParenDepth = 0;
-        // True while inside a when…else CONDITION (between a depth-0 `when` and the
-        // following depth-0 `else`/`;`), where a `<=` is a relational comparison and
-        // must NOT be read as a missing-';' signal. Nested conditional expressions are
-        // parenthesised (depth > 0), so they never toggle this.
-        bool rhsInCondition = false;
-        // Rolling RHS token history for the C11 stray-operator detector (lets it
-        // walk back across an indexed/sliced next-target, e.g. `z(0) <=`).
-        var rhsTokens = new List<Parser.Models.Token>();
-        while (_streamer.Current?.Value != ";")
-        {
-            if (_streamer.Current == null)
-                throw new ParserException(
-                    $"Unexpected end of input in concurrent assignment for '{first.Value}' — missing ';'?",
-                    _streamer.Previous);
-            // Reject stray UNKNOWN tokens (e.g. `$`, mojibake from a paste)
-            // inside the RHS — once they reach Operation.Evaluate they
-            // become a confusing runtime error far from the source line.
-            if (_streamer.Current.Type == UNKNOWN && !(_streamer.Current.IsFieldSelector && _streamer.Previous?.Value == ")"))
-                throw new ParserException(
-                    $"Unexpected token '{_streamer.Current.Value}' inside concurrent statement — not a valid VHDL identifier, keyword, operator, or literal",
-                    _streamer.Current);
-
-            var curTok = _streamer.Current;
-            var cur = curTok.Value;
-            if (cur == "(") rhsParenDepth++;
-            else if (cur == ")") rhsParenDepth--;
-            else if (rhsParenDepth == 0 && cur.Equals("when", StringComparison.OrdinalIgnoreCase)) rhsInCondition = true;
-            else if (rhsParenDepth == 0 && cur.Equals("else", StringComparison.OrdinalIgnoreCase)) rhsInCondition = false;
-            // C11 (v1.21.0, extended v1.23.0/v1.24.0): a stray assignment operator
-            // at paren-depth 0 means the RHS ran past a missing ';' into the next
-            // statement. The shared detector handles ':=' (always), a '<=' in a
-            // waveform context, and — guarded — a '<=' that starts a new statement
-            // inside a trailing when…else condition (operand-before-target).
-            else if (ConcurrentAssignmentTermination.IsStrayAssignmentOperator(
-                         curTok, rhsParenDepth, rhsInCondition, rhsTokens))
-                throw new ValidationException(
-                    $"';' expected to terminate the assignment to '{first.Value}' (found '{cur}' — missing ';'?)",
-                    curTok);
-
-            rhsBuilder.Append(cur).Append(' ');
-            rhsTokens.Add(curTok);
-            _streamer.MoveNext();
-        }
-        string rhs = rhsBuilder.ToString().Trim();
+        // Strict shape (SimpleStatement): `<signal>{(…)|.field} <= <expr> ;` or
+        // `<procedure>[(…)] ;` — anything else is a ParserException at the token.
+        var st = SimpleStatement.Read(_streamer, StatementRegion.Concurrent);
+        // (Procedure calls are routed to ConcurrentStatements.ProcedureCall before this.)
 
         // Gate a guarded assignment on its enclosing block's guard — genuine dynamic
         // guard simulation: the resulting conditional assignment re-evaluates the
         // guard on every delta cycle and disconnects the driver while it is false.
-        if (isGuarded && assignOp == "<=" && _blockStack.Count > 0)
+        string rhs = st.Rhs;
+        if (st.Guarded && st.Operator == "<=" && _blockStack.Count > 0)
         {
             var guardCtx = _blockStack.Peek();
             if (guardCtx.IsGuarded)
-                rhs = guardCtx.BuildGuardedRhs(rhs, GuardedDisconnectValue(first.Value));
+                rhs = guardCtx.BuildGuardedRhs(rhs, GuardedDisconnectValue(st.First.Value));
         }
 
-        string operation = $"{lhs} {assignOp} {rhs}".Trim();
-        _streamer.MoveNext(); // ;
-        var type = _detector.GetOperationType(operation);
-        switch (type)
-        {
-            case OperationType.ASSIGNATION:
-                // F-G-08 pass 5: reuse the HashSet stashed by SyntetizeBehaviour.
-                // Fallback to on-demand build for any legacy caller that
-                // invokes SyntetizeAssingations directly (defensive; the only
-                // production caller is SyntetizeBehaviour, which sets the field).
-                var variables = _assignmentVariables ?? [.. _ports, .. _signals, .. _generics];
-
-                // Phase B+ Deep AST: capture the operation's 1-based source
-                // line. Use the assignment-operator's line specifically — it
-                // sits on the actual `<=` statement no matter how the RHS
-                // wraps — falling back to the streamer cursor (post-`;`) only
-                // when we couldn't find the `<=` token in the rawDataBuilder.
-                var assignLine = _streamer.Current?.Line ?? 0;
-
-                // Check for conditional assignment (when...else pattern)
-                if (operation.Contains("when", StringComparison.OrdinalIgnoreCase))
-                {
-                    var condAssign = ConditionalAssignment.TryParse(operation, variables, assignLine);
-                    if (condAssign != null)
-                    {
-                        Tasks.Add(condAssign);
-                        break;
-                    }
-                }
-
-                // Regular assignment
-                Operation op = new(operation, variables, sourceLine: assignLine, isAssignmentStatement: true);
-                Tasks.Add(op);
-                break;
-        }
+        // F-G-08 pass 5: reuse the HashSet stashed by SyntetizeBehaviour.
+        var variables = _assignmentVariables ?? [.. _ports, .. _signals, .. _generics];
+        Tasks.Add(ConcurrentStatements.AssignmentTask($"{st.Target} {st.Operator} {rhs}".Trim(), variables, st.First.SourceLine));
     }
 
 }
