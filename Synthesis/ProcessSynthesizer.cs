@@ -308,6 +308,11 @@ internal static class ProcessSynthesizer
         // bare conditions; ignore those — they're never real
         // assignments to a named signal.
         if (op.Result.Name.StartsWith("Condition", StringComparison.OrdinalIgnoreCase)) return;
+        if (op.AggregateTarget is not null)
+        {
+            ctx.AddDiagnostic("Unsupported", Synthesizer.AggregateTargetNote);
+            return;
+        }
 
         var part = ConcurrentAssignSynthesizer.PartTargetNet(op.Target, ctx);
         int width = part?.Width ?? (op.Result.Type == Constants.DATATYPES.STD_LOGIC_VECTOR
@@ -660,6 +665,7 @@ internal static class ProcessSynthesizer
                 {
                     case Operation op when op.Result?.Name is { Length: > 0 } name
                                          && !name.StartsWith("Condition", StringComparison.OrdinalIgnoreCase)
+                                         && op.AggregateTarget is null
                                          && scope.Contains(op.Result):
                         var q = ConcurrentAssignSynthesizer.PartTargetNet(op.Target, ctx) ?? NetForLhs(op.Result, ctx);
                         driven.TryAdd(q.Name, q);
@@ -867,7 +873,8 @@ internal static class ProcessSynthesizer
             switch (t)
             {
                 case Operation op when op.Result?.Name is { Length: > 0 } name
-                                     && !name.StartsWith("Condition", StringComparison.Ordinal):
+                                     && !name.StartsWith("Condition", StringComparison.Ordinal)
+                                     && op.AggregateTarget is null:
                     if (seen.Add(name))
                     {
                         int w = op.Result.Type == Constants.DATATYPES.STD_LOGIC_VECTOR

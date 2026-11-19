@@ -16,6 +16,7 @@ internal static class SelectedAssignSynthesizer
     {
         // See ConditionalAssignSynthesizer — Variable's `==` overloads
         // need to be sidestepped via pattern matching.
+        if (sa.HasAggregateTarget) ctx.AddDiagnostic("Unsupported", Synthesizer.AggregateTargetNote);
         if (sa.Target is null || sa.Choices.Count == 0) return;
 
         var outNet = ConcurrentAssignSynthesizer.TargetNet(sa.Destination, sa.Target, ctx);

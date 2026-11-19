@@ -135,7 +135,8 @@ public static class ParseTrace
         for (int i = 0; i < tokens.Count; i++)
         {
             var t = tokens[i];
-            if (t == "&") continue;
+            // `a & b` concatenates: the operands are joined without a blank, as GHDL prints them.
+            if (t == "&") { needSpace = false; continue; }
 
             // F-G-15+ (2026-07-18): to_string / to_hstring / to_bstring
             // formatter calls. Same pattern matcher, different output
@@ -153,14 +154,16 @@ public static class ParseTrace
                 continue;
             }
 
-            // Single-token full string literal: `"whole thing"`.
+            // A string literal token (the tokenizer keeps it whole, G56): its text,
+            // with `""` unescaped.
             if (t.Length >= 2 && t.StartsWith('"') && t.EndsWith('"'))
             {
-                Append(t.Substring(1, t.Length - 2));
+                Append(t.Substring(1, t.Length - 2).Replace("\"\"", "\""));
                 continue;
             }
 
-            // Fragmented string literal opener: `"foo` with no matching close.
+            // Fragmented string literal opener: `"foo` with no matching close — only
+            // from callers that re-split joined text on blanks (procedure BodyRaw).
             if (t.StartsWith('"'))
             {
                 var frag = new System.Text.StringBuilder(t.Substring(1));

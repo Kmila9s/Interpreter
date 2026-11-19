@@ -12,6 +12,9 @@ namespace Interpreter.Synthesis;
 /// </summary>
 public static class Synthesizer
 {
+    /// <summary>Diagnostic for an aggregate assignment target <c>(a, b) &lt;= …</c> (simulated, not synthesised yet).</summary>
+    internal const string AggregateTargetNote = "Aggregate assignment target (a, b) <= … not yet synthesised.";
+
     /// <summary>
     /// Synthesise the entity's first architecture into a gate-level
     /// netlist. Each architecture task (concurrent assign, conditional,
@@ -46,6 +49,9 @@ public static class Synthesizer
             {
                 switch (task)
                 {
+                    case Operation { AggregateTarget: not null }:
+                        ctx.AddDiagnostic("Unsupported", AggregateTargetNote);
+                        break;
                     case Operation op:
                         ConcurrentAssignSynthesizer.Synthesize(op, ctx);
                         break;

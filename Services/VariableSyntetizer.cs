@@ -139,6 +139,13 @@ public class VariableSyntetizer : ISControl
                 SkipComponentDeclaration();
                 continue;
             }
+            // Configuration specification `for (u|all|others) : c use …;` (G19): it
+            // binds instances (the elaborator applies it) and declares no object.
+            if (_streamer.Current?.Value?.ToLower() == "for")
+            {
+                SkipToSemicolon();
+                continue;
+            }
             // Skip type declarations
             if (_streamer.Current?.Value?.ToLower() == "type")
             {

@@ -53,10 +53,10 @@ public sealed class TextioCall : ISControl
             return new TextioCall(name, LineVariable(args[1][0], scope), null, null);
         }
         var value = args[1];
-        if (value.Any(t => t.Value.Contains('"')))
+        if (value.Any(t => t.IsStringLiteral))
         {
-            // string'("…") or "…": the shared report renderer rebuilds the literal.
-            var literal = value.SkipWhile(t => !t.Value.Contains('"')).Select(t => t.Value).ToList();
+            // string'("…") or "…" [& …]: rendered once by the shared report renderer.
+            var literal = value.SkipWhile(t => !t.IsStringLiteral).Select(t => t.Value).ToList();
             if (literal.Count > 0 && literal[^1] == ")") literal.RemoveAt(literal.Count - 1);
             return new TextioCall(name, LineVariable(args[0][0], scope), ParseTrace.RenderReportTokens(literal, scope), null);
         }

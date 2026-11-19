@@ -71,8 +71,8 @@ public sealed record SimpleStatement(Token First, string Target, string? Operato
 
         if (first.Value == "(")
         {
-            // VHDL-2008 aggregate target `(a, b) <= …` (G55).
-            throw new ParserException("aggregate assignment targets are not supported yet", first);
+            // Aggregate target `(a, b) <= …` (G55); its elements are resolved by Operation.
+            AppendBalanced(stream, target);
         }
         else if (first.Type == IDENTIFIERS || first.Type == QUALIFIED_IDENTIFIERS)
         {
@@ -161,7 +161,7 @@ public sealed record SimpleStatement(Token First, string Target, string? Operato
                 ?? throw new ParserException(
                     $"Unexpected end of input in the assignment to '{first.Value}' — missing ';'?", stream.Previous);
             // Stray UNKNOWN tokens (`$`, pasted mojibake) are never valid VHDL.
-            if (cur.Type == UNKNOWN && !(cur.IsFieldSelector && stream.Previous?.Value == ")") && !IsQualifierMark(cur.Value))
+            if (cur.Type == UNKNOWN && !Token.IsQualifierMarkText(cur.Value))
                 throw new ParserException(
                     $"Unexpected token '{cur.Value}' inside the statement — not a valid VHDL identifier, keyword, operator, or literal", cur);
             if (depth == 0 && cur.Type == KEYWORDS && StatementWords.Contains(cur.Value))
@@ -186,11 +186,6 @@ public sealed record SimpleStatement(Token First, string Target, string? Operato
         }
         return (rhs.ToString().Trim(), topLevelWhen);
     }
-
-    /// <summary>The <c>type'</c> mark of a qualified expression (<c>bit_vector'(…)</c>).</summary>
-    private static bool IsQualifierMark(string value) =>
-        value.Length > 1 && value[^1] == '\'' && (char.IsLetter(value[0]) || value[0] == '_')
-        && value[..^1].All(c => char.IsLetterOrDigit(c) || c == '_');
 
     /// <summary>Appends a balanced parenthesised group (stream on its <c>(</c>).</summary>
     private static void AppendBalanced(TokenStream stream, List<Token> into)
@@ -217,17 +212,12 @@ public sealed record SimpleStatement(Token First, string Target, string? Operato
         if (TargetTokens.Count < 3 || TargetTokens[1].Value != "(") return args;
         var current = new List<Token>();
         int depth = 0;
-        bool inString = false; // the tokenizer splits a string literal on blanks and commas
         for (int i = 2; i < TargetTokens.Count - 1; i++)
         {
             var t = TargetTokens[i];
-            if (t.Value.Count(c => c == '"') % 2 == 1) inString = !inString;
-            if (!inString)
-            {
-                if (t.Value == "(") depth++;
-                else if (t.Value == ")") depth--;
-                else if (depth == 0 && t.Value == ",") { args.Add(current); current = []; continue; }
-            }
+            if (t.Value == "(") depth++;
+            else if (t.Value == ")") depth--;
+            else if (depth == 0 && t.Value == ",") { args.Add(current); current = []; continue; }
             current.Add(t);
         }
         args.Add(current);

@@ -25,11 +25,21 @@ internal sealed class BranchTarget<TBranch> where TBranch : notnull
     /// <summary>The target resolved; null when undeclared.</summary>
     public AssignmentTarget? Destination { get; private set; }
 
+    /// <summary>The aggregate target <c>(a, b)</c> of declared objects (G55); null for a name target.</summary>
+    public AggregateTarget? Aggregate { get; private set; }
+
+    /// <summary>True for an aggregate target.</summary>
+    public bool IsAggregate => Aggregate is not null;
+
+    /// <summary>True when the target is a declared object or an aggregate of them.</summary>
+    public bool IsDeclared => Destination is not null || IsAggregate;
+
     /// <summary>Records and resolves the target.</summary>
     public void Set(string text)
     {
         Text = text.Trim();
         Destination = AssignmentTarget.Resolve(Text, _scope);
+        Aggregate = Destination is null ? AggregateTarget.TryParse(Text, _scope, 0) : null;
     }
 
     /// <summary>
@@ -39,6 +49,11 @@ internal sealed class BranchTarget<TBranch> where TBranch : notnull
     /// </summary>
     public void Read(TokenStream streamer)
     {
+        if (streamer.Current?.Value == "(")
+        {
+            Set($"({ParseTrace.ReadParenthesized(streamer)})");   // aggregate target (G55)
+            return;
+        }
         if (streamer.Current?.Type != Constants.TYPE.IDENTIFIERS) return;
         string name = streamer.Current.Value;
         streamer.MoveNext();

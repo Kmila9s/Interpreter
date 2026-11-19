@@ -67,23 +67,17 @@ public sealed class ReportStatement : ISControl
 
         _streamer.Expect(Constants.TYPE.KEYWORDS); // consume 'report'
 
-        // Track whether we're inside a string literal — the tokenizer
-        // splits `"a; b"` on whitespace, so a `;` inside the literal
-        // arrives as its own token and would prematurely terminate the
-        // walk. Same fix shape as F-G-09's SplitArchitecture masking.
+        // String literals are single tokens (G56), so a `;` or `severity`
+        // inside one never ends the walk.
         var raw = new StringBuilder();
-        bool insideString = false;
         while (_streamer.Current != null)
         {
             var val = _streamer.Current.Value;
-
-            if (!insideString && val == ";") break;
-
-            var low = val.ToLowerInvariant();
+            if (val == ";") break;
 
             // Stop capturing at 'severity' but still consume its token +
             // level identifier so the ';' termination stays intact.
-            if (!insideString && low == "severity")
+            if (val.Equals("severity", StringComparison.OrdinalIgnoreCase))
             {
                 _streamer.MoveNext(); // 'severity'
                 if (_streamer.Current != null && _streamer.Current.Value != ";")
@@ -93,11 +87,6 @@ public sealed class ReportStatement : ISControl
                 }
                 continue;
             }
-
-            // Toggle insideString on any token with an unmatched `"`.
-            int quoteCount = 0;
-            foreach (var c in val) if (c == '"') quoteCount++;
-            if (quoteCount % 2 == 1) insideString = !insideString;
 
             _tokens.Add(val);
             raw.Append(val).Append(' ');

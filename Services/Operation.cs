@@ -129,6 +129,9 @@ public class Operation : IOperation {
     /// </summary>
     public bool IsVariableAssignment { get; private set; }
 
+    /// <summary>The aggregate target of <c>(a, b) &lt;= value</c> (G55); null for any other assignment.</summary>
+    public AggregateTarget? AggregateTarget { get; private set; }
+
     /// <summary>
     /// Initializes a new instance of the <see cref="Operation"/> class.
     /// </summary>
@@ -157,10 +160,11 @@ public class Operation : IOperation {
             if (splitted.Length >= 2)
             {
                 string varName = splitted[0].Trim();
-                Target = AssignmentTarget.Resolve(varName, this.Variables);
+                AggregateTarget = AggregateTarget.TryParse(varName, this.Variables, SourceLine);
+                Target = AggregateTarget is null ? AssignmentTarget.Resolve(varName, this.Variables) : null;
                 if (Target?.Path.FieldError is { } fieldError)
                     throw new Parser.Models.ParserException(fieldError, SourceLine, 0, varName);
-                var foundVar = Target?.Base;
+                var foundVar = Target?.Base ?? AggregateTarget?.Elements[0].Base;
 
                 if (foundVar is null)
                 {
@@ -205,13 +209,14 @@ public class Operation : IOperation {
         // isAssignmentStatement (set only by the concurrent/process assignment
         // statement parsers) because the ctor also splits a comparison like
         // `if din <= x` on `<=`, and `din` may legitimately be an input port read.
-        if (isAssignmentStatement &&
-            Result is { IsPort: true, PortType: Constants.PortType.IN })
+        if (isAssignmentStatement)
         {
-            throw ResultError($"cannot assign to input port \"{Result.Name}\"");
+            foreach (var written in WrittenObjects)
+                if (written is { IsPort: true, PortType: Constants.PortType.IN })
+                    throw ResultError($"cannot assign to input port \"{written.Name}\"");
         }
 
-        _data = tokenizer.TokenizeLineReturn(RawData);
+        _data = DropQualifierMarks(tokenizer.TokenizeLineReturn(RawData));
         var syntetized = Syntetize().ToList();
 #if DEBUG_OPERATION
         Console.WriteLine($"[DEBUG Operation] RawData: '{RawData}'");
@@ -230,8 +235,12 @@ public class Operation : IOperation {
         // (gated like C8 so comparisons are never mistaken for assignments).
         if (isAssignmentStatement)
         {
-            ValidatePartialTarget();
-            ValidateAssignmentTypeWidth();
+            if (AggregateTarget is null)
+            {
+                ValidatePartialTarget();
+                ValidateAssignmentTypeWidth();
+            }
+            else ValidateAggregateTargetWidth();
         }
 
         if (_profileStopwatch != null)
@@ -359,7 +368,8 @@ public class Operation : IOperation {
     {
         EnsureWritable();
         var value = Evaluate();
-        if (Target is { IsPartial: true } part) part.Assign(null, value, SourceLine, 0, immediate: true);
+        if (AggregateTarget is { } aggregate) aggregate.Assign(null, value, SourceLine, 0, immediate: true);
+        else if (Target is { IsPartial: true } part) part.Assign(null, value, SourceLine, 0, immediate: true);
         else Result.Value = value;
         return Result;
     }
@@ -1221,6 +1231,40 @@ public class Operation : IOperation {
     }
 
     /// <summary>
+    /// A qualified expression <c>T'(e)</c> has the value of <c>(e)</c>: the
+    /// type mark only fixes the type GHDL resolves the expression to, so the
+    /// mark is dropped and the parenthesised operand kept.
+    /// </summary>
+    private static string[] DropQualifierMarks(string[] tokens)
+    {
+        if (!tokens.Any(Parser.Models.Token.IsQualifierMarkText)) return tokens;
+        var kept = new List<string>(tokens.Length);
+        for (int i = 0; i < tokens.Length; i++)
+            if (!(Parser.Models.Token.IsQualifierMarkText(tokens[i]) && i + 1 < tokens.Length && tokens[i + 1] == "("))
+                kept.Add(tokens[i]);
+        return [.. kept];
+    }
+
+    /// <summary>
+    /// The objects this assignment writes: the target's object, every element of an
+    /// aggregate target, or nothing for a condition.
+    /// </summary>
+    public IEnumerable<Variable> WrittenObjects =>
+        AggregateTarget is { } aggregate ? aggregate.Elements.Select(e => e.Base)
+        : Result is null ? [] : [Result];
+
+    /// <summary>
+    /// G55: an aggregate target takes a value of exactly its total width when
+    /// both widths are certain (GHDL rejects the mismatch at analysis).
+    /// </summary>
+    private void ValidateAggregateTargetWidth()
+    {
+        if (AggregateTarget?.StaticWidth(Variables) is int targetWidth
+            && ExpressionWidthInference.TryComputeWidth(RawRhs, Variables) is int w && w != targetWidth)
+            throw ResultError($"width mismatch: {targetWidth}-bit aggregate target assigned a {w}-bit value");
+    }
+
+    /// <summary>
     /// G17/G49 (v3.1.1): a part target with literal indices must lie inside
     /// its object, and a range target takes a value of exactly its width
     /// when that width is certain (as GHDL checks).
@@ -1665,7 +1709,7 @@ public class Operation : IOperation {
         Variable? shape = items.Count >= 2 && items[^1] is Operator && items[^2] is Variable partner
                           && (partner.Layout != null || partner.ElementSize > 1)
             ? partner
-            : Target?.Path.StaticShape ?? Result;
+            : AggregateTarget is not null ? null : Target?.Path.StaticShape ?? Result;
         bool othersOnly = _data[open + 1].Equals("others", StringComparison.OrdinalIgnoreCase)
                           && !inner.Contains(',');
         if (othersOnly && shape?.Layout == null) return null;

@@ -76,6 +76,9 @@ public class SelectedAssignment : ISControl
     /// <summary>The written target resolved (whole, or the bit/range written); null when undeclared.</summary>
     public AssignmentTarget? Destination => _target.Destination;
 
+    /// <summary>True for an aggregate target <c>(a, b) &lt;= …</c> (G55).</summary>
+    public bool HasAggregateTarget => _target.IsAggregate;
+
     /// <summary>
     /// Gets the list of selection choices.
     /// </summary>
@@ -122,7 +125,7 @@ public class SelectedAssignment : ISControl
     /// </summary>
     public Task ExecuteAsync(Services.SignalScheduler? scheduler)
     {
-        if (Target is null || string.IsNullOrEmpty(SelectorExpression) || Choices.Count == 0)
+        if (!_target.IsDeclared || string.IsNullOrEmpty(SelectorExpression) || Choices.Count == 0)
             return Task.CompletedTask;
 
         _selector ??= new Operation(SelectorExpression, _variables);
