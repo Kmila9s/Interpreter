@@ -55,6 +55,7 @@ internal sealed class ArchRecord
     public string File { get; init; } = string.Empty;
     public long Order { get; init; }                          // (file index, offset) in analysis order
     public string Header { get; init; } = string.Empty;       // library/use (and packages) above it in its file
+    public string Context { get; init; } = string.Empty;      // its own context clause (since the previous unit's end)
     public string Text { get; init; } = string.Empty;         // `architecture … end …;`
     public string DeclPart { get; init; } = string.Empty;     // between `is` and `begin`, without component declarations / configuration specifications
     public string Body { get; init; } = string.Empty;         // between `begin` and the closing `end`
@@ -68,6 +69,7 @@ internal sealed class EntityRecord
     public string Name { get; init; } = string.Empty;
     public string File { get; init; } = string.Empty;
     public string Header { get; init; } = string.Empty;       // library/use clauses above the entity
+    public string Context { get; init; } = string.Empty;      // its own context clause (since the previous unit's end)
     public string EntityText { get; init; } = string.Empty;   // `entity X is … end …;`
     public List<string> Ports { get; init; } = new();         // lowercased
     public List<string> Generics { get; init; } = new();      // lowercased
@@ -191,6 +193,19 @@ internal sealed class DesignLibrary
         RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Multiline);
 
 
+    /// <summary>
+    /// The context clause of the unit starting at <paramref name="index"/>: the text
+    /// since the previous unit's closing <c>end …;</c> (a <c>use</c> applies only to
+    /// the unit right after it).
+    /// </summary>
+    private static string ContextBefore(string text, int index)
+    {
+        var ends = UnitEndRe.Matches(text[..index]);
+        return ends.Count == 0 ? text[..index] : text[(ends[^1].Index + ends[^1].Length)..index];
+    }
+
+    private static readonly Regex UnitEndRe = new(@"\bend\b[^;]*;", RegexOptions.IgnoreCase);
+
     private void AddEntities(string file, string text)
     {
         var first = EntityRe.Match(text);
@@ -203,6 +218,7 @@ internal sealed class DesignLibrary
                 Name = em.Groups["name"].Value,
                 File = file,
                 Header = header,
+                Context = ContextBefore(text, em.Index),
                 EntityText = em.Value,
                 Ports = Names(VhdlUnitText.ExtractParenBlockAfter(body, VhdlUnitText.PortStartRe)),
                 Generics = Names(VhdlUnitText.ExtractParenBlockAfter(body, VhdlUnitText.GenericStartRe)),
@@ -258,6 +274,7 @@ internal sealed class DesignLibrary
                 File = file,
                 Order = ((long)fileIndex << 32) | (uint)am.Index,
                 Header = header,
+                Context = ContextBefore(text, am.Index),
                 Text = text[am.Index..endIdx],
                 DeclPart = decl,
                 Body = body,

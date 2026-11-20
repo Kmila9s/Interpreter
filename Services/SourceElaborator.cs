@@ -46,6 +46,7 @@ public sealed partial class SourceElaborator
 
         var generics = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         ExtractGenericDefaults(generics, top.EntityText);
+        PackageRegistry.Instance.RegisterUnitArithmetic(string.Empty, top.Context + "\n" + arch.Context);
         var (decl, body, _) = Inline(arch.DeclPart, arch.Body, arch.Specs, block, lib, generics, depth: 0, pathPrefix: string.Empty);
 
         var sb = new StringBuilder();
@@ -229,6 +230,8 @@ public sealed partial class SourceElaborator
             // F-G-06 sibling-collision fix: the caller's path prefix composes into
             // the alias prefix (`u1__u_scan__foo` / `u2__u_scan__foo`).
             string aliasPrefix = $"{pathPrefix}{label}__";
+            // The numeric package the child's own context clause selects (std_logic_signed…).
+            PackageRegistry.Instance.RegisterUnitArithmetic(aliasPrefix, child.Context + "\n" + childArch.Context);
             // A formal written with selectors (`p.lo => a`, `v(0) => b`) renames
             // and declares its base port once; each association wires its part.
             // An input left `open` or not associated takes its default (LRM 6.5.6.3): its

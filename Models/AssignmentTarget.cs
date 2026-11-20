@@ -106,11 +106,28 @@ public sealed partial class AssignmentTarget
     private bool TryEncode(ref object value, out (int Start, int Width)? span)
     {
         span = null;
-        if (!IsPartial) return true;
+        if (!IsPartial) { CheckBounds(value); return true; }
         if (Path.Resolve() is not { } at) return false;
         span = (at.Start, at.Width);
         value = at.Field is { } field ? FieldCodec.Encode(field, value) : FieldCodec.LogicBits(value, at.Width);
         return true;
+    }
+
+    /// <summary>
+    /// GHDL's <c>bound check failure</c> for a whole-object write: an integer outside
+    /// its subtype's range (<c>natural</c>, <c>range 0 to 9</c>; the base type
+    /// <c>integer</c> itself wraps, unchecked), or a logic vector of another length.
+    /// </summary>
+    private void CheckBounds(object value)
+    {
+        var b = Base;
+        if (b.ScalarRange is { } range && Operator.TryInteger(new Variable { Value = value }, out var n)
+            && (n < range.Low || n > range.High))
+            throw new SimulationRuntimeException("bound check failure");
+        if (b.Type == Constants.DATATYPES.STD_LOGIC_VECTOR && b.Size > 0 && b.Layout is null && b.ElementSize == 0
+            && value is string bits && bits.Length != b.Size && bits.Length > 0 && StdLogic.IsVector(bits)
+            && !HdlLiteral.TryOthersFill(bits, out _))
+            throw new SimulationRuntimeException("bound check failure");
     }
 
     private void Write(object value, (int Start, int Width)? span) =>

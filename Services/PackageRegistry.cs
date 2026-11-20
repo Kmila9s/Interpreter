@@ -59,6 +59,60 @@ public class PackageRegistry
     private readonly HashSet<string> _declaredNames = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// How <c>std_logic_vector</c> operands read as numbers in arithmetic and
+    /// relational operators: the package the design's <c>use</c> clauses make
+    /// visible — <c>std_logic_signed</c> (signed), <c>std_logic_unsigned</c> /
+    /// <c>numeric_std_unsigned</c> (unsigned, also the default). <c>signed</c> and
+    /// <c>unsigned</c> operands always follow their own type.
+    /// </summary>
+    public Signedness VectorArithmetic { get; private set; } = Signedness.Unsigned;
+
+    /// <summary>Instance prefix (<c>u1__</c>; empty for the top) → vector arithmetic of the unit inlined there.</summary>
+    private readonly Dictionary<string, Signedness> _unitArithmetic = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The numeric package the <c>use</c> clauses of <paramref name="context"/> make
+    /// visible for std_logic_vector — the last one written, as a context clause
+    /// applies to the unit right after it — or null when there is none.
+    /// </summary>
+    public static Signedness? ArithmeticOf(string context)
+    {
+        var matches = System.Text.RegularExpressions.Regex.Matches(VhdlText.StripLineComments(context ?? string.Empty),
+            @"\buse\s+ieee\s*\.\s*(std_logic_signed|std_logic_unsigned|numeric_std_unsigned)\b",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (matches.Count == 0) return null;
+        return matches[^1].Groups[1].Value.Equals("std_logic_signed", StringComparison.OrdinalIgnoreCase)
+            ? Signedness.Signed : Signedness.Unsigned;
+    }
+
+    /// <summary>Records the numeric package of a design source's <c>use</c> clauses as the default (<see cref="VectorArithmetic"/>).</summary>
+    public void RegisterContextClauses(string source)
+    {
+        if (ArithmeticOf(source) is { } s) VectorArithmetic = s;
+    }
+
+    /// <summary>Records the vector arithmetic of the unit inlined under <paramref name="prefix"/> (its context clause <paramref name="context"/>).</summary>
+    public void RegisterUnitArithmetic(string prefix, string context) =>
+        _unitArithmetic[prefix] = ArithmeticOf(context) ?? Signedness.Unsigned;
+
+    /// <summary>
+    /// How a std_logic_vector object named <paramref name="name"/> reads as a number:
+    /// the package of the unit it belongs to (longest instance prefix), else the default.
+    /// </summary>
+    public Signedness ArithmeticFor(string? name)
+    {
+        string best = string.Empty;
+        Signedness? found = null;
+        foreach (var (prefix, s) in _unitArithmetic)
+            if ((name ?? string.Empty).StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && prefix.Length >= best.Length)
+            {
+                best = prefix;
+                found = s;
+            }
+        return found ?? VectorArithmetic;
+    }
+
+    /// <summary>
     /// Gets all registered packages.
     /// </summary>
     public IReadOnlyDictionary<string, PackageDefinition> Packages => _packages;
@@ -302,6 +356,8 @@ public class PackageRegistry
         _globalFunctions.Clear();
         _globalProcedures.Clear();
         _declaredNames.Clear();
+        VectorArithmetic = Signedness.Unsigned;
+        _unitArithmetic.Clear();
     }
 
     /// <summary>

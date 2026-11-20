@@ -285,7 +285,7 @@ public class Operation : IOperation, IConcurrentStatement {
     /// as <c>0 - term</c> / <c>0 + term</c> (<c>a &lt;= -7;</c>, <c>x := -n * 2;</c>). A logical
     /// operator in that position is a VHDL-2008 unary reduction (<c>and v</c>).
     /// </summary>
-    private static List<object> WithUnarySigns(List<object> items)
+    internal static List<object> WithUnarySigns(List<object> items)
     {
         var result = new List<object>(items.Count + 1);
         foreach (var item in items)
@@ -309,17 +309,26 @@ public class Operation : IOperation, IConcurrentStatement {
     /// writing anything. Shared by <see cref="Execute"/> and
     /// <see cref="ScheduledOperation.Run"/>.
     /// </summary>
-    public object Evaluate()
+    public object Evaluate() => EvaluateResult().Value!;
+
+    /// <summary><see cref="Evaluate"/> with the result's type, width and type mark.</summary>
+    public Variable EvaluateResult()
     {
-        try { return EvaluateItems(); }
+        try { return EvaluateRpn(Items, RawData, Result?.Name); }
         catch (SimulationRuntimeException e) { throw e.At(SourceLine); }
     }
 
-    private object EvaluateItems()
+    /// <summary>
+    /// Evaluates an expression in postfix order (<see cref="ShuntingYard"/>) against
+    /// its operands' current values: the single expression evaluator, shared by
+    /// assignments, conditions and function arguments (<see cref="Models.DeferredExpression"/>).
+    /// The result carries its type, width and type mark (signed/unsigned).
+    /// </summary>
+    internal static Variable EvaluateRpn(IEnumerable<object> items, string expression, string? target = null)
     {
         Stack<Variable> variables = new();
 
-        foreach(var item in Items){
+        foreach(var item in items){
             if(item is Variable newVar){
                 variables.Push(newVar);
             }
@@ -359,6 +368,9 @@ public class Operation : IOperation, IConcurrentStatement {
             else if(item is Models.IDeferredOperand deferred){
                 variables.Push(deferred.Evaluate());
             }
+            else if(item is Models.DeferredExpression nested){
+                variables.Push(nested.Evaluate());
+            }
             else if(item is Operator op){
                 // Only treat as unary NOT if it's actually a logic operation with NOT precedence
                 // v0.13.0 Fix: Added type check to prevent ** (power) operator from being treated as NOT
@@ -370,11 +382,13 @@ public class Operation : IOperation, IConcurrentStatement {
 
                 if(isUnaryNot){
                     var value = variables.Pop();
-                    variables.Push(new("Temp", op.Execute(value), value.Type));
+                    variables.Push(Shaped(new("Temp", op.Execute(value), value.Type), value.TypeMark));
                 } else {
                     var right = variables.Pop();
                     var left = variables.Pop();
                     Variable vari = new("Temp", op.Execute(left, right), left.Type);
+                    if (op.OperatorType == Constants.OperatorType.ARITH_OPERATION && vari.Value is string)
+                        vari.Type = Constants.DATATYPES.STD_LOGIC_VECTOR;   // integer op vector is a vector
                     if (op.OperatorType == Constants.OperatorType.COMPARATION)
                     {
                         vari.IsPort = false;
@@ -404,14 +418,36 @@ public class Operation : IOperation, IConcurrentStatement {
                         vari.Type = text ? Constants.DATATYPES.STRING : Constants.DATATYPES.STD_LOGIC_VECTOR;
                         if (vari.Value is string concat) vari.Size = concat.Length;
                     }
-                    variables.Push(vari);
+                    variables.Push(Shaped(vari, ResultMark(left, right)));
                 }
             }
         }
         if (variables.Count != 1)
             throw new InvalidOperationException(
-                $"Malformed expression: stack not reduced to a single result ({variables.Count} items left). RHS=`{RawData}` Target=`{Result?.Name}`");
-        return variables.Pop().Value;
+                $"Malformed expression: stack not reduced to a single result ({variables.Count} items left). RHS=`{expression}` Target=`{target}`");
+        return variables.Pop();
+    }
+
+    /// <summary>A vector result's width is its length; its type mark is <paramref name="mark"/>.</summary>
+    private static Variable Shaped(Variable v, string? mark)
+    {
+        if (v.Type == Constants.DATATYPES.STD_LOGIC_VECTOR && v.Value is string bits) v.Size = bits.Length;
+        v.TypeMark = mark;
+        return v;
+    }
+
+    /// <summary>
+    /// The type mark of a binary result: <c>signed</c> when an operand is signed,
+    /// else <c>unsigned</c> when one is unsigned (numeric_std overload resolution),
+    /// else the left operand's.
+    /// </summary>
+    private static string? ResultMark(Variable left, Variable right)
+    {
+        var l = TypeMarks.SignednessOf(left.TypeMark);
+        var r = TypeMarks.SignednessOf(right.TypeMark);
+        if (l == Signedness.Signed || r == Signedness.Signed) return "signed";
+        if (l == Signedness.Unsigned || r == Signedness.Unsigned) return "unsigned";
+        return left.TypeMark ?? right.TypeMark;
     }
 
     /// <summary>The target must be writable: VHDL forbids assigning an input port.</summary>
@@ -575,8 +611,11 @@ public class Operation : IOperation, IConcurrentStatement {
             else if (_finder.IsLiteral(currentItem))
             {
                 Constants.DATATYPES type = _finder.GetDataType(currentItem);
+                // A based bit-string literal (x"0F", o"7", b"01") stands for its bits.
+                object literal = currentItem.Length > 2 && currentItem[1] == '"' && HdlLiteral.TryBits(currentItem, out string based)
+                    ? based : currentItem;
                 // v0.17.0: Use atomic counter instead of expensive Guid.NewGuid()
-                item = new Variable($"Literal-{Interlocked.Increment(ref _literalCounter)}", currentItem, type) { IsConstant = true };
+                item = new Variable($"Literal-{Interlocked.Increment(ref _literalCounter)}", literal, type) { IsConstant = true };
             }
             else if (_variableRegex.IsMatch(currentItem))
             {
@@ -931,37 +970,9 @@ public class Operation : IOperation, IConcurrentStatement {
             }
         }
 
-        // Determine result type
-        Constants.DATATYPES resultType = functionName switch
-        {
-            "rising_edge" or "falling_edge" => Constants.DATATYPES.BOOLEAN,
-            "to_integer" or "conv_integer" => Constants.DATATYPES.INTEGER,
-            _ => Constants.DATATYPES.STD_LOGIC_VECTOR
-        };
-
-        // v0.17.0 Fix: For edge detection functions, defer evaluation until execution time
-        // These functions depend on the current simulation state which isn't available at parse time
         if (Models.DeferredFunction.ShouldDefer(functionName))
-        {
-            return (true, new Models.DeferredFunction(functionName, args.ToArray(), resultType, Variables));
-        }
-
-        // Evaluate the function immediately for other functions
-        object result = StandardFunctions.EvaluateFunction(functionName, args.ToArray(), Variables);
-
-        // v0.17.0 Fix: Preserve actual boolean value instead of converting to string
-        object resultValue = resultType == Constants.DATATYPES.BOOLEAN
-            ? (result ?? false)
-            : (result?.ToString() ?? "false");
-
-        var resultVar = new Variable(
-            $"Function-{functionName}",
-            resultValue,
-            resultType
-        );
-        resultVar.PortType = Constants.PortType.OUT;
-
-        return (true, resultVar);
+            return (true, new Models.DeferredFunction(functionName, args.ToArray(), StandardFunctions.ResultType(functionName, args), Variables));
+        return (true, StandardFunctions.Result(functionName, StandardFunctions.EvaluateFunction(functionName, args.ToArray(), Variables), args));
     }
 
     /// <summary>
@@ -1105,7 +1116,7 @@ public class Operation : IOperation, IConcurrentStatement {
                 {
                     argBuffer.Add(intVal);
                 }
-                else if (_arithOperators.IsMatch(token) || _logicOperators.IsMatch(token.ToLower()))
+                else if (token == "&" || _arithOperators.IsMatch(token) || _logicOperators.IsMatch(token.ToLower()))
                 {
                     // Binary / unary operator inside a function-call argument.
                     // Recording it as an Operator (not a bare string) lets
@@ -1125,40 +1136,10 @@ public class Operation : IOperation, IConcurrentStatement {
         }
         FlushArg();
 
-        // Determine result type
-        Constants.DATATYPES resultType = functionName.ToLower() switch
-        {
-            "rising_edge" or "falling_edge" or "is_x" or "std_match" => Constants.DATATYPES.BOOLEAN,
-            "to_integer" or "conv_integer" or "clog2" => Constants.DATATYPES.INTEGER,
-            "to_x01" or "to_x01z" or "to_ux01" when args.FirstOrDefault() is Variable { Type: Constants.DATATYPES.STD_LOGIC } =>
-                Constants.DATATYPES.STD_LOGIC,
-            "to_stdulogic" => Constants.DATATYPES.STD_LOGIC,
-            "to_bit" => Constants.DATATYPES.BIT,
-            _ => Constants.DATATYPES.STD_LOGIC_VECTOR
-        };
-
-        // v0.17.0 Fix: For edge detection functions, defer evaluation until execution time
+        // v0.17.0: functions read while simulating (edges, conversions of live values) are deferred.
         if (Models.DeferredFunction.ShouldDefer(functionName))
-        {
-            return (true, new Models.DeferredFunction(functionName, args.ToArray(), resultType, Variables));
-        }
-
-        // Evaluate the function immediately for other functions
-        object result = StandardFunctions.EvaluateFunction(functionName, args.ToArray(), Variables);
-
-        // v0.17.0 Fix: Preserve actual boolean value instead of converting to string
-        object resultValue = resultType == Constants.DATATYPES.BOOLEAN
-            ? (result ?? false)
-            : (result?.ToString() ?? "false");
-
-        var resultVar = new Variable(
-            $"Function-{functionName}",
-            resultValue,
-            resultType
-        );
-        resultVar.PortType = Constants.PortType.OUT;
-
-        return (true, resultVar);
+            return (true, new Models.DeferredFunction(functionName, args.ToArray(), StandardFunctions.ResultType(functionName, args), Variables));
+        return (true, StandardFunctions.Result(functionName, StandardFunctions.EvaluateFunction(functionName, args.ToArray(), Variables), args));
     }
 
     // Reduce a buffered function-call argument (mix of Variables,

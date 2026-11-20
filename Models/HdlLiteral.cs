@@ -14,19 +14,15 @@ public static class HdlLiteral
     public const string OthersMarker = "(others=>";
 
     /// <summary>
-    /// Parses a bit string (all <c>0</c>/<c>1</c>, read as binary), a decimal
-    /// integer or a hex literal (<c>0x…</c>, <c>x…</c>); false when the text is
-    /// not numeric.
+    /// Parses an integer written as text: decimal, or a hex literal (<c>0x…</c>,
+    /// <c>x…</c>); false when the text is not numeric. Decimal comes first (G65:
+    /// <c>"10"</c> is ten, not the bits <c>1 0</c>); a vector's bits are read by
+    /// <see cref="LogicVector.TryToInteger"/>, which knows the value is a vector.
     /// </summary>
     public static bool TryParseInt(string? s, out long value)
     {
         value = 0;
         if (string.IsNullOrEmpty(s)) return false;
-        if (s.Length <= 63 && IsBitString(s))
-        {
-            foreach (char c in s) value = (value << 1) | (uint)(c - '0');
-            return true;
-        }
         if (long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
             return true;
         ReadOnlySpan<char> h = s;
@@ -52,17 +48,27 @@ public static class HdlLiteral
     }
 
     /// <summary>
-    /// Bits written by a literal: <c>x"0F"</c> → <c>00001111</c>, <c>"0101"</c> →
-    /// <c>0101</c>, <c>'1'</c> → <c>1</c>. False for anything else.
+    /// Bits written by a literal: <c>x"0F"</c> → <c>00001111</c>, <c>o"7"</c> →
+    /// <c>111</c>, <c>b"01"</c> / <c>"0101"</c> → the digits, <c>'1'</c> → <c>1</c>.
+    /// False for anything else.
     /// </summary>
     public static bool TryBits(string text, out string bits)
     {
         bits = string.Empty;
-        if (text.Length >= 3 && text[0] is 'x' or 'X' && text[1] == '"' && text[^1] == '"')
+        if (text.Length >= 3 && text[1] == '"' && text[^1] == '"' && text[0] is 'x' or 'X' or 'o' or 'O' or 'b' or 'B')
         {
-            try { bits = HexBits(text[2..^1]); return true; }
-            catch (FormatException) { return false; }
-            catch (ArgumentException) { return false; }
+            int radix = char.ToLowerInvariant(text[0]) switch { 'x' => 16, 'o' => 8, _ => 2 };
+            int width = radix switch { 16 => 4, 8 => 3, _ => 1 };
+            var sb = new System.Text.StringBuilder();
+            foreach (char c in text[2..^1])
+            {
+                if (c == '_') continue;
+                int d = Uri.IsHexDigit(c) ? Convert.ToInt32(c.ToString(), 16) : -1;
+                if (d < 0 || d >= radix) return false;
+                sb.Append(Convert.ToString(d, 2).PadLeft(width, '0'));
+            }
+            bits = sb.ToString();
+            return true;
         }
         if (text.Length >= 2 && text[0] == '"' && text[^1] == '"') { bits = text[1..^1]; return true; }
         if (text.Length == 3 && text[0] == '\'' && text[2] == '\'') { bits = text[1].ToString(); return true; }
@@ -73,11 +79,4 @@ public static class HdlLiteral
     public static string HexBits(string hexDigits) =>
         string.Concat(hexDigits.Where(c => c != '_')
             .Select(c => Convert.ToString(Convert.ToInt32(c.ToString(), 16), 2).PadLeft(4, '0')));
-
-    private static bool IsBitString(string s)
-    {
-        foreach (char c in s)
-            if (c is not ('0' or '1')) return false;
-        return true;
-    }
 }

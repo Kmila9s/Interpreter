@@ -121,6 +121,8 @@ public class DeferredUserFunction
             resultType);
         if (ReturnTypeSize > 0) resultVar.Size = ReturnTypeSize;
         resultVar.PortType = PortType.OUT;
+        resultVar.TypeMark = (Services.FunctionRegistry.Instance.Get(FunctionName)
+            ?? Services.PackageRegistry.Instance.GetFunction(FunctionName))?.ReturnTypeMark;
         return resultVar;
     }
 }

@@ -40,70 +40,36 @@ namespace Interpreter.Models;
 public class DeferredExpression
 {
     private readonly List<object> _items;
-    private DeferredExpression? _tail; // the operand of a leading unary operator
+    private readonly List<object> _postfix;
 
-    /// <summary>Creates a deferred expression buffering the given RPN items.</summary>
-    /// <param name="items">The buffered expression items to defer.</param>
+    /// <summary>Creates a deferred expression over the buffered infix items of a function argument.</summary>
+    /// <param name="items">Operands (variables, deferred reads/calls, literals) and operators, in infix order.</param>
     public DeferredExpression(List<object> items)
     {
         _items = items;
+        _postfix = new Repositories.ShuntingYard(Services.Operation.WithUnarySigns(
+            [.. items.Select(i => i is Services.Operator ? i : Operand(i))])).Result;
     }
 
     /// <summary>
-    /// Read-only view of the buffered items. Exposed so the synthesizer
-    /// can walk the sub-expression at build time and emit cells for each
-    /// operator, mirroring what <see cref="Evaluate"/> does at runtime.
-    /// The layout is infix: <c>[operand, op, operand, op, operand, …]</c>.
+    /// Read-only view of the buffered infix items (<c>[operand, op, operand, …]</c>), walked by
+    /// the synthesizer to emit a cell per operator.
     /// </summary>
     public IReadOnlyList<object> Items => _items;
 
     /// <summary>
-    /// Re-fold the buffered items using the current live values of any
-    /// Variables / DeferredFunctions they reference. Returns a fresh
-    /// Variable representing the sub-expression's current value.
+    /// The argument's current value, evaluated with the operators' precedence by the
+    /// same evaluator as any expression (<see cref="Services.Operation.EvaluateRpn"/>).
     /// </summary>
-    public Variable Evaluate()
+    public Variable Evaluate() =>
+        _items.Count == 0 ? new Variable("__DExprEmpty", "", DATATYPES.STD_LOGIC_VECTOR)
+        : _items.Count == 1 ? Services.Operation.ToArgVariablePublic(_items[0])
+        : Services.Operation.EvaluateRpn(_postfix, string.Join(" ", _items));
+
+    /// <summary>An operand the evaluator understands: literals and bare tokens become constants.</summary>
+    private static object Operand(object item) => item switch
     {
-        if (_items.Count == 0) return new Variable("__DExprEmpty", "", DATATYPES.STD_LOGIC_VECTOR);
-        if (_items.Count == 1) return Services.Operation.ToArgVariablePublic(_items[0]);
-
-        // A leading unary operator (`abs x`, `not x`, `-x`) applies to the rest of the argument.
-        if (_items[0] is Services.Operator { OperatorName: var unary } prefix)
-        {
-            var operand = (_tail ??= new DeferredExpression(_items.GetRange(1, _items.Count - 1))).Evaluate();
-            if (unary is "-" or "+")
-                return new Variable("__DExprSign", prefix.Execute(new Variable("__Zero", "0", DATATYPES.INTEGER), operand), operand.Type);
-            return new Variable("__DExprUnary", prefix.Execute(operand), operand.Type);
-        }
-
-        // Sanity-check shape: [operand, op, operand, op, operand, …]. If
-        // it doesn't alternate, fall back to items[0] resolved live —
-        // mirrors the fallback in Operation.FoldArgExpression so we never
-        // crash on malformed input.
-        for (int i = 0; i < _items.Count; i++)
-        {
-            bool shouldBeOp = (i % 2) == 1;
-            bool isOp = _items[i] is Services.Operator;
-            if (shouldBeOp != isOp) return Services.Operation.ToArgVariablePublic(_items[0]);
-        }
-
-        Variable acc = Services.Operation.ToArgVariablePublic(_items[0]);
-        for (int i = 1; i + 1 < _items.Count; i += 2)
-        {
-            var op = (Services.Operator)_items[i];
-            var right = Services.Operation.ToArgVariablePublic(_items[i + 1]);
-            object result = op.Execute(acc, right);
-            var vType = acc.Type;
-            if (string.Equals(op.OperatorName, "&", StringComparison.Ordinal))
-                vType = DATATYPES.STD_LOGIC_VECTOR;
-            var next = new Variable("__DExprFold", result, vType)
-            {
-                PortType = PortType.OUT,
-            };
-            if (vType == DATATYPES.STD_LOGIC_VECTOR && result is string s)
-                next.Size = s.Length;
-            acc = next;
-        }
-        return acc;
-    }
+        int or string => Services.Operation.ToArgVariablePublic(item),
+        _ => item,
+    };
 }
