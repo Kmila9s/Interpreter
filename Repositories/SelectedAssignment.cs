@@ -215,9 +215,10 @@ public class SelectedAssignment : ISControl, IConcurrentStatement
 
         _target.Read(_streamer);
 
-        // Expect '<='
-        if (_streamer.Current?.Value == "<=")
+        // Expect '<=' (signal) or ':=' (VHDL-2008 selected variable assignment, G77)
+        if (_streamer.Current?.Value is "<=" or ":=")
         {
+            _target.Operator = _streamer.Current.Value;
             _streamer.MoveNext();
         }
 

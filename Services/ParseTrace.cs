@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using Interpreter.Models;
 using Parser.Models;
 using Parser.Repositories;
 
@@ -154,6 +155,15 @@ public static class ParseTrace
                 continue;
             }
 
+            // `T'image(e)` (G81), optionally indexed: `std_logic'image(x)(2)`.
+            if (lower.EndsWith("'image", StringComparison.Ordinal) &&
+                TryImage(tokens, i, variables, out var image, out int imageTokens))
+            {
+                Append(image);
+                i += imageTokens - 1;
+                continue;
+            }
+
             // A string literal token (the tokenizer keeps it whole, G56): its text,
             // with `""` unescaped.
             if (t.Length >= 2 && t.StartsWith('"') && t.EndsWith('"'))
@@ -221,6 +231,51 @@ public static class ParseTrace
     /// (including <c>to_string</c> itself) and returns true. On failure
     /// returns false so the caller falls back to source-text rendering.
     /// </summary>
+    /// <summary>
+    /// <c>T'image(e)</c> at <paramref name="start"/>: <c>e</c> evaluated now and written as
+    /// GHDL does — an integer in decimal, a character/std_logic/bit between quotes,
+    /// a boolean as <c>true</c>/<c>false</c>, a time in fs; a following <c>(n)</c>
+    /// selects one character (strings index from 1).
+    /// </summary>
+    private static bool TryImage(List<string> tokens, int start, HashSet<Variable> variables, out string text, out int consumed)
+    {
+        text = string.Empty; consumed = 0;
+        if (start + 1 >= tokens.Count || tokens[start + 1] != "(") return false;
+        int close = Close(tokens, start + 1);
+        if (close < 0) return false;
+        string type = tokens[start][..tokens[start].IndexOf('\'')].ToLowerInvariant();
+        var value = new Operation(string.Join(" ", tokens.GetRange(start + 2, close - start - 2)), variables).EvaluateResult();
+        string raw = value.Value is bool b ? (b ? "true" : "false") : value.Value?.ToString() ?? string.Empty;
+        text = type switch
+        {
+            "time" => PhysicalTime.TryFs(value.Value, out long fs) ? PhysicalTime.Image(fs) : raw,
+            "std_logic" or "std_ulogic" or "bit" or "character" => $"'{raw.Trim('\'')}'",
+            "boolean" => raw.ToLowerInvariant(),
+            _ => raw,
+        };
+        consumed = close - start + 1;
+        // `(n)`: one character of the image (1-based).
+        if (close + 3 < tokens.Count && tokens[close + 1] == "(" && tokens[close + 3] == ")" && int.TryParse(tokens[close + 2], out int n)
+            && n >= 1 && n <= text.Length)
+        {
+            text = text[n - 1].ToString();
+            consumed += 3;
+        }
+        return true;
+    }
+
+    /// <summary>Index of the <c>)</c> closing the <c>(</c> token at <paramref name="open"/>, or -1.</summary>
+    private static int Close(List<string> tokens, int open)
+    {
+        int depth = 0;
+        for (int k = open; k < tokens.Count; k++)
+        {
+            if (tokens[k] == "(") depth++;
+            else if (tokens[k] == ")" && --depth == 0) return k;
+        }
+        return -1;
+    }
+
     private static bool TryEvalTypedString(List<string> tokens, int startIdx,
                                            HashSet<Variable> variables,
                                            string caller,

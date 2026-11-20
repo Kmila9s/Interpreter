@@ -263,8 +263,11 @@ public class ConditionalAssignment : ISControl, IConcurrentStatement
         if (!operation.Contains("when", StringComparison.OrdinalIgnoreCase))
             return null;
 
-        // Find the assignment operator
-        int assignIndex = operation.IndexOf("<=");
+        // Find the assignment operator: `<=` (signal) or `:=` (VHDL-2008 variable),
+        // whichever comes first (a `<=` after `:=` is a comparison in a condition).
+        int signalAt = operation.IndexOf("<=", StringComparison.Ordinal), variableAt = operation.IndexOf(":=", StringComparison.Ordinal);
+        bool isVariable = variableAt >= 0 && (signalAt < 0 || variableAt < signalAt);
+        int assignIndex = isVariable ? variableAt : signalAt;
         if (assignIndex < 0)
             return null;
 
@@ -273,6 +276,7 @@ public class ConditionalAssignment : ISControl, IConcurrentStatement
 
         var assignment = new ConditionalAssignment(variables, targetPart);
         assignment._line = sourceLine;
+        assignment._target.Operator = isVariable ? ":=" : "<=";
 
         // Parse branches from value part
         ParseBranchesFromString(assignment, valuePart);

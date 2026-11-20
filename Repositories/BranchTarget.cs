@@ -37,6 +37,9 @@ internal sealed class BranchTarget<TBranch> where TBranch : notnull
     /// <summary>The delay mechanism written after <c>&lt;=</c> (with the first branch), applied to every branch.</summary>
     private string _mechanism = string.Empty;
 
+    /// <summary><c>&lt;=</c> for a signal assignment, <c>:=</c> for a VHDL-2008 conditional/selected variable assignment (G77).</summary>
+    public string Operator { get; set; } = "<=";
+
     /// <summary>
     /// <c>target &lt;= value</c> for one branch. The delay mechanism
     /// (<c>transport</c>, <c>reject t inertial</c>) is written once, before the
@@ -44,6 +47,7 @@ internal sealed class BranchTarget<TBranch> where TBranch : notnull
     /// </summary>
     private string AssignmentText(string value)
     {
+        if (Operator == ":=") return $"{Text} := {value}";
         string prefix = Waveform.MechanismPrefix(value);
         if (prefix.Length > 0) _mechanism = prefix;
         else value = _mechanism + value;

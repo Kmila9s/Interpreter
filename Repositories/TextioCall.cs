@@ -1,16 +1,19 @@
 using System.Runtime.CompilerServices;
 using System.Text;
 using Interpreter.Interfaces;
+using Interpreter.Models;
 using Interpreter.Services;
 using Parser.Models;
 
 namespace Interpreter.Repositories;
 
 /// <summary>
-/// Output side of <c>std.textio</c> (VHDL-2008 §16.4): <c>write</c>, <c>hwrite</c>
-/// append to a <c>line</c> variable and <c>writeline(output, l)</c> prints it on the
-/// same channel as <c>report</c> (<see cref="ReportBus"/>), so the CLI, API and editor
-/// show it. The text of a <c>line</c> lives beside its variable.
+/// <c>std.textio</c> (VHDL-2008 §16.4). Output: <c>write</c>, <c>hwrite</c> append to a
+/// <c>line</c> variable and <c>writeline(output, l)</c> prints it on the same channel as
+/// <c>report</c> (<see cref="ReportBus"/>), so the CLI, API and editor show it. Input
+/// (G80): <c>readline(f, l)</c> takes the next line of a file opened for reading
+/// (<see cref="TextioFiles"/>) and <c>read(l, v)</c> consumes the next value of
+/// <c>v</c>'s type from it. The text of a <c>line</c> lives beside its variable.
 /// </summary>
 public sealed class TextioCall : ISControl
 {
@@ -24,20 +27,30 @@ public sealed class TextioCall : ISControl
     /// <summary>The value expression (built once at analysis); null for a literal or <c>writeline</c>.</summary>
     private readonly Operation? _value;
 
-    private TextioCall(string procedure, Variable line, string? literal, Operation? value)
+    /// <summary>The file of <c>readline</c>; null otherwise.</summary>
+    private readonly Variable? _file;
+    /// <summary>The object <c>read</c> fills; null otherwise.</summary>
+    private readonly AssignmentTarget? _target;
+    private readonly int _sourceLine;
+
+    private TextioCall(string procedure, Variable line, string? literal, Operation? value,
+        Variable? file = null, AssignmentTarget? target = null, int sourceLine = 0)
     {
         _procedure = procedure;
         _line = line;
         _literal = literal;
         _value = value;
+        _file = file;
+        _target = target;
+        _sourceLine = sourceLine;
     }
 
     /// <summary>Procedures handled here.</summary>
-    public static bool Handles(string name) => name is "write" or "hwrite" or "writeline";
+    public static bool Handles(string name) => name is "write" or "hwrite" or "writeline" or "readline" or "read";
 
     /// <summary>std.textio procedures Kmila does not simulate yet (reported, never dropped).</summary>
     public static bool IsUnsupported(string name) =>
-        name is "read" or "readline" or "hread" or "oread" or "owrite" or "bwrite" or "file_open" or "file_close";
+        name is "hread" or "oread" or "owrite" or "bwrite" or "file_open" or "file_close";
 
     /// <summary>Builds the call from its arguments.</summary>
     /// <exception cref="ParserException">Unsupported file, missing or undeclared arguments.</exception>
@@ -46,6 +59,15 @@ public sealed class TextioCall : ISControl
         var args = call.CallArguments();
         if (args.Count < 2 || args[0].Count == 0 || args[1].Count == 0)
             throw new ParserException($"'{name}' expects a line and a value", call.First);
+        int line = call.First.SourceLine;
+        if (name == "readline")
+            return new TextioCall(name, LineVariable(args[1][0], scope), null, null, file: LineVariable(args[0][0], scope), sourceLine: line);
+        if (name == "read")
+        {
+            string targetText = string.Join(' ', args[1].Select(t => t.Value));
+            var target = AssignmentTarget.Resolve(targetText, scope) ?? throw ParserException.UndeclaredVariable(targetText, args[1][0]);
+            return new TextioCall(name, LineVariable(args[0][0], scope), null, null, target: target, sourceLine: line);
+        }
         if (name == "writeline")
         {
             if (!args[0][0].Value.Equals("output", StringComparison.OrdinalIgnoreCase))
@@ -77,6 +99,19 @@ public sealed class TextioCall : ISControl
     public Task ExecuteAsync()
     {
         var text = Lines.GetOrCreateValue(_line);
+        if (_procedure == "readline")
+        {
+            text.Clear().Append(TextioFiles.ReadLine(_file!, _sourceLine));
+            return Task.CompletedTask;
+        }
+        if (_procedure == "read")
+        {
+            string rest = text.ToString();
+            object value = TextioFiles.Read(ref rest, _target!.Base, _sourceLine);
+            text.Clear().Append(rest);
+            _target.Assign(null, value, _sourceLine, immediate: true);
+            return Task.CompletedTask;
+        }
         if (_procedure == "writeline")
         {
             ReportBus.Instance.Emit(text.ToString());

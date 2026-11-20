@@ -67,6 +67,16 @@ public class PackageRegistry
     /// </summary>
     public Signedness VectorArithmetic { get; private set; } = Signedness.Unsigned;
 
+    /// <summary>Types declared in the design's architectures and subprograms (by name), for <c>T'range</c> in any body.</summary>
+    private readonly Dictionary<string, TypeDefinition> _designTypes = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Records a type declared in the design (an architecture's or a subprogram's declarative part).</summary>
+    public void RegisterDesignType(TypeDefinition type) => _designTypes.TryAdd(type.Name, type);
+
+    /// <summary>A type of the design or of a package by name, or null.</summary>
+    public TypeDefinition? LookupType(string name) =>
+        _designTypes.TryGetValue(name, out var t) ? t : PackageSubtypeScanner.LookupGlobally(name);
+
     /// <summary>Instance prefix (<c>u1__</c>; empty for the top) → vector arithmetic of the unit inlined there.</summary>
     private readonly Dictionary<string, Signedness> _unitArithmetic = new(StringComparer.OrdinalIgnoreCase);
 
@@ -358,6 +368,7 @@ public class PackageRegistry
         _declaredNames.Clear();
         VectorArithmetic = Signedness.Unsigned;
         _unitArithmetic.Clear();
+        _designTypes.Clear();
     }
 
     /// <summary>

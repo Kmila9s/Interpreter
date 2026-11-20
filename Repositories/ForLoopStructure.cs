@@ -191,6 +191,12 @@ public class ForLoopStructure : ILoopStructure
             {
                 effLeft = sig.LeftBound!.Value; effRight = sig.RightBound!.Value; effDownto = sig.IsDownto;
             }
+            else if (sig is null && PackageRegistry.Instance.LookupType(sigName) is { Kind: TypeKind.Array, IsUnconstrained: false } type)
+            {
+                // `T'range` of a constrained array type (`for i in mem_t'range`).
+                (effLeft, effRight) = type.DeclaredRange;
+                effDownto = type.IsDownto;
+            }
             else
             {
                 effLeft = width - 1; effRight = 0; effDownto = true;

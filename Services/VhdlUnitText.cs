@@ -119,7 +119,7 @@ internal static class VhdlUnitText
         // the `case` keyword from the depth counter and caused
         // SplitArchitecture to terminate prematurely at the inner
         // `end process` instead of the architecture-level `end`.
-        var rx = new Regex(@"\b(architecture|process|function|procedure|generate|block|begin|end|if|case|loop|then|is)\b(?:[ \t]+(function|procedure|process|generate|block|architecture|if|case|loop)\b)?",
+        var rx = new Regex(@"\b(architecture|process|function|procedure|generate|block|begin|end|if|elsif|else|case|loop|then|is)\b(?:[ \t]+(function|procedure|process|generate|block|architecture|if|case|loop)\b)?",
                            RegexOptions.IgnoreCase);
         // First locate the architecture-level `begin`.
         Match m = rx.Match(masked, startIdx);
@@ -174,6 +174,15 @@ internal static class VhdlUnitText
                     // `end generate`: their `generate` must not open a second level.
                     innerDepth++;
                     conditionPending = true;
+                    break;
+                case "elsif":
+                    // `elsif C then` (sequential) or `elsif C generate`: a branch of the
+                    // open if, never a new level.
+                    conditionPending = true;
+                    break;
+                case "else":
+                    // `else generate` continues the open if generate.
+                    if (em.Groups[2].Value.Equals("generate", StringComparison.OrdinalIgnoreCase)) conditionPending = false;
                     break;
                 case "then":
                 case "is":

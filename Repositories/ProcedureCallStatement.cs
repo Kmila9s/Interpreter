@@ -116,7 +116,9 @@ public class ProcedureCallStatement : ISControl
                 .Split(' ', StringSplitOptions.RemoveEmptyEntries);
         }
 
-        var tokens = def.BodyRaw.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        // Re-tokenized (not split on blanks): a string literal stays one token, so a
+        // `report` prints its text exactly (G80; was "say:  row" for "say: ").
+        var tokens = TokenStream.FromLines(def.BodyRaw.Split('\n')).Slice(0, int.MaxValue).Select(t => t.Value).ToArray();
         for (int i = 0; i < tokens.Length; i++)
         {
             if (tokens[i].Equals("report", StringComparison.OrdinalIgnoreCase))

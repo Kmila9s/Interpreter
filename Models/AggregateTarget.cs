@@ -24,7 +24,7 @@ public sealed class AggregateTarget
     /// declared targets; null when it is not one (a parenthesised operand of a
     /// <c>&lt;=</c> comparison, a plain name).
     /// </summary>
-    /// <exception cref="ValidationException">An element is undeclared, or the aggregate is named or nested.</exception>
+    /// <exception cref="ValidationException">An element is undeclared, or the aggregate is named.</exception>
     public static AggregateTarget? TryParse(string lhs, HashSet<Variable> scope, int sourceLine)
     {
         lhs = lhs.Trim();
@@ -40,7 +40,15 @@ public sealed class AggregateTarget
             if (VhdlText.TopLevelSplit(part, "=>").Count > 1)
                 throw new ValidationException("named aggregate assignment targets are not supported yet", sourceLine, 0, part);
             if (part.StartsWith('('))
-                throw new ValidationException("nested aggregate assignment targets are not supported yet", sourceLine, 0, part);
+            {
+                // A nested aggregate (G79) stands for its elements in order: a composite
+                // value is its elements' bits, so the leaves take consecutive bits.
+                var nested = TryParse(part, scope, sourceLine)
+                    ?? throw new ValidationException($"no declaration for \"{part}\"", sourceLine, 0, part);
+                elements.AddRange(nested.Elements);
+                texts.AddRange(nested._texts);
+                continue;
+            }
             var element = AssignmentTarget.Resolve(part, scope)
                 ?? throw new ValidationException($"no declaration for \"{part}\"", sourceLine, 0, part);
             if (element.Path.FieldError is { } fieldError)

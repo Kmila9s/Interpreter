@@ -123,7 +123,7 @@ public sealed partial class SourceElaborator
     private const int MaxElaborationDepth = 8;
 
     /// <summary>What an instance elaborates to: the entity, its architecture and the block configuration that applies inside it.</summary>
-    private sealed record Resolved(EntityRecord Entity, ArchRecord Arch, BlockConfig? Block);
+    private sealed record Resolved(EntityRecord Entity, ArchRecord Arch, BlockConfig? Block, Binding? Binding = null);
 
     /// <summary>
     /// Binds instance <paramref name="im"/>; null when it is left as written (unknown
@@ -136,6 +136,7 @@ public sealed partial class SourceElaborator
         string kind = im.Groups["kind"].Value.ToLowerInvariant();
         string? archName = im.Groups["arch"].Success ? im.Groups["arch"].Value : null;
         BlockConfig? block = null;
+        Binding? binding = null;
         string entityName = name;
 
         if (kind == "configuration")
@@ -146,6 +147,7 @@ public sealed partial class SourceElaborator
         else if (kind != "entity")
         {
             var cc = config?.Find(label, name) ?? specs.Find(label, name);
+            binding = cc?.Binding;
             if (cc?.Binding is { Open: true }) { open = true; return null; }
             if (cc?.Binding?.Configuration is { } cfgName)
             {
@@ -159,9 +161,18 @@ public sealed partial class SourceElaborator
                 block = cc?.Nested;
             }
         }
-        if (!lib.Entities.TryGetValue(entityName, out var entity)) return null;
+        if (!lib.Entities.TryGetValue(entityName, out var entity))
+        {
+            // An entity instantiation names its unit: missing is an error (GHDL: unit not
+            // found), never a silently empty instance. An unbound component stays open.
+            if (kind == "entity")
+                throw new ParserException($"entity \"{entityName}\" of instance \"{label}\" not found in library \"work\"", 0, 0, label);
+            return null;
+        }
         var arch = DesignLibrary.SelectArchitecture(entity, archName ?? block?.Architecture);
-        return arch == null ? null : new Resolved(entity, arch, block);
+        if (arch == null && kind == "entity")
+            throw new ParserException($"entity \"{entityName}\" of instance \"{label}\" has no architecture{(archName is null ? "" : $" \"{archName}\"")}", 0, 0, label);
+        return arch == null ? null : new Resolved(entity, arch, block, binding);
     }
 
     /// <summary>
@@ -215,7 +226,10 @@ public sealed partial class SourceElaborator
             }
             // Unknown unit: left as written, so the parser reports it.
             if (resolved == null) { bodySb.Append(im.Value); continue; }
-            var (child, childArch, childBlock) = resolved;
+            var (child, childArch, childBlock, binding) = resolved;
+            // A binding with its own maps (G80): entity ⇐ component ⇐ actual.
+            if (binding?.PortMap is { } bindingPorts) portMapRaw = ComposeMap(bindingPorts, portMapRaw);
+            if (binding?.GenericMap is { } bindingGenerics) genericMapRaw = ComposeMap(bindingGenerics, genericMapRaw, substitute: true);
 
             // For each port, allocate an alias signal in the parent's decl section.
             // The inlined body references the alias rather than the mapped
@@ -661,6 +675,35 @@ public sealed partial class SourceElaborator
         while (j < entityText.Length && char.IsWhiteSpace(entityText[j])) j++;
         if (j < entityText.Length && entityText[j] == ';') j++;
         return entityText.Remove(open, j - open);
+    }
+
+    /// <summary>
+    /// The associations of a binding's map (<c>entity formal =&gt; component name</c>) with
+    /// each component name replaced by what the instance associates with it, giving
+    /// <c>entity formal =&gt; actual</c>. A port the instance leaves out becomes
+    /// <c>open</c>; with <paramref name="substitute"/> (generic maps) names inside an
+    /// expression are replaced and others kept (the component's default).
+    /// </summary>
+    private static string ComposeMap(string bindingMap, string instanceMap, bool substitute = false)
+    {
+        var actuals = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var a in VhdlUnitText.SplitBalanced(instanceMap, ','))
+        {
+            int arrow = a.IndexOf("=>", StringComparison.Ordinal);
+            if (arrow > 0) actuals[a[..arrow].Trim()] = a[(arrow + 2)..].Trim();
+        }
+        var composed = new List<string>();
+        foreach (var a in VhdlUnitText.SplitBalanced(bindingMap, ','))
+        {
+            int arrow = a.IndexOf("=>", StringComparison.Ordinal);
+            if (arrow < 0) continue;
+            string formal = a[..arrow].Trim(), local = a[(arrow + 2)..].Trim();
+            string actual = substitute
+                ? (actuals.Count == 0 ? local : VhdlUnitText.RenameTokens(local, actuals))
+                : actuals.TryGetValue(local, out var mapped) ? mapped : "open";
+            composed.Add($"{formal} => {actual}");
+        }
+        return string.Join(", ", composed);
     }
 
     /// <summary>A signal name, optionally with one static index or range: the actuals an <c>inout</c> formal may take.</summary>

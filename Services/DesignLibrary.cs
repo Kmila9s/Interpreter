@@ -7,7 +7,14 @@ namespace Interpreter.Services;
 /// What a component instance is bound to: an entity (optionally a named
 /// architecture), a configuration, or nothing (<c>use open</c>).
 /// </summary>
-internal sealed record Binding(string? Entity, string? Architecture, string? Configuration, bool Open = false);
+internal sealed record Binding(string? Entity, string? Architecture, string? Configuration, bool Open = false)
+{
+    /// <summary>The binding's <c>generic map</c> associations (entity generic ⇒ expression over the component's), or null.</summary>
+    public string? GenericMap { get; init; }
+
+    /// <summary>The binding's <c>port map</c> associations (entity port ⇒ component port), or null.</summary>
+    public string? PortMap { get; init; }
+}
 
 /// <summary>A component configuration: its binding and the block configuration applied inside the bound entity.</summary>
 internal sealed class ComponentConfig
@@ -327,9 +334,21 @@ internal sealed class DesignLibrary
         }
         else if (text.Equals("open", StringComparison.OrdinalIgnoreCase)) return new Binding(null, null, null, Open: true);
         else throw new ParserException($"binding indication \"use {text}\" is not supported yet", line, 0);
-        if (!string.IsNullOrWhiteSpace(rest))
-            throw new ParserException("generic/port maps in a binding indication are not supported yet", line, 0);
-        return binding;
+        if (string.IsNullOrWhiteSpace(rest)) return binding;
+        // `generic map (…)` and `port map (…)` of the binding (G80).
+        string? gmap = MapBody(rest, "generic"), pmap = MapBody(rest, "port");
+        if (gmap is null && pmap is null)
+            throw new ParserException($"binding indication \"use {text}\" is not supported yet", line, 0);
+        return binding with { GenericMap = gmap, PortMap = pmap };
+    }
+
+    /// <summary>The associations inside <c>&lt;kind&gt; map ( … )</c> of <paramref name="text"/>, or null.</summary>
+    private static string? MapBody(string text, string kind)
+    {
+        var m = Regex.Match(text, $@"\b{kind}\s+map\s*\(", RegexOptions.IgnoreCase);
+        if (!m.Success) return null;
+        int open = m.Index + m.Length - 1, close = VhdlText.MatchingParen(text, open);
+        return close < 0 ? null : text[(open + 1)..close];
     }
 
     // ---------- Configuration declarations ----------

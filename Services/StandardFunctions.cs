@@ -67,7 +67,7 @@ public static class StandardFunctions
     /// <summary>The storage type of a standard function's result (the single table for every call path).</summary>
     public static DATATYPES ResultType(string functionName, IReadOnlyList<object> args) => functionName.ToLowerInvariant() switch
     {
-        "rising_edge" or "falling_edge" or "is_x" or "std_match" => DATATYPES.BOOLEAN,
+        "rising_edge" or "falling_edge" or "is_x" or "std_match" or "endfile" => DATATYPES.BOOLEAN,
         "to_integer" or "conv_integer" or "clog2" => DATATYPES.INTEGER,
         "to_x01" or "to_x01z" or "to_ux01" when args.Count > 0 && args[0] is Variable { Type: DATATYPES.STD_LOGIC } => DATATYPES.STD_LOGIC,
         "to_stdulogic" => DATATYPES.STD_LOGIC,
@@ -135,7 +135,7 @@ public static class StandardFunctions
     {
         "to_x01", "to_x01z", "to_ux01", "to_01", "is_x", "std_match",
         "to_stdulogic", "to_stdlogicvector", "to_stdulogicvector", "to_bit", "to_bitvector",
-        "shl", "shr", "ext", "sxt", "conv_unsigned", "conv_signed",
+        "shl", "shr", "ext", "sxt", "conv_unsigned", "conv_signed", "endfile",
     };
 
     /// <summary>
@@ -204,6 +204,9 @@ public static class StandardFunctions
                         return FallingEdge(signal);
                 }
                 return false;
+
+            case "endfile":
+                return arguments.Length >= 1 && ArgVariable(arguments[0], variables) is { } file && TextioFiles.EndOfFile(file);
 
             case "to_integer":
             case "conv_integer":

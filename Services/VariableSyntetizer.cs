@@ -182,6 +182,12 @@ public class VariableSyntetizer : ISControl
                     break;
                 continue;
             }
+            // `file f : text open read_mode is "data.txt";` (std.textio input, G80)
+            if (_streamer.Current?.Value?.ToLower() == "file")
+            {
+                ParseFileDeclaration();
+                continue;
+            }
             // Skip attribute declarations and specifications
             if (_streamer.Current?.Value?.ToLower() == "attribute")
             {
@@ -193,19 +199,6 @@ public class VariableSyntetizer : ISControl
             {
                 SkipDisconnectSpec();
                 continue;
-            }
-
-            // Check for constant declarations with function calls (e.g., constant X := func(Y);)
-            // v0.13.0: Constants with function calls cannot be evaluated at parse time
-            // Only skip if the initialization contains a function call (identifier followed by '(')
-            if (_streamer.Current?.Value?.ToLower() == "constant")
-            {
-                if (HasFunctionCallInConstant())
-                {
-                    SkipConstantDeclaration();
-                    continue;
-                }
-                // Otherwise, fall through to normal variable parsing
             }
 
             List<Variable> variables = new();
@@ -693,9 +686,11 @@ public class VariableSyntetizer : ISControl
                     var other => other ?? new object(),
                 };
             }
-            catch (Exception) when (!ParseTrace.Enabled)
+            catch (Exception e) when (e is not ParserException)
             {
-                value = new object();
+                // G54: never the default value in silence.
+                throw new ParserException($"cannot evaluate the initial value {call}({args}): {e.Message}",
+                    _streamer.Current ?? _streamer.Previous);
             }
         }
         // Check for identifier reference
@@ -1016,155 +1011,6 @@ public class VariableSyntetizer : ISControl
     }
 
     /// <summary>
-    /// Checks if a constant declaration contains a function call in its initialization.
-    /// Uses lookahead without consuming tokens.
-    /// </summary>
-    /// <returns>True if the constant has a function call like func(args), false otherwise.</returns>
-    private bool HasFunctionCallInConstant()
-    {
-        _streamer.SetRollBack();
-
-        // Look ahead to find ':=' and then check what follows
-        bool foundAssign = false;
-        int iterations = 0;
-        const int MAX_LOOKAHEAD = 50;
-
-        while (_streamer.Current != null && iterations < MAX_LOOKAHEAD)
-        {
-            iterations++;
-            string val = _streamer.Current.Value;
-
-            // Stop if we hit semicolon or begin
-            if (val == ";" || val.ToLower() == "begin" || val.ToLower() == _breaker)
-            {
-                break;
-            }
-
-            if (val == ":=")
-            {
-                foundAssign = true;
-                _streamer.MoveNext();
-                continue;
-            }
-
-            // After ':=', check if we have identifier followed by '('
-            // which indicates a function call
-            if (foundAssign)
-            {
-                // Skip any leading '(' for aggregate initializers like "(others => '0')"
-                if (val == "(")
-                {
-                    _streamer.RollBack();
-                    return false; // This is an aggregate, not a function call
-                }
-
-                // Check for identifier followed by '('
-                if (_streamer.Current?.Type == IDENTIFIERS)
-                {
-                    string ident = _streamer.Current.Value;
-                    _streamer.MoveNext();
-
-                    // If next is '(', it's a function call
-                    if (_streamer.Current?.Value == "(")
-                    {
-                        _streamer.RollBack();
-                        return true;
-                    }
-                }
-
-                // If we got here without finding function call pattern, it's a simple constant
-                _streamer.RollBack();
-                return false;
-            }
-
-            _streamer.MoveNext();
-        }
-
-        _streamer.RollBack();
-        return false;
-    }
-
-    /// <summary>
-    /// Skips a constant declaration until ';'.
-    /// Constants with function calls cannot be evaluated at parse time.
-    /// </summary>
-    /// <remarks>
-    /// <para>v0.13.0: Added to handle constants with function call initializations.</para>
-    /// <code>
-    /// constant TREE_DEPTH : integer := clog2(NUM_INPUTS);  -- Skipped
-    /// constant ZERO : std_logic_vector(7 downto 0) := (others => '0');  -- Skipped
-    /// </code>
-    /// </remarks>
-    private void SkipConstantDeclaration()
-    {
-        // Skip 'constant' keyword
-        _streamer.MoveNext();
-
-        // Capture the constant name(s) so later expressions can resolve them.
-        // Without this, constants defined as `constant X : integer := func(Y);`
-        // would be silently dropped, and any downstream use of X would fail
-        // with "Undeclared variable". Register a placeholder Variable per name;
-        // value resolution can refine this later if function evaluation is added.
-        var declaredNames = new List<string>();
-        while (_streamer.Current != null && _streamer.Current.Type == IDENTIFIERS)
-        {
-            declaredNames.Add(_streamer.Current.Value);
-            _streamer.MoveNext();
-            if (_streamer.Current?.Value == ",") _streamer.MoveNext();
-            else break;
-        }
-
-        int parenDepth = 0;
-        int iterations = 0;
-        const int MAX_ITERATIONS = 1000;
-
-        // Skip until we find ';' at depth 0
-        while (_streamer.Current != null && iterations < MAX_ITERATIONS)
-        {
-            iterations++;
-            string val = _streamer.Current.Value;
-
-            if (val == "(")
-            {
-                parenDepth++;
-            }
-            else if (val == ")")
-            {
-                parenDepth--;
-            }
-            else if (val == ";" && parenDepth == 0)
-            {
-                _streamer.MoveNext(); // skip ';'
-                break;
-            }
-
-            // Safety: if we hit 'begin', we've gone too far
-            if (val.ToLower() == "begin" || val.ToLower() == _breaker)
-            {
-                break;
-            }
-
-            _streamer.MoveNext();
-        }
-
-        foreach (var name in declaredNames)
-        {
-            if (string.IsNullOrEmpty(name)) continue;
-            if (Variables.Any(v => v.Name.Equals(name, StringComparison.OrdinalIgnoreCase))) continue;
-            // Seed Value=0 so downstream Convert.ToInt32(...) calls succeed instead
-            // of falling into the `_value ?? new()` branch and getting a raw object.
-            Variables.Add(new Variable { Name = name, Value = 0 });
-            SkipDiagnosticLog.Instance.AddInfo(
-                "VHD-CONSTANT-PLACEHOLDER",
-                name,
-                $"Constant '{name}' has a function-call initializer that the " +
-                "parser does not yet evaluate. Registered with placeholder " +
-                "value 0 — vector widths derived from this constant will be " +
-                "incorrect at runtime.");
-        }
-    }
-
-    /// <summary>
     /// Skips a component declaration until 'end component;'
     /// </summary>
     private void SkipComponentDeclaration()
@@ -1293,6 +1139,38 @@ public class VariableSyntetizer : ISControl
                 break;
         }
         return v;
+    }
+
+    /// <summary>
+    /// A file declaration: <c>file f : text open read_mode is "name";</c> (or the
+    /// VHDL-87 <c>is in "name"</c>). Read mode opens the file for <c>readline</c>;
+    /// writing to a file is not supported yet (an error, never a silent no-op).
+    /// </summary>
+    private void ParseFileDeclaration()
+    {
+        var start = _streamer.Current!;
+        _streamer.MoveNext(); // file
+        var names = new List<string>();
+        while (_streamer.Current is { Type: IDENTIFIERS } n)
+        {
+            names.Add(n.Value);
+            _streamer.MoveNext();
+            if (_streamer.Current?.Value == ",") _streamer.MoveNext(); else break;
+        }
+        var words = new List<Token>();
+        while (_streamer.Current is { } t && t.Value != ";") { words.Add(t); _streamer.MoveNext(); }
+        if (_streamer.Current?.Value == ";") _streamer.MoveNext();
+        string? path = words.FirstOrDefault(w => w.IsStringLiteral)?.Value.Trim('"');
+        string mode = words.Any(w => w.Value.Equals("write_mode", StringComparison.OrdinalIgnoreCase) || w.Value.Equals("append_mode", StringComparison.OrdinalIgnoreCase)
+            || w.Value.Equals("out", StringComparison.OrdinalIgnoreCase)) ? "write" : "read";
+        if (mode == "write")
+            throw new ParserException("files opened for writing are not supported yet (use writeline(output, …))", start);
+        foreach (var name in names)
+        {
+            var file = new Variable(name, string.Empty, Constants.DATATYPES.UNKNOWN) { TypeMark = "text" };
+            if (path is not null) TextioFiles.OpenRead(file, path);
+            Variables.Add(file);
+        }
     }
 
     /// <summary>
@@ -1606,6 +1484,7 @@ public class VariableSyntetizer : ISControl
         if (typeDef != null)
         {
             ParsedTypes.TryRegister(typeDef);
+            PackageRegistry.Instance.RegisterDesignType(typeDef);
             _typeRegistry?.TryRegister(typeDef);
 
             // Bug #16 fix: register every enum literal as a constant Variable
@@ -2082,60 +1961,18 @@ public class VariableSyntetizer : ISControl
             _streamer.MoveNext();
         }
 
-        // Parse local declarations (variables, constants) until top-level
-        // `begin`. Tier 4.3 (2026-07-28): capture `variable <n> : <type>[(hi
-        // downto lo)] [:= <init>];` into a list so synth-time body inlining
-        // can recognise SSA writes to locals via the scope-alias stack.
-        // Constants and other declaration kinds are still skipped.
-        var localVariables = new List<Variable>();
-        while (_streamer.Current != null && _streamer.Current.Value?.ToLower() != "begin")
-        {
-            ParseTrace.Step(ref _fnIter, _streamer, _currentCt);
-            if (_streamer.Current.Value?.ToLower() == "variable")
-            {
-                _streamer.MoveNext(); // 'variable'
-                string localName = _streamer.Current?.Value ?? string.Empty;
-                if (!string.IsNullOrEmpty(localName)) _streamer.MoveNext();
-                if (_streamer.Current?.Value == ":") _streamer.MoveNext();
-                string localTypeTok = _streamer.Current?.Value ?? "std_logic";
-                var localType = Variable.GetDatatype(localTypeTok);
-                if (_streamer.Current != null) _streamer.MoveNext();
-                int localSize = 0;
-                if (_streamer.Current?.Value == "(")
-                {
-                    _streamer.MoveNext(); // '('
-                    if (int.TryParse(_streamer.Current?.Value, out int hi))
-                    {
-                        _streamer.MoveNext(); // hi
-                        _streamer.MoveNext(); // downto/to
-                        if (int.TryParse(_streamer.Current?.Value, out int lo))
-                        {
-                            localSize = Math.Abs(hi - lo) + 1;
-                            _streamer.MoveNext(); // lo
-                        }
-                    }
-                    while (_streamer.Current != null && _streamer.Current.Value != ")")
-                    {
-                        _streamer.MoveNext();
-                    }
-                    if (_streamer.Current?.Value == ")") _streamer.MoveNext();
-                }
-                // Skip optional `:= <init>` and any trailing tokens up to ';'.
-                while (_streamer.Current != null && _streamer.Current.Value != ";"
-                    && _streamer.Current.Value?.ToLower() != "begin")
-                {
-                    _streamer.MoveNext();
-                }
-                if (_streamer.Current?.Value == ";") _streamer.MoveNext();
-
-                if (!string.IsNullOrEmpty(localName))
-                {
-                    localVariables.Add(new Variable(localName, string.Empty, localType) { Size = localSize });
-                }
-                continue;
-            }
-            _streamer.MoveNext();
-        }
+        // Local declarations (variables, constants, types) until the body's `begin`,
+        // read by the same declaration parser as a process's: user types (arrays of
+        // vectors, records), constant bounds and initial values (G54: a local
+        // `m : mem_t` was untyped and the function returned '0').
+        var localScope = new HashSet<Variable>(_comparator);
+        localScope.UnionWith(Variables);
+        foreach (var p in parameters) localScope.Add(p.CreateVariable());
+        var localTypes = new TypeRegistry();
+        foreach (var t in (_typeRegistry?.Types.Values ?? []).Concat(ParsedTypes.Types.Values)) localTypes.TryRegister(t);
+        var localParser = new VariableSyntetizer(_streamer, localScope, TypeRegistry: localTypes);
+        if (_streamer.Current?.Value?.ToLower() != "begin") localParser.Syntetize(_currentCt);
+        var localVariables = localParser.Variables.ToList();
         if (_streamer.Current?.Value?.ToLower() == "begin")
         {
             _streamer.MoveNext(); // consume 'begin'
