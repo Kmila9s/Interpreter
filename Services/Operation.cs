@@ -599,6 +599,23 @@ public class Operation : IOperation, IConcurrentStatement {
                 continue;
             }
 
+            // A physical literal (`10 ns`, `2.5 us`) is one time value, in femtoseconds.
+            if (_currentSyntetizeIndex + 1 < _data.Length && PhysicalTime.IsUnit(_data[_currentSyntetizeIndex + 1])
+                && PhysicalTime.TryLiteral(currentItem, _data[_currentSyntetizeIndex + 1], out long timeFs))
+            {
+                items.Add(PhysicalTime.Value(timeFs, $"Literal-{Interlocked.Increment(ref _literalCounter)}"));
+                _currentSyntetizeIndex += 2;
+                continue;
+            }
+
+            // `now`: the simulation time, read when the expression is evaluated.
+            if (currentItem.Equals("now", StringComparison.OrdinalIgnoreCase) && !Variables.Contains(currentItem))
+            {
+                items.Add(new NowOperand());
+                _currentSyntetizeIndex++;
+                continue;
+            }
+
             if (_operators.IsMatch(currentItem.ToLower()))
             {
                 isComparation = true;

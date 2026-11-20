@@ -62,6 +62,12 @@ public class SignalAttributeHandler
         set => _tickResolutionNs = Math.Max(1, value);
     }
 
+    /// <summary>The current simulation time in femtoseconds (VHDL <c>now</c>), set by the engine at each time step.</summary>
+    public long NowFs { get; private set; }
+
+    /// <summary>Enters time step <paramref name="tick"/> (<see cref="NowFs"/> = tick × resolution).</summary>
+    public void EnterTime(ulong tick) => NowFs = (long)tick * _tickResolutionNs * PhysicalTime.UnitFs["ns"];
+
     private static SignalAttributeHandler? _instance;
     /// <summary>Lazily-created process-wide singleton instance.</summary>
     public static SignalAttributeHandler Instance => _instance ??= new SignalAttributeHandler();
@@ -264,6 +270,7 @@ public class SignalAttributeHandler
         _deltaTransitionCount.Clear();
         _byName.Clear();
         _currentTimeMoment = 0;
+        NowFs = 0;
         _tickResolutionNs = 1;
     }
 }

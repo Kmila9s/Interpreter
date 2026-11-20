@@ -200,6 +200,14 @@ public partial class DeltaCycleEngine : IDisposable
         foreach (var (p, w) in toWake)
         {
             UnregisterConditionBlocked(p, w);
+            p.ConditionWait = null;
+            // The condition came first: cancel the timeout of `wait until … for`.
+            if (p.TimeoutTick is { } timeout && _pendingProcessWakes.TryGetValue(timeout, out var timed))
+            {
+                timed.Remove(p);
+                if (timed.Count == 0) _pendingProcessWakes.Remove(timeout);
+            }
+            p.TimeoutTick = null;
             ScheduleProcessWake(p, _currentTick);
         }
         return true;
@@ -569,6 +577,7 @@ public partial class DeltaCycleEngine : IDisposable
         }
 
         _currentDelta = 0;
+        SignalAttributeHandler.Instance.EnterTime(_currentTick);
 
         // Transactions maturing at this time update their signals before any
         // process resumes (LRM §14.7.5.3): a process woken now reads them. The
@@ -1030,19 +1039,25 @@ public partial class DeltaCycleEngine : IDisposable
         // since it last started from Pc=0. Consulted by the fall-off path
         // below to decide whether an implicit VHDL-style loop-back is safe.
         process.YieldedSinceLoopStart = true;
+        if (!waitStmt.IsCondition && !waitStmt.IsTimed)
+        {
+            process.IsTerminated = true;
+            return;
+        }
+        // A condition and a timeout (`wait until c for T`) wait for whichever comes
+        // first; the other is cancelled on wake (WakeConditionBlockedProcesses,
+        // DrainReadyProcessWakesAsync).
         if (waitStmt.IsCondition)
         {
             RegisterConditionBlocked(process, waitStmt);
+            process.ConditionWait = waitStmt;
         }
-        else if (waitStmt.IsTimed && !waitStmt.IsTerminal)
+        if (waitStmt.IsTimed)
         {
             int tickResNs = _signalScheduler.TickResolutionNs;
             ulong delayTicks = (ulong)Math.Max(1L, waitStmt.DelayNs / Math.Max(1, tickResNs));
             ScheduleProcessWake(process, _currentTick + delayTicks);
-        }
-        else
-        {
-            process.IsTerminated = true;
+            process.TimeoutTick = _currentTick + delayTicks;
         }
     }
 
@@ -1518,6 +1533,10 @@ public partial class DeltaCycleEngine : IDisposable
             foreach (var process in list)
             {
                 if (process.IsTerminated) continue;
+                // The timeout came first: the condition of `wait until … for` no longer waits.
+                if (process.ConditionWait is { } pending) UnregisterConditionBlocked(process, pending);
+                process.ConditionWait = null;
+                process.TimeoutTick = null;
                 await ExecuteProcessSegmentAsync(process);
             }
         }

@@ -193,7 +193,7 @@ public class IfStructure : ISControl
         }
         _streamer.MoveNext(); // consume 'then'
 
-        branch.Condition = new Operation(rawDataBuilder.ToString().Trim(), _variables);
+        branch.Condition = new Operation(rawDataBuilder.ToString().Trim(), _variables, branch.ConditionLine);
         SyntetizeBranchBody(branch);
         Branches.Add(branch);
     }

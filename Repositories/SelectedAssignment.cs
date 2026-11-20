@@ -51,6 +51,9 @@ public class SelectedAssignment : ISControl, IConcurrentStatement
 {
     /// <summary>The variables in scope during selector and value evaluation.</summary>
     private readonly HashSet<Variable> _variables;
+    /// <summary>1-based source line of the statement (errors in its condition/selector report it).</summary>
+    private int _line;
+
     /// <summary>The token stream used for parsing the selected assignment, or null if constructed explicitly.</summary>
     private readonly TokenStream? _streamer;
     /// <summary>The target and each choice's assignment.</summary>
@@ -132,7 +135,7 @@ public class SelectedAssignment : ISControl, IConcurrentStatement
         if (!_target.IsDeclared || string.IsNullOrEmpty(SelectorExpression) || Choices.Count == 0)
             return Task.CompletedTask;
 
-        _selector ??= new Operation(SelectorExpression, _variables);
+        _selector ??= new Operation(SelectorExpression, _variables, _line);
         string selectorValue = ExtractValue(_selector.Evaluate());
 
         SelectionChoice? matched = null;
@@ -187,6 +190,7 @@ public class SelectedAssignment : ISControl, IConcurrentStatement
         // Capture the statement's source line up-front (before tokens are
         // consumed) for the gated validation pass at the end of this method.
         int sourceLine = _streamer.Current?.SourceLine ?? 0;
+        _line = sourceLine;
 
         // Expect 'with'
         if (_streamer.Current?.Value.ToLower() == "with")

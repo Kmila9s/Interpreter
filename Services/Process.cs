@@ -62,6 +62,12 @@ public partial class Process : ISControl
     /// </summary>
     public bool HasWait { get; private set; } = false;
 
+    /// <summary>The <c>wait on/until</c> the process is blocked on (cancelled when its timeout fires first).</summary>
+    internal Interpreter.Repositories.WaitForStatement? ConditionWait { get; set; }
+
+    /// <summary>The tick of the pending timeout of <c>wait … for</c> (cancelled when the condition fires first).</summary>
+    internal ulong? TimeoutTick { get; set; }
+
     /// <summary>1-based source line of the <c>process</c> keyword (0 for an equivalent process).</summary>
     public int SourceLine { get; private set; }
 

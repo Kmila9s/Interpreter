@@ -13,12 +13,8 @@ namespace Interpreter.Models;
 /// </summary>
 public static partial class TimeValue
 {
-    /// <summary>Time units in nanoseconds.</summary>
-    private static readonly Dictionary<string, double> UnitNs = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ["fs"] = 1e-6, ["ps"] = 1e-3, ["ns"] = 1, ["us"] = 1e3, ["ms"] = 1e6,
-        ["sec"] = 1e9, ["min"] = 6e10, ["hr"] = 3.6e12,
-    };
+    /// <summary>Nanoseconds per femtosecond (time values are femtoseconds, <see cref="PhysicalTime"/>).</summary>
+    private const double NsPerFs = 1e-6;
 
     [GeneratedRegex(@"\d[\d_]*(?:\.[\d_]+)?(?:[eE][+-]?\d+)?|[A-Za-z_]\w*|[()*/+-]")]
     private static partial Regex Lexeme();
@@ -81,9 +77,9 @@ public static partial class TimeValue
             if (char.IsDigit(t[0]))
             {
                 value = double.Parse(t.Replace("_", ""), CultureInfo.InvariantCulture);
-                if (pos < tokens.Count && UnitNs.TryGetValue(tokens[pos], out double unit))
+                if (pos < tokens.Count && PhysicalTime.UnitFs.TryGetValue(tokens[pos], out long unitFs))
                 {
-                    value *= unit; isTime = true; pos++;
+                    value *= unitFs * NsPerFs; isTime = true; pos++;
                 }
                 return true;
             }
@@ -95,8 +91,18 @@ public static partial class TimeValue
         {
             value = 0; isTime = false;
             if (depth > 8) return false;
-            object? raw = scope?.FirstOrDefault(v => v is not null && v.Name.Equals(name, StringComparison.OrdinalIgnoreCase))?.Value
-                ?? PackageRegistry.Instance.GetConstant(name)?.Value;
+            if (name.Equals("now", StringComparison.OrdinalIgnoreCase))
+            {
+                value = SignalAttributeHandler.Instance.NowFs * NsPerFs; isTime = true; return true;
+            }
+            var obj = scope?.FirstOrDefault(v => v is not null && v.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                ?? PackageRegistry.Instance.GetConstant(name);
+            // A time object holds femtoseconds; anything else is re-read from its value text.
+            if (obj is not null && PhysicalTime.IsTime(obj) && PhysicalTime.TryFs(obj.Value, out long fs))
+            {
+                value = fs * NsPerFs; isTime = true; return true;
+            }
+            object? raw = obj?.Value;
             return raw is not null && TryEvaluate(raw.ToString() ?? string.Empty, scope, depth + 1, out value, out isTime);
         }
     }

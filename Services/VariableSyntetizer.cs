@@ -391,7 +391,7 @@ public class VariableSyntetizer : ISControl
                 var prevShape = _currentShape;
                 _currentShape = ShapeOf(subtype);
 
-                value = ParseInitializationValue();
+                value = subtype.TypeName == PhysicalTime.TypeMark ? ParseTimeInitializer() : ParseInitializationValue();
 
                 _currentShape = prevShape;
             }
@@ -1239,7 +1239,8 @@ public class VariableSyntetizer : ISControl
             Constants.DATATYPES.BIT => "0",
             Constants.DATATYPES.BOOLEAN => false,
             Constants.DATATYPES.INTEGER or Constants.DATATYPES.NATURAL =>
-                subtype.TypeName is "time" or "real" ? 0 : (int)(subtype.ScalarLeft ?? int.MinValue),
+                subtype.TypeName == PhysicalTime.TypeMark ? long.MinValue          // time'left
+                : subtype.TypeName == "real" ? 0 : (int)(subtype.ScalarLeft ?? int.MinValue),
             Constants.DATATYPES.STRING => new string('\0', subtype.Width),
             Constants.DATATYPES.CHARACTER => "\0",
             _ => new object(),
@@ -1292,6 +1293,27 @@ public class VariableSyntetizer : ISControl
                 break;
         }
         return v;
+    }
+
+    /// <summary>
+    /// The initial value of a <c>time</c> object (<c>:= 4 ns</c>, <c>:= PERIOD / 2</c>):
+    /// the expression up to the declaration's end, in femtoseconds.
+    /// </summary>
+    private object ParseTimeInitializer()
+    {
+        var tokens = new List<string>();
+        int depth = 0;
+        while (_streamer.Current is { } t && !(depth == 0 && (t.Value == ";" || t.Value == ")")))
+        {
+            if (t.Value == "(") depth++;
+            else if (t.Value == ")") depth--;
+            tokens.Add(t.Value);
+            _streamer.MoveNext();
+        }
+        string text = string.Join(" ", tokens);
+        if (!TimeValue.TryEvaluateNs(text, Variables, out double ns))
+            throw new ParserException($"cannot evaluate the time expression \"{text}\"", _streamer.Current ?? _streamer.Previous);
+        return (long)Math.Round(ns * PhysicalTime.UnitFs["ns"]);
     }
 
     /// <summary>

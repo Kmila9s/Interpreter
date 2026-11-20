@@ -52,6 +52,9 @@ public class ConditionalAssignment : ISControl, IConcurrentStatement
 {
     /// <summary>The variables in scope during condition and value evaluation.</summary>
     private readonly HashSet<Variable> _variables;
+    /// <summary>1-based source line of the statement (errors in its condition/selector report it).</summary>
+    private int _line;
+
     /// <summary>The token stream used for parsing the conditional assignment, or null if constructed explicitly.</summary>
     private readonly TokenStream? _streamer;
     /// <summary>The target and each branch's assignment.</summary>
@@ -135,7 +138,7 @@ public class ConditionalAssignment : ISControl, IConcurrentStatement
             if (string.IsNullOrEmpty(branch.ConditionExpression))
                 continue;
 
-            branch.Condition ??= new Operation(branch.ConditionExpression, _variables);
+            branch.Condition ??= new Operation(branch.ConditionExpression, _variables, _line);
             if (Truth.Of(branch.Condition.Evaluate()))
             {
                 _target.Assign(branch, branch.ValueExpression, scheduler);
@@ -154,6 +157,7 @@ public class ConditionalAssignment : ISControl, IConcurrentStatement
     {
         if (_streamer == null) return;
 
+        _line = _streamer.Current?.SourceLine ?? 0;
         _target.Read(_streamer);
 
         // Expect '<='
@@ -268,6 +272,7 @@ public class ConditionalAssignment : ISControl, IConcurrentStatement
         string valuePart = operation[(assignIndex + 2)..].Trim();
 
         var assignment = new ConditionalAssignment(variables, targetPart);
+        assignment._line = sourceLine;
 
         // Parse branches from value part
         ParseBranchesFromString(assignment, valuePart);
