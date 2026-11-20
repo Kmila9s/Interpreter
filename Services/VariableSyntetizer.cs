@@ -1259,6 +1259,7 @@ public class VariableSyntetizer : ISControl
     /// </summary>
     private static Variable ApplyShape(Variable v, SubtypeIndication subtype)
     {
+        v.TypeMark = BaseTypeMark(subtype);
         if (subtype.Left is int left && subtype.Right is int right)
             v.SetDeclaredRange(left, right, subtype.IsDownto);
         var t = subtype.Custom;
@@ -1291,6 +1292,24 @@ public class VariableSyntetizer : ISControl
                 break;
         }
         return v;
+    }
+
+    /// <summary>
+    /// The type mark an object of <paramref name="subtype"/> has: the predefined
+    /// or user type a user subtype constrains (its base, recursively), else the
+    /// written mark — <c>subtype byte is signed(7 downto 0)</c> gives <c>signed</c>.
+    /// </summary>
+    private static string BaseTypeMark(SubtypeIndication subtype)
+    {
+        var t = subtype.Custom;
+        for (int guard = 0; t is { Kind: TypeKind.Subtype } && guard < 16; guard++)
+        {
+            string baseName = t.BaseTypeName.ToLowerInvariant();
+            var next = PackageSubtypeScanner.LookupGlobally(baseName);
+            if (next is null || ReferenceEquals(next, t)) return baseName;
+            t = next;
+        }
+        return (t?.Name ?? subtype.TypeName).ToLowerInvariant();
     }
 
     /// <summary>
@@ -1992,6 +2011,7 @@ public class VariableSyntetizer : ISControl
         var returnType = Constants.DATATYPES.UNKNOWN;
         int returnTypeSize = 0;
         string? customReturnTypeName = null;
+        string? returnTypeMark = null;
         string bodyRaw = string.Empty;
 
         if (_streamer.Current?.Value == "(")
@@ -2004,6 +2024,7 @@ public class VariableSyntetizer : ISControl
         {
             _streamer.MoveNext(); // consume 'return'
             string retTypeTok = _streamer.Current?.Value ?? "std_logic";
+            returnTypeMark = retTypeTok.ToLowerInvariant();
             returnType = Variable.GetDatatype(retTypeTok);
             if (returnType == Constants.DATATYPES.UNKNOWN)
                 customReturnTypeName = retTypeTok;
@@ -2193,6 +2214,7 @@ public class VariableSyntetizer : ISControl
                 ReturnType = returnType,
                 ReturnTypeSize = returnTypeSize,
                 CustomReturnTypeName = customReturnTypeName,
+                ReturnTypeMark = returnTypeMark,
                 BodyRaw = bodyRaw,
                 LocalVariables = localVariables,
                 IsPure = true,
@@ -2302,6 +2324,7 @@ public class VariableSyntetizer : ISControl
                     Name = n,
                     Type = dataType,
                     CustomTypeName = customTypeName,
+                    TypeMark = typeTok.ToLowerInvariant(),
                     Mode = mode,
                     Size = size,
                     HighBound = hi,

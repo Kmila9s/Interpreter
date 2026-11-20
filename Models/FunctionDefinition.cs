@@ -46,6 +46,9 @@ public class FunctionDefinition
     /// </summary>
     public string? CustomReturnTypeName { get; set; }
 
+    /// <summary>The declared return type mark (lower case), as <see cref="Variable.TypeMark"/>.</summary>
+    public string? ReturnTypeMark { get; set; }
+
     /// <summary>
     /// Gets or sets the return type size (for vectors).
     /// </summary>
