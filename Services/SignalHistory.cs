@@ -549,9 +549,10 @@ public class SignalHistory
             sb.AppendLine("$upscope $end");
             sb.AppendLine("$enddefinitions $end");
 
-            // Get all unique time points sorted
+            // One sample per real instant: the value settled after its last delta
+            // (internal time is tick*1000 + delta), like GHDL's dump.
             var allTimes = _history.Values
-                .SelectMany(h => h.Select(e => e.Item1))
+                .SelectMany(h => h.Select(e => SettledMoment(e.Item1 / 1000)))
                 .Distinct()
                 .OrderBy(t => t)
                 .ToList();
@@ -603,7 +604,7 @@ public class SignalHistory
                             // Convert internal time to VCD time
                             // Our time format: tick * 1000 + delta
                             // VCD time: in units of timescale
-                            long vcdTime = time * timescaleNs;
+                            long vcdTime = time / 1000 * 1000 * timescaleNs;
                             sb.AppendLine($"#{vcdTime}");
                             hasChanges = true;
                         }
@@ -750,56 +751,32 @@ public class SignalHistory
     /// <summary>
     /// Formats a value for VCD output.
     /// </summary>
+    /// <summary>
+    /// The internal time (tick*1000 + delta) at which tick <paramref name="tick"/>'s values have
+    /// settled after all its deltas: the moment a VCD sample or a waveform probe reads.
+    /// </summary>
+    public static long SettledMoment(long tick) => tick * 1000 + 999;
+
     private static string FormatVcdValue(object? value, int width)
     {
         if (value == null)
             return width == 1 ? "x" : $"b{new string('x', width)} ";
-
-        string valueStr = value.ToString() ?? "";
-
-        // Handle boolean
         if (value is bool b)
             return b ? "1" : "0";
 
-        // Handle single bit (std_logic)
+        // The nine std_logic values are written as they are (upper case, like GHDL);
+        // anything else is unknown.
+        string valueStr = value.ToString() ?? "";
+        static char Bit(char c) => StdLogic.IsValue(c) ? StdLogic.Norm(c) : 'X';
         if (width == 1)
-        {
-            if (valueStr.Length == 1)
-            {
-                char c = char.ToLower(valueStr[0]);
-                return c switch
-                {
-                    '0' => "0",
-                    '1' => "1",
-                    'z' => "z",
-                    'x' => "x",
-                    'u' => "x",
-                    '-' => "x",
-                    _ => "x"
-                };
-            }
-            return "x";
-        }
-
-        // Handle multi-bit (std_logic_vector)
+            return valueStr.Length == 1 ? Bit(valueStr[0]).ToString() : "X";
         // VCD format: bVALUE IDENTIFIER (note the space before identifier)
-        var vcdBits = new System.Text.StringBuilder("b");
-        foreach (char c in valueStr)
+        return string.Create(valueStr.Length + 2, valueStr, static (r, src) =>
         {
-            char lc = char.ToLower(c);
-            vcdBits.Append(lc switch
-            {
-                '0' => '0',
-                '1' => '1',
-                'z' => 'z',
-                'x' => 'x',
-                'u' => 'x',
-                '-' => 'x',
-                _ => 'x'
-            });
-        }
-        vcdBits.Append(' ');
-        return vcdBits.ToString();
+            r[0] = 'b';
+            for (int i = 0; i < src.Length; i++) r[i + 1] = Bit(src[i]);
+            r[^1] = ' ';
+        });
     }
 
     /// <summary>

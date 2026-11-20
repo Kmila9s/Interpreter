@@ -1,3 +1,4 @@
+using Interpreter.Models;
 using Interpreter.Interfaces;
 using Interpreter.Repositories;
 using Parser.Models;
@@ -1155,9 +1156,7 @@ public class DeltaCycleEngine : IDisposable
                 if (ws.Condition != null)
                 {
                     var result = ws.Condition.Execute();
-                    condition = result is Variable v
-                        ? Convert.ToBoolean(v.Value)
-                        : Convert.ToBoolean(result);
+                    condition = Truth.Of(result);
                 }
                 if (!condition) return false;
             }
@@ -1340,8 +1339,8 @@ public class DeltaCycleEngine : IDisposable
             if (b.IsElse) { matchIdx = i; break; } // else is last per parse
             if (b.Condition != null)
             {
-                var result = b.Condition.Execute() as Variable;
-                if (result?.Value is bool cond && cond)
+                var result = b.Condition.Execute();
+                if (Truth.Of(result))
                 {
                     matchIdx = i;
                     break;
@@ -1425,11 +1424,7 @@ public class DeltaCycleEngine : IDisposable
             foreach (var choice in b.Choices)
             {
                 string cleanChoice = ResolveChoiceForCase(choice);
-                bool hit = caseStruct.IsMatching
-                    ? MatchesWithWildcards(cleanChoice, selectorValue)
-                    : exprSelector
-                        ? CaseStructure.ChoiceMatchesNumeric(cleanChoice, selectorValue)
-                        : cleanChoice.Equals(selectorValue, StringComparison.OrdinalIgnoreCase);
+                bool hit = CaseChoice.Matches(cleanChoice, selectorValue, caseStruct.IsMatching, exprSelector);
                 if (hit)
                 {
                     matchIdx = i;
@@ -1655,8 +1650,8 @@ public class DeltaCycleEngine : IDisposable
             // Evaluate condition
             if (branch.Condition != null)
             {
-                var result = branch.Condition.Execute() as Variable;
-                if (result?.Value is bool condition && condition)
+                var result = branch.Condition.Execute();
+                if (Truth.Of(result))
                 {
                     // #5: branch taken — let breakpoint consumers pause on the
                     // condition's source line.
@@ -1739,11 +1734,7 @@ public class DeltaCycleEngine : IDisposable
             foreach (var choice in branch.Choices)
             {
                 string cleanChoice = ResolveChoiceForCase(choice);
-                bool hit = caseStruct.IsMatching
-                    ? MatchesWithWildcards(cleanChoice, selectorValue)
-                    : exprSelector
-                        ? CaseStructure.ChoiceMatchesNumeric(cleanChoice, selectorValue)
-                        : cleanChoice.Equals(selectorValue, StringComparison.OrdinalIgnoreCase);
+                bool hit = CaseChoice.Matches(cleanChoice, selectorValue, caseStruct.IsMatching, exprSelector);
                 if (hit)
                 {
                     matchingBranch = branch;
@@ -1783,27 +1774,6 @@ public class DeltaCycleEngine : IDisposable
     /// when the token doesn't resolve to anything recognisable so the
     /// legacy string match still has a chance.
     /// </summary>
-    /// <summary>
-    /// VHDL-2008 matching-case comparison (Tier 4.2, 2026-07-28): `-` in the
-    /// choice literal matches any bit of the selector at that position;
-    /// everything else is a bit-for-bit exact compare (case-insensitive).
-    /// A length mismatch is a non-match rather than an error so the loop
-    /// continues to the next arm or falls through to `others`. Kept as a
-    /// static helper local to DeltaCycleEngine to avoid exposing another
-    /// case-matching entry point outside this file.
-    /// </summary>
-    private static bool MatchesWithWildcards(string choice, string selector)
-    {
-        if (choice.Length != selector.Length) return false;
-        for (int i = 0; i < choice.Length; i++)
-        {
-            char c = choice[i];
-            if (c == '-') continue;
-            if (char.ToUpperInvariant(c) != char.ToUpperInvariant(selector[i])) return false;
-        }
-        return true;
-    }
-
     private string ResolveChoiceForCase(string choice)
     {
         string clean = choice?.Trim() ?? string.Empty;
@@ -1923,14 +1893,7 @@ public class DeltaCycleEngine : IDisposable
             if (whileLoop.Condition != null)
             {
                 var result = whileLoop.Condition.Execute();
-                if (result is Variable v)
-                {
-                    condition = Convert.ToBoolean(v.Value);
-                }
-                else
-                {
-                    condition = Convert.ToBoolean(result);
-                }
+                condition = Truth.Of(result);
             }
 
             if (!condition)

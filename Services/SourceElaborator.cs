@@ -231,8 +231,16 @@ public sealed class SourceElaborator
             string aliasPrefix = $"{pathPrefix}{label}__";
             // A formal written with selectors (`p.lo => a`, `v(0) => b`) renames
             // and declares its base port once; each association wires its part.
+            // An input left `open` or not associated takes its default (LRM 6.5.6.3): its
+            // alias is declared with the default and has no driver.
+            portMappings.RemoveAll(kv => kv.Value.Equals("open", StringComparison.OrdinalIgnoreCase));
+            var associated = portMappings.Select(kv => FormalBase(kv.Key)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var unassociated = portInfo.Where(p => !p.Value.IsOutput && !associated.Contains(p.Key))
+                .Select(p => p.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
             foreach (var kv in portMappings)
                 rename[FormalBase(kv.Key)] = aliasPrefix + FormalBase(kv.Key);
+            foreach (var formal in unassociated)
+                rename[formal] = aliasPrefix + formal;
 
             // Generic values: the child's defaults, overridden by the generic map
             // (P4: without the defaults the alias declarations would keep
@@ -265,7 +273,8 @@ public sealed class SourceElaborator
 
             declSb.AppendLine();
             declSb.AppendLine($"  -- ↓ inlined from component {label} : {entName}");
-            foreach (var formal in portMappings.Select(kv => FormalBase(kv.Key)).Distinct(StringComparer.OrdinalIgnoreCase))
+            // Declaration order = association order (the flattened text must stay stable), then the defaults.
+            foreach (var formal in portMappings.Select(kv => FormalBase(kv.Key)).Distinct(StringComparer.OrdinalIgnoreCase).Concat(unassociated))
             {
                 var aliasName = aliasPrefix + formal;
                 if (portInfo.TryGetValue(formal, out var info))
@@ -280,7 +289,9 @@ public sealed class SourceElaborator
                             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                                 { [gv.Key] = gv.Value });
                     }
-                    declSb.AppendLine($"  signal {aliasName} : {typeText};");
+                    string init = unassociated.Contains(formal) && info.Default is { } d
+                        ? $" := {d}" : "";
+                    declSb.AppendLine($"  signal {aliasName} : {typeText}{init};");
                 }
                 else
                 {
@@ -362,6 +373,8 @@ public sealed class SourceElaborator
     {
         public string TypeText { get; init; } = "STD_LOGIC";
         public bool   IsOutput { get; init; }
+        /// <summary>The port's default expression (<c>:= …</c>), or null.</summary>
+        public string? Default { get; init; }
     }
 
     private static Dictionary<string, PortInfo> ExtractPortInfo(string entityText)
@@ -397,10 +410,12 @@ public sealed class SourceElaborator
             {
                 var t = name.Trim();
                 if (string.IsNullOrEmpty(t)) continue;
+                var (type, @default) = SplitDefault(typeText);
                 info[t.ToLowerInvariant()] = new PortInfo
                 {
-                    TypeText = StripDefault(typeText),
+                    TypeText = type,
                     IsOutput = isOutput,
+                    Default = @default,
                 };
             }
         }
@@ -414,11 +429,11 @@ public sealed class SourceElaborator
             }
             return -1;
         }
-        static string StripDefault(string typeText)
+        // `type := default` → (type, default or null).
+        static (string Type, string? Default) SplitDefault(string typeText)
         {
-            // Drop any `:= default` clause.
             int idx = typeText.IndexOf(":=");
-            return (idx >= 0 ? typeText.Substring(0, idx) : typeText).Trim();
+            return idx >= 0 ? (typeText[..idx].Trim(), typeText[(idx + 2)..].Trim()) : (typeText.Trim(), null);
         }
     }
 

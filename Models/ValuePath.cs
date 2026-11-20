@@ -109,7 +109,7 @@ public sealed class ValuePath
                     int r = ix.Right?.Evaluate() ?? l;
                     if (l < 0 || r < 0) return null;
                     var part = ix.Right is null
-                        ? VectorIndexing.Element(shape, l, width)
+                        ? (_isStatic ? VectorIndexing.Element(shape, l, width) : VectorIndexing.ElementAtRunTime(shape, l, width))
                         : VectorIndexing.Range(shape, l, r, width);
                     if (part is not { } p) return null;
                     start += p.Start;

@@ -14,7 +14,6 @@ namespace Interpreter.Services;
 /// <item><strong>Edge Detection:</strong> rising_edge(), falling_edge()</item>
 /// <item><strong>Type Conversions:</strong> to_integer(), to_unsigned(), to_signed(), std_logic_vector()</item>
 /// <item><strong>Vector Operations:</strong> resize(), shift_left(), shift_right(), rotate_left(), rotate_right()</item>
-/// <item><strong>Arithmetic:</strong> AddVectors(), SubtractVectors()</item>
 /// <item><strong>Synthesis Functions:</strong> clog2() - ceiling of log base 2</item>
 /// </list>
 /// <para><strong>v0.13.0 Improvements:</strong></para>
@@ -32,47 +31,11 @@ namespace Interpreter.Services;
 /// </remarks>
 public static class StandardFunctions
 {
-    /// <summary>
-    /// Checks if a string contains VHDL meta-values ('U', 'X', 'Z', 'W', 'L', 'H', '-').
-    /// </summary>
-    private static bool ContainsMetaValues(string s) =>
-        s.IndexOfAny(['U', 'X', 'Z', 'W', 'L', 'H', '-']) >= 0;
+    /// <summary>IEEE <c>rising_edge(s)</c> (see <see cref="SignalAttributeHandler.IsRisingEdge"/>).</summary>
+    public static bool RisingEdge(Variable signal) => SignalAttributeHandler.Instance.IsRisingEdge(signal);
 
-    /// <summary>
-    /// IEEE standard rising_edge function.
-    /// Returns true if signal has an event and current value is '1'.
-    /// Usage: rising_edge(clk)
-    /// </summary>
-    public static bool RisingEdge(Variable signal)
-    {
-        var handler = SignalAttributeHandler.Instance;
-
-        // Check if signal had an event
-        if (!handler.GetEvent(signal))
-            return false;
-
-        // Check if current value is '1'
-        string currentValue = signal.Value?.ToString()?.Replace("'", "").Replace("\"", "") ?? "";
-        return currentValue == "1";
-    }
-
-    /// <summary>
-    /// IEEE standard falling_edge function.
-    /// Returns true if signal has an event and current value is '0'.
-    /// Usage: falling_edge(clk)
-    /// </summary>
-    public static bool FallingEdge(Variable signal)
-    {
-        var handler = SignalAttributeHandler.Instance;
-
-        // Check if signal had an event
-        if (!handler.GetEvent(signal))
-            return false;
-
-        // Check if current value is '0'
-        string currentValue = signal.Value?.ToString()?.Replace("'", "").Replace("\"", "") ?? "";
-        return currentValue == "0";
-    }
+    /// <summary>IEEE <c>falling_edge(s)</c> (see <see cref="SignalAttributeHandler.IsFallingEdge"/>).</summary>
+    public static bool FallingEdge(Variable signal) => SignalAttributeHandler.Instance.IsFallingEdge(signal);
 
     /// <summary>
     /// Converts an integer to std_logic_vector.
@@ -98,10 +61,12 @@ public static class StandardFunctions
         if (string.IsNullOrEmpty(cleaned))
             return 0;
 
-        // v0.13.0 Fix: Handle VHDL meta-values 'U' (uninitialized), 'X' (unknown), 'Z' (high-impedance)
-        // These cannot be converted to integers, so treat as 0
-        if (cleaned.Contains('U') || cleaned.Contains('X') || cleaned.Contains('Z'))
-            return 0;
+        // A bit string: weak levels read as 0/1; a metavalue gives 0 with numeric_std's warning.
+        if (StdLogic.IsVector(cleaned) && !cleaned.All(char.IsDigit))
+        {
+            if (StdLogic.TryToUnsigned(cleaned, out long bits) && bits <= int.MaxValue) return (int)bits;
+            if (StdLogic.IsX(cleaned)) { Operator.NumericStdWarning("TO_INTEGER: metavalue detected, returning 0"); return 0; }
+        }
 
         // v3.2 (#29) ordering fix:
         //   Binary first when the string is multi-character and all 0s/1s.
@@ -182,62 +147,6 @@ public static class StandardFunctions
     }
 
     /// <summary>
-    /// Vector addition with carry.
-    /// </summary>
-    public static string AddVectors(string a, string b)
-    {
-        string cleanA = a.Replace("\"", "").Replace("'", "");
-        string cleanB = b.Replace("\"", "").Replace("'", "");
-
-        int maxLen = Math.Max(cleanA.Length, cleanB.Length);
-        // Handle meta-values: treat as zero
-        if (ContainsMetaValues(cleanA)) cleanA = new string('0', maxLen);
-        if (ContainsMetaValues(cleanB)) cleanB = new string('0', maxLen);
-        cleanA = cleanA.PadLeft(maxLen, '0');
-        cleanB = cleanB.PadLeft(maxLen, '0');
-
-        try
-        {
-            int valA = Convert.ToInt32(cleanA, 2);
-            int valB = Convert.ToInt32(cleanB, 2);
-            int result = valA + valB;
-            return ToStdLogicVector(result, maxLen);
-        }
-        catch { return new string('0', maxLen); }
-    }
-
-    /// <summary>
-    /// Vector subtraction.
-    /// Handles VHDL meta-values ('U', 'X', 'Z') by treating them as zero.
-    /// </summary>
-    public static string SubtractVectors(string a, string b)
-    {
-        string cleanA = a.Replace("\"", "").Replace("'", "");
-        string cleanB = b.Replace("\"", "").Replace("'", "");
-
-        int maxLen = Math.Max(cleanA.Length, cleanB.Length);
-        // Handle meta-values: treat as zero
-        if (ContainsMetaValues(cleanA)) cleanA = new string('0', maxLen);
-        if (ContainsMetaValues(cleanB)) cleanB = new string('0', maxLen);
-        cleanA = cleanA.PadLeft(maxLen, '0');
-        cleanB = cleanB.PadLeft(maxLen, '0');
-
-        try
-        {
-            int valA = Convert.ToInt32(cleanA, 2);
-            int valB = Convert.ToInt32(cleanB, 2);
-            int result = valA - valB;
-
-            // Handle negative results (2's complement)
-            if (result < 0)
-                result += (1 << maxLen);
-
-            return ToStdLogicVector(result, maxLen);
-        }
-        catch { return new string('0', maxLen); }
-    }
-
-    /// <summary>
     /// Computes ceiling of log base 2 (number of bits needed to represent val).
     /// Common VHDL/synthesis function.
     /// </summary>
@@ -253,6 +162,17 @@ public static class StandardFunctions
         }
         return result;
     }
+
+    /// <summary>
+    /// v3.1.5 IEEE functions evaluated only while simulating (never folded at analysis): the
+    /// metavalue conversions/predicates, bit ↔ std_ulogic and the std_logic_arith helpers.
+    /// </summary>
+    public static readonly HashSet<string> LiveFunctions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "to_x01", "to_x01z", "to_ux01", "to_01", "is_x", "std_match",
+        "to_stdulogic", "to_stdlogicvector", "to_stdulogicvector", "to_bit", "to_bitvector",
+        "shl", "shr", "ext", "sxt", "conv_unsigned", "conv_signed",
+    };
 
     /// <summary>
     /// Checks if a function name is a standard function.
@@ -277,7 +197,7 @@ public static class StandardFunctions
             "conv_integer" => true,
             "std_logic_vector" => true,
             "clog2" => true,
-            _ => false
+            var other => LiveFunctions.Contains(other)
         };
     }
 
@@ -487,39 +407,44 @@ public static class StandardFunctions
                 }
                 return "0";
 
-            // Phase 5: meta-value normalization from std_logic_1164.
-            // to_x01: map U/X/Z/W/-/L/H → X/X/X/X/X/0/1; keep 0/1.
-            // is_x:   returns true iff any bit is one of the meta-values.
+            // IEEE 1164 / numeric_std metavalue functions (StdLogic holds the tables).
             case "to_x01":
+            case "to_x01z":
+            case "to_ux01":
                 if (arguments.Length >= 1)
                 {
-                    string s = GetStringValue(arguments[0], variables);
-                    var sb = new System.Text.StringBuilder(s.Length);
-                    foreach (char c in s)
+                    string name = functionName.ToLowerInvariant();
+                    return new string(GetStringValue(arguments[0], variables).Select(c => StdLogic.Norm(c) switch
                     {
-                        sb.Append(c switch {
-                            '0' or 'L' or 'l' => '0',
-                            '1' or 'H' or 'h' => '1',
-                            'U' or 'u' or 'X' or 'x' or 'Z' or 'z'
-                                or 'W' or 'w' or '-' => 'X',
-                            _ => c,
-                        });
-                    }
-                    return sb.ToString();
+                        'Z' when name == "to_x01z" => 'Z',
+                        'U' when name == "to_ux01" => 'U',
+                        _ => StdLogic.ToX01(c),
+                    }).ToArray());
                 }
                 return "";
 
+            // bit ↔ std_ulogic conversions: to_bit maps 1/H to '1', anything else to '0'.
+            case "to_stdulogic":
+            case "to_stdlogicvector":
+            case "to_stdulogicvector":
+                return arguments.Length >= 1 ? GetStringValue(arguments[0], variables) : "";
+            case "to_bit":
+            case "to_bitvector":
+                return arguments.Length >= 1
+                    ? new string(GetStringValue(arguments[0], variables).Select(c => StdLogic.ToX01(c) == '1' ? '1' : '0').ToArray())
+                    : "";
+
+            case "to_01":
+                return arguments.Length >= 1 ? StdLogic.To01(GetStringValue(arguments[0], variables)) : "";
+
             case "is_x":
-                if (arguments.Length >= 1)
+                return arguments.Length >= 1 && StdLogic.IsX(GetStringValue(arguments[0], variables));
+
+            case "std_match":
+                if (arguments.Length >= 2)
                 {
-                    string s = GetStringValue(arguments[0], variables);
-                    foreach (char c in s)
-                    {
-                        if (c is 'U' or 'u' or 'X' or 'x' or 'Z' or 'z'
-                             or 'W' or 'w' or '-')
-                            return true;
-                    }
-                    return false;
+                    string a = GetStringValue(arguments[0], variables), b = GetStringValue(arguments[1], variables);
+                    return a.Length == b.Length && a.Zip(b).All(p => StdLogic.Match(p.First, p.Second));
                 }
                 return false;
 

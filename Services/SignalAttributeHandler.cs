@@ -1,3 +1,4 @@
+using Interpreter.Models;
 using Parser.Models;
 using static Parser.Models.Constants;
 
@@ -235,20 +236,22 @@ public class SignalAttributeHandler
     /// <summary>signal'active — treated as an alias for 'event today (no driver-transaction model yet).</summary>
     public bool GetActive(Variable signal) => GetEvent(signal);
 
-    /// <summary>rising_edge shorthand: 'event AND value == '1'.</summary>
-    public bool IsRisingEdge(Variable signal)
-    {
-        if (!GetEvent(signal)) return false;
-        string v = signal.Value?.ToString()?.Replace("'", "").Replace("\"", "") ?? "";
-        return v == "1";
-    }
+    /// <summary>
+    /// <c>rising_edge</c>: an event with <c>To_X01(last_value) = '0'</c> and <c>To_X01(value) = '1'</c>
+    /// (IEEE 1164), so <c>U→1</c> and <c>X→1</c> are not rising edges and <c>0→H</c> is.
+    /// </summary>
+    public bool IsRisingEdge(Variable signal) => IsEdge(signal, '0', '1');
 
-    /// <summary>falling_edge shorthand: 'event AND value == '0'.</summary>
-    public bool IsFallingEdge(Variable signal)
+    /// <summary><c>falling_edge</c>: an event with <c>To_X01(last_value) = '1'</c> and <c>To_X01(value) = '0'</c>.</summary>
+    public bool IsFallingEdge(Variable signal) => IsEdge(signal, '1', '0');
+
+    private bool IsEdge(Variable signal, char from, char to) =>
+        GetEvent(signal) && Level(signal.Value) == to && Level(GetLastValue(signal)) == from;
+
+    private static char Level(object? value)
     {
-        if (!GetEvent(signal)) return false;
-        string v = signal.Value?.ToString()?.Replace("'", "").Replace("\"", "") ?? "";
-        return v == "0";
+        string v = value?.ToString()?.Replace("'", "").Replace("\"", "") ?? "";
+        return v.Length == 1 ? StdLogic.ToX01(v[0]) : 'X';
     }
 
     /// <summary>Clears per-simulation state. Called from <c>DeltaCycleEngine.Reset</c>.</summary>

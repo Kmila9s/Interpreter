@@ -132,7 +132,7 @@ public class ConditionalAssignment : ISControl
                 continue;
 
             branch.Condition ??= new Operation(branch.ConditionExpression, _variables);
-            if (EvaluateConditionResult(branch.Condition.Evaluate()))
+            if (Truth.Of(branch.Condition.Evaluate()))
             {
                 _target.Assign(branch, branch.ValueExpression, scheduler);
                 return Task.CompletedTask;
@@ -142,23 +142,6 @@ public class ConditionalAssignment : ISControl
         return Task.CompletedTask;
     }
 
-    /// <summary>
-    /// Evaluates a condition result to determine if it represents true.
-    /// </summary>
-    /// <param name="result">The result of a condition evaluation (bool, char, string, or Variable).</param>
-    /// <returns>True if the result represents a true/positive condition.</returns>
-    private static bool EvaluateConditionResult(object? result)
-    {
-        if (result is bool boolResult)
-            return boolResult;
-        if (result is char charResult)
-            return charResult == '1';
-        if (result is string strResult)
-            return strResult == "1" || strResult.Equals("true", StringComparison.OrdinalIgnoreCase);
-        if (result is Variable varResult)
-            return EvaluateConditionResult(varResult.Value);
-        return false;
-    }
 
     /// <summary>
     /// Synthesizes the conditional assignment from the token stream.

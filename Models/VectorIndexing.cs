@@ -39,6 +39,20 @@ public static class VectorIndexing
         return (slot * width, width);
     }
 
+    /// <summary>
+    /// The span of element/bit <paramref name="index"/> computed at run time; an index outside the
+    /// range is the run-time error GHDL reports (<c>index (6) out of bounds (3 downto 0)</c>).
+    /// </summary>
+    public static (int Start, int Width) ElementAtRunTime(Variable v, int index, int length) =>
+        Element(v, index, length) ?? throw new SimulationRuntimeException($"index ({index}) out of bounds ({RangeText(v, length)})");
+
+    private static string RangeText(Variable v, int length)
+    {
+        if (v.HasDeclaredRange) return $"{v.LeftBound} {(v.IsDownto ? "downto" : "to")} {v.RightBound}";
+        int units = v.ElementSize > 1 ? length / v.ElementSize : length;
+        return $"{units - 1} downto 0";
+    }
+
     /// <summary>Storage span covering indices <paramref name="left"/>..<paramref name="right"/> (either direction), or null when either end is out of range.</summary>
     public static (int Start, int Width)? Range(Variable v, int left, int right, int length)
     {

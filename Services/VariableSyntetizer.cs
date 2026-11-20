@@ -381,7 +381,7 @@ public class VariableSyntetizer : ISControl
             object value = new();
             bool hasInitializer = false;
             // Handle initialization with :=
-            if (!_isPort && _streamer.Current?.Value == ":=")
+            if (_streamer.Current?.Value == ":=")
             {
                 hasInitializer = true;
                 _streamer.Expect(OPERATORS); // consume ":="
@@ -406,16 +406,8 @@ public class VariableSyntetizer : ISControl
                 if (_isPort && dataType == Constants.DATATYPES.STD_LOGIC_VECTOR)
                     Console.WriteLine($"[VariableSyntetizer] Creating port '{variable.Name}' with VectorSize={VectorSize}");
 #endif
-                // Determine initial value - use custom type default if applicable
-                object initValue = value;
-                // Packed composites (records, arrays of records) start from their
-                // field defaults; other types keep today's seeding until the LRM
-                // initial-value policy (v3.1.5).
-                if (!_isPort && !hasInitializer
-                    && (customTypeDef?.Kind == TypeKind.Record || customTypeDef?.ElementShape?.Layout != null))
-                {
-                    initValue = customTypeDef.GetDefaultValue();
-                }
+                // Without `:=` the object starts at its type's LRM default (T'left).
+                object initValue = hasInitializer ? value : LrmDefault(subtype);
                 // Eagerly expand `(others=>X)` aggregate to a literal bitstring
                 // when the declared vector size is known. The Size setter only
                 // expands the marker when `_value` is already non-null, but the
@@ -425,8 +417,7 @@ public class VariableSyntetizer : ISControl
                 // Covers std_logic_vector, unsigned, signed, bit_vector, and the
                 // other vector-shaped types — the marker form is by definition
                 // vector-only in VHDL, so VectorSize>0 + marker pattern suffices.
-                if (!_isPort
-                    && VectorSize > 0
+                if (VectorSize > 0
                     && HdlLiteral.TryOthersFill(initValue as string, out char fill))
                 {
                     initValue = new string(fill, VectorSize);
@@ -442,7 +433,9 @@ public class VariableSyntetizer : ISControl
                     // Generics are constants too (fixed at elaboration).
                     IsConstant = _isGeneric || varType.Equals("constant", StringComparison.OrdinalIgnoreCase),
                     Size = VectorSize,  // Set Size BEFORE Value to avoid Size setter issues
-                    Value = !_isPort ? initValue : null!,
+                    Value = initValue,
+                    HasInitializer = hasInitializer,
+                    ScalarRange = subtype.ScalarRange,
                 };
 
                 ApplyShape(newVar, subtype);
@@ -745,14 +738,8 @@ public class VariableSyntetizer : ISControl
             int? rhsInt = TryAsInt(rhs);
             if (lhsInt.HasValue && rhsInt.HasValue)
             {
-                value = op switch
-                {
-                    "+" => lhsInt.Value + rhsInt.Value,
-                    "-" => lhsInt.Value - rhsInt.Value,
-                    "*" => lhsInt.Value * rhsInt.Value,
-                    "/" => rhsInt.Value == 0 ? 0 : lhsInt.Value / rhsInt.Value,
-                    _   => value
-                };
+                if (op is "+" or "-" or "*" or "/")
+                    value = (int)IntegerArithmetic.Apply(op, lhsInt.Value, rhsInt.Value);
             }
             else
             {
@@ -1232,7 +1219,32 @@ public class VariableSyntetizer : ISControl
     /// </summary>
     private readonly record struct SubtypeIndication(
         Constants.DATATYPES Type, TypeDefinition? Custom, int Width,
-        int? Left, int? Right, bool IsDownto, bool Signed);
+        int? Left, int? Right, bool IsDownto, bool Signed,
+        string TypeName = "", long? ScalarLeft = null, (long Low, long High)? ScalarRange = null);
+
+    /// <summary>
+    /// The LRM initial value of an object of <paramref name="subtype"/> declared without
+    /// <c>:=</c> (<c>T'left</c>): std_logic <c>'U'</c> (vectors all <c>'U'</c>), bit <c>'0'</c>,
+    /// boolean FALSE, an integer its range's left bound (<c>integer'left</c> when unconstrained),
+    /// an enumeration its first literal, a record/array field by field, character NUL.
+    /// </summary>
+    private static object LrmDefault(SubtypeIndication subtype)
+    {
+        if (subtype.Custom is { } custom && custom.Kind is TypeKind.Record or TypeKind.Enumeration or TypeKind.Array)
+            return custom.GetDefaultValue();
+        return subtype.Type switch
+        {
+            Constants.DATATYPES.STD_LOGIC => "U",
+            Constants.DATATYPES.STD_LOGIC_VECTOR => new string(subtype.TypeName is "bit_vector" or "boolean_vector" ? '0' : 'U', subtype.Width),
+            Constants.DATATYPES.BIT => "0",
+            Constants.DATATYPES.BOOLEAN => false,
+            Constants.DATATYPES.INTEGER or Constants.DATATYPES.NATURAL =>
+                subtype.TypeName is "time" or "real" ? 0 : (int)(subtype.ScalarLeft ?? int.MinValue),
+            Constants.DATATYPES.STRING => new string('\0', subtype.Width),
+            Constants.DATATYPES.CHARACTER => "\0",
+            _ => new object(),
+        };
+    }
 
     /// <summary>A template object of <paramref name="subtype"/> (record fields, array elements, initializer shape).</summary>
     private static Variable ShapeOf(SubtypeIndication subtype) =>
@@ -1305,6 +1317,9 @@ public class VariableSyntetizer : ISControl
         string dataTypeStr = mark.Name;
         var customTypeDef = mark.Custom;
         bool signedInt = dataType == Constants.DATATYPES.INTEGER;
+        // Integer subtypes: 'left and the bounds (natural = 0 to integer'high, positive = 1 to …).
+        long? scalarLeft = dataTypeStr switch { "natural" => 0, "positive" => 1, _ => null };
+        (long Low, long High)? scalarRange = scalarLeft is long l0 ? (l0, int.MaxValue) : null;
         // v0.13.0: Handle custom types - they are IDENTIFIERS not KEYWORDS
         // For custom types found in the registry, consume the type identifier directly
         if (customTypeDef != null)
@@ -1332,7 +1347,7 @@ public class VariableSyntetizer : ISControl
         }
 
         // Handle vector types with parentheses (std_logic_vector, bit_vector, signed, unsigned, etc.)
-        if (dataType == Constants.DATATYPES.STD_LOGIC_VECTOR ||
+        if (dataType == Constants.DATATYPES.STD_LOGIC_VECTOR || dataType == Constants.DATATYPES.STRING ||
             dataTypeStr == "bit_vector" || dataTypeStr == "signed" || dataTypeStr == "unsigned" ||
             dataTypeStr == "std_ulogic_vector" || dataTypeStr == "boolean_vector" || dataTypeStr == "integer_vector")
         {
@@ -1379,6 +1394,8 @@ public class VariableSyntetizer : ISControl
                 _streamer.Expect(KEYWORDS); // consume "to"
                 int end = ReadRangeBound();
                 VectorSize = RangeToBitWidth(initial, end);
+                scalarLeft = initial;
+                scalarRange = (Math.Min(initial, end), Math.Max(initial, end));
             signedInt = Math.Min(initial, end) < 0;
             }
         }
@@ -1421,6 +1438,11 @@ public class VariableSyntetizer : ISControl
             else if (customTypeDef.Kind == TypeKind.Subtype)
             {
                 dataType = customTypeDef.BaseType;
+                if (dataType is Constants.DATATYPES.INTEGER or Constants.DATATYPES.NATURAL)
+                {
+                    scalarLeft = customTypeDef.IsDownto ? customTypeDef.SubtypeRange.High : customTypeDef.SubtypeRange.Low;
+                    scalarRange = (customTypeDef.SubtypeRange.Low, customTypeDef.SubtypeRange.High);
+                }
                 // Inherit the subtype's declared range so signals of a
                 // subtype like `byte is std_logic_vector(7 downto 0)` index
                 // correctly. SubtypeRange is stored (High=max, Low=min).
@@ -1437,7 +1459,8 @@ public class VariableSyntetizer : ISControl
                 dataType = Constants.DATATYPES.STD_LOGIC_VECTOR;
             }
         }
-        return new SubtypeIndication(dataType, customTypeDef, VectorSize, declLeft, declRight, declIsDownto, signedInt);
+        return new SubtypeIndication(dataType, customTypeDef, VectorSize, declLeft, declRight, declIsDownto, signedInt,
+            dataTypeStr, scalarLeft, scalarRange);
     }
 
     /// <summary>
@@ -2572,15 +2595,8 @@ public class VariableSyntetizer : ISControl
             string op = t[i++];
             var b = ResolveToken(t[i++]);
             if (b == null) return null;
-            acc = op switch
-            {
-                "+" => acc + b.Value,
-                "-" => acc - b.Value,
-                "*" => acc * b.Value,
-                "/" => b.Value != 0 ? acc / b.Value : 0,
-                _   => int.MinValue,
-            };
-            if (acc == int.MinValue) return null;
+            if (op is not ("+" or "-" or "*" or "/")) return null;
+            acc = (int)IntegerArithmetic.Apply(op, acc, b.Value);
         }
         return i == t.Count ? acc : null;
     }

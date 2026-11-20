@@ -167,7 +167,7 @@ public class DeferredFunction
             "signed"               => true,
             "std_logic_vector"     => true,
             "conv_std_logic_vector"=> true,
-            _ => false
+            var other => Services.StandardFunctions.LiveFunctions.Contains(other)
         };
     }
 }

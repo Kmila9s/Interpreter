@@ -134,49 +134,7 @@ public class SimulationRunner : IDisposable, ISimulationRunner
             // Collect all signals
             HashSet<Variable> allSignals = [.. entity.Ports, .. arch.Signals];
 
-            // Initialize ALL signals to safe defaults to avoid 'U' meta-value parsing errors.
-            // In real VHDL, uninitialized signals are 'U', but the interpreter's expression
-            // evaluation needs numeric values for arithmetic/comparisons.
-            var configuredSignals = new HashSet<Variable>(
-                config.Clocks.Select(c => c.Signal)
-                    .Concat(config.Stimuli.Select(s => s.Signal))
-            );
-
-            foreach (var signal in allSignals)
-            {
-                // Skip signals that will be set by clock or stimulus configs
-                if (configuredSignals.Contains(signal))
-                    continue;
-
-                // Bug #5E: respect declared initial values. If
-                // VariableSyntetizer populated a non-trivial Value (e.g.
-                // `signal r : std_logic_vector(3 downto 0) := "0001";` or
-                // `signal state : state_t := sA;`), don't clobber it. Only
-                // seed signals that arrived here uninitialized.
-                string? existing = signal.Value?.ToString();
-                bool needsDefault =
-                    string.IsNullOrEmpty(existing) ||
-                    existing.All(c => c == 'U' || c == 'u') ||
-                    existing == "System.Object";
-                if (!needsDefault && !signal.IsPort)
-                    continue;
-
-                string defaultVal = signal.Size > 1 ? new string('0', signal.Size) : "0";
-
-                // Smart defaults for common signal names
-                if (signal.Name.Equals("reset", StringComparison.OrdinalIgnoreCase) ||
-                    signal.Name.Equals("rst", StringComparison.OrdinalIgnoreCase))
-                {
-                    defaultVal = "0";
-                }
-                else if (signal.Name.Equals("enable", StringComparison.OrdinalIgnoreCase) ||
-                         signal.Name.Equals("en", StringComparison.OrdinalIgnoreCase))
-                {
-                    defaultVal = "1";
-                }
-
-                signal.Value = defaultVal;
-            }
+            InitialValueSeeder.Prepare(config);
 
             // Bug #15 fix: register signals BEFORE applying clock initial
             // states / tick-0 stim. Otherwise the U→initial transition is
@@ -271,6 +229,10 @@ public class SimulationRunner : IDisposable, ISimulationRunner
                     {
                         clk.Signal.Value = clk.Signal.Value?.ToString() == "1" ? "0" : "1";
                         directlyChanged.Add(clk.Signal);
+                    }
+                    else if (tick == 0)
+                    {
+                        directlyChanged.Add(clk.Signal); // its initial level, set before the loop
                     }
                 }
 

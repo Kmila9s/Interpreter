@@ -543,7 +543,8 @@ public class DeltaCycleEngineTests
             var history = new SignalHistory();
             history.RegisterSignals(allSignals, 0);
 
-            // Simulate 10 clock cycles (matching GHDL testbench)
+            // Simulate 10 clock cycles (matching GHDL testbench). History times follow the
+            // engine's convention: tick*1000 + delta, one tick per ns here.
             // Each cycle: 5ns low, 5ns high = 10ns period
             // Time in femtoseconds to match GHDL
             for (int cycle = 0; cycle < 10; cycle++)
@@ -551,12 +552,12 @@ public class DeltaCycleEngineTests
                 // Falling edge (already low from previous or initial)
                 clk.Value = "0";
                 long timeLow = cycle * 10000000L; // cycle * 10ns in fs
-                history.RecordChange(clk, (int)(timeLow / 1000000), clk.Value);
+                history.RecordChange(clk, (int)(timeLow / 1000000) * 1000, clk.Value);
 
                 // Rising edge at 5ns offset
                 long timeHigh = timeLow + 5000000L; // +5ns
                 clk.Value = "1";
-                history.RecordChange(clk, (int)(timeHigh / 1000000), clk.Value);
+                history.RecordChange(clk, (int)(timeHigh / 1000000) * 1000, clk.Value);
 
                 // Counter increments on rising edge (when enable=1 and reset=0)
                 if (enable.Value?.ToString() == "1" && reset.Value?.ToString() == "0")
@@ -567,8 +568,8 @@ public class DeltaCycleEngineTests
                     counter_reg.Value = Convert.ToString(newVal, 2).PadLeft(4, '0');
                     count.Value = counter_reg.Value;
 
-                    history.RecordChange(counter_reg, (int)(timeHigh / 1000000), counter_reg.Value);
-                    history.RecordChange(count, (int)(timeHigh / 1000000), count.Value);
+                    history.RecordChange(counter_reg, (int)(timeHigh / 1000000) * 1000, counter_reg.Value);
+                    history.RecordChange(count, (int)(timeHigh / 1000000) * 1000, count.Value);
                 }
             }
 

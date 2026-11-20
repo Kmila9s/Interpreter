@@ -121,8 +121,8 @@ public class IfStructure : ISControl
             // Evaluate condition
             if (branch.Condition != null)
             {
-                var result = branch.Condition.Execute() as Variable;
-                if (result?.Value is bool condition && condition)
+                var result = branch.Condition.Execute();
+                if (Truth.Of(result))
                 {
                     Executer executer = new(branch.Tasks);
                     await executer.ExecuteAsync();

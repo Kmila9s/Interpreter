@@ -27,6 +27,30 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// </summary>
     public string OperatorName { get; private set; } = string.Empty;
 
+    private Func<char, char, char>? _logicFunction;
+    private bool _logicResolved;
+
+    /// <summary>The IEEE 1164 function of this logical operator (resolved once; the name never changes).</summary>
+    private Func<char, char, char>? LogicFunction
+    {
+        get
+        {
+            if (!_logicResolved) (_logicFunction, _logicResolved) = (StdLogic.Binary(OperatorName), true);
+            return _logicFunction;
+        }
+    }
+
+    /// <summary>True for a logical operator used as a VHDL-2008 unary reduction (<c>and v</c>).</summary>
+    public bool IsReduction { get; private set; }
+
+    /// <summary>This logical operator as a unary reduction: one operand, highest precedence.</summary>
+    public Operator AsReduction()
+    {
+        IsReduction = true;
+        Precedence = PrecedencesLogicOperators.NOT;
+        return this;
+    }
+
     /// <summary>
     /// Initializes a new instance of the <see cref="Operator"/> class.
     /// </summary>
@@ -93,6 +117,13 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                     case "ror":
                         Precedence = PrecedencesLogicOperators.ROR;
                     break;
+                    case "?=":
+                    case "?/=":
+                        Precedence = PrecedencesLogicOperators.COMPARATION;
+                    break;
+                    case "??":
+                        Precedence = PrecedencesLogicOperators.NOT;
+                    break;
                 }
             break;
             case OperatorType.ARITH_OPERATION:
@@ -114,7 +145,8 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                         Precedence = PrecedencesArithOperators.DIVISION;
                     break;
                     case "mod":
-                        Precedence = PrecedencesArithOperators.UNARY;
+                    case "rem":
+                        Precedence = PrecedencesArithOperators.MULTIPLICATION;
                     break;
                 }
             break;
@@ -227,6 +259,7 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             case OperatorType.LOGIC_OPERATION:
                 switch(leftSideOperator.Type){
                     case DATATYPES.STD_LOGIC:
+                    case DATATYPES.BIT:
                         result = SolveLogicOperation(leftSideOperator, rightSideOperator);
                     break;
                     case DATATYPES.STD_LOGIC_VECTOR:
@@ -258,6 +291,11 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// <returns>The result of the comparation.</returns>
     public object SolveComparation(Variable var1, Variable var2)
     {
+        // string / character: ordinal (lexicographic) comparison of the text.
+        if (IsText(var1) || IsText(var2))
+        {
+            return Relational(string.CompareOrdinal(TextOf(var1), TextOf(var2)));
+        }
         // v3.3: when EITHER side is a vector, route through the vector
         // comparison path so a literal like `8` doesn't get compared against
         // a binary string like "0010" via int.TryParse — which would parse
@@ -279,6 +317,7 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                         return b1 == b2;
                     }
                     case "!=":
+                    case "/=":
                     {
                         bool b1Ok = bool.TryParse(var1.Value?.ToString(), out bool b1);
                         bool b2Ok = bool.TryParse(var2.Value?.ToString(), out bool b2);
@@ -291,34 +330,12 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             case DATATYPES.STD_LOGIC:
             case DATATYPES.BIT:
             {
-                // STD_LOGIC/BIT: use string comparison to handle meta-values ('U','X','Z','W','L','H','-')
-                string s1 = var1.Value?.ToString() ?? "U";
-                string s2 = var2.Value?.ToString() ?? "U";
-                bool isMetaValue = !int.TryParse(s1, out _) || !int.TryParse(s2, out _);
-                switch (OperatorName.ToLower())
-                {
-                    case "=":
-                        return !isMetaValue && s1 == s2;
-                    case "!=":
-                    case "/=":
-                        return isMetaValue || s1 != s2;
-                    case ">":
-                    case "<":
-                    case ">=":
-                    case "<=":
-                        // Relational ops on meta-values always return false
-                        if (isMetaValue) return false;
-                        return OperatorName.ToLower() switch
-                        {
-                            ">" => int.Parse(s1) > int.Parse(s2),
-                            "<" => int.Parse(s1) < int.Parse(s2),
-                            ">=" => int.Parse(s1) >= int.Parse(s2),
-                            "<=" => int.Parse(s1) <= int.Parse(s2),
-                            _ => false
-                        };
-                    default:
-                        throw new Exception($"Operator type do not detected or even supported: {OperatorName}");
-                }
+                // Enumeration semantics (IEEE 1164): `=` is equality of the value and the
+                // relational operators follow the declaration order U X 0 1 Z W L H -.
+                string s1 = StripLiteralQuotes(var1.Value), s2 = StripLiteralQuotes(var2.Value);
+                if (s1.Length != 1 || s2.Length != 1)
+                    return OperatorName is "=" ? s1 == s2 : OperatorName is "/=" or "!=" && s1 != s2;
+                return Relational(StdLogic.Values.IndexOf(StdLogic.Norm(s1[0])).CompareTo(StdLogic.Values.IndexOf(StdLogic.Norm(s2[0]))));
             }
             case DATATYPES.INTEGER:
             case DATATYPES.NATURAL:
@@ -383,6 +400,15 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         string s1 = var1.Value?.ToString() ?? string.Empty;
         string s2 = var2.Value?.ToString() ?? string.Empty;
 
+        // numeric_std: a metavalue in a numeric comparison returns FALSE (TRUE for `/=`) with a warning.
+        bool numeric = var1.Type != var2.Type || OperatorName is not ("=" or "/=" or "!=");
+        if (numeric && (HasMeta(var1) || HasMeta(var2)))
+        {
+            bool ne = OperatorName is "/=" or "!=";
+            NumericStdWarning($"\"{(ne ? "/=" : OperatorName)}\": metavalue detected, returning {(ne ? "TRUE" : "FALSE")}");
+            return ne;
+        }
+
         switch (OperatorName.ToLower())
         {
             case "=":
@@ -446,7 +472,7 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// the integer's binary representation.
     /// </remarks>
     private static string ConcatenateBits(Variable l, Variable r)
-        => AsConcatBits(l) + AsConcatBits(r);
+        => IsText(l) || IsText(r) ? TextOf(l) + TextOf(r) : AsConcatBits(l) + AsConcatBits(r);
 
     private static string AsConcatBits(Variable v)
     {
@@ -471,6 +497,29 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         return s.Length == 0 ? "0" : s;
     }
 
+    /// <summary>The relational operator applied to a comparison result (<paramref name="c"/> &lt; 0, 0 or &gt; 0).</summary>
+    private bool Relational(int c) => OperatorName.ToLower() switch
+    {
+        "=" => c == 0,
+        "!=" or "/=" => c != 0,
+        "<" => c < 0,
+        "<=" => c <= 0,
+        ">" => c > 0,
+        ">=" => c >= 0,
+        _ => throw new Exception($"Operator type do not detected or even supported: {OperatorName}"),
+    };
+
+    private static bool IsText(Variable v) => v.Type is DATATYPES.STRING or DATATYPES.CHARACTER;
+
+    private static string TextOf(Variable v) => v.Value?.ToString() ?? string.Empty;
+
+    private static bool HasMeta(Variable v) =>
+        v.Type == DATATYPES.STD_LOGIC_VECTOR && StdLogic.IsX(StripLiteralQuotes(v.Value));
+
+    /// <summary>Publishes a numeric_std assertion warning (<c>NUMERIC_STD.&lt;what&gt;</c>), as GHDL prints it.</summary>
+    internal static void NumericStdWarning(string what) =>
+        ReportBus.Instance.Emit($"[assert-warning] NUMERIC_STD.{what}");
+
     private static int ParseAsUnsignedInt(Variable v)
     {
         if (v.Value == null) return 0;
@@ -478,11 +527,8 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
 
         // Vector-typed signals always come in as binary strings — interpret
         // them that way regardless of int.TryParse's decimal interpretation.
-        if (v.Type == DATATYPES.STD_LOGIC_VECTOR &&
-            s.Length > 0 && s.All(c => c == '0' || c == '1'))
-        {
-            try { return Convert.ToInt32(s, 2); } catch { return 0; }
-        }
+        if (v.Type == DATATYPES.STD_LOGIC_VECTOR && s.Length <= 31 && StdLogic.TryToUnsigned(s, out long bits))
+            return (int)bits;
 
         if (int.TryParse(s, out int direct)) return direct;
 
@@ -503,8 +549,8 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     private bool TryCoerceTypes(ref Variable left, ref Variable right)
     {
         // INTEGER <-> STD_LOGIC_VECTOR coercion
-        if ((left.Type == DATATYPES.INTEGER && right.Type == DATATYPES.STD_LOGIC_VECTOR) ||
-            (left.Type == DATATYPES.STD_LOGIC_VECTOR && right.Type == DATATYPES.INTEGER))
+        if ((left.Type is DATATYPES.INTEGER or DATATYPES.NATURAL && right.Type == DATATYPES.STD_LOGIC_VECTOR) ||
+            (left.Type == DATATYPES.STD_LOGIC_VECTOR && right.Type is DATATYPES.INTEGER or DATATYPES.NATURAL))
         {
             // For educational purposes, allow this - convert INTEGER to vector representation
             // or treat vector as integer for arithmetic
@@ -525,6 +571,12 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             return true;
         }
 
+        // string/character against a literal another type was given (`s = "0101"`, `c = '1'`)
+        if (IsText(left) || IsText(right))
+        {
+            return true;
+        }
+
         // UNKNOWN type - allow coercion for flexibility with custom types
         if (left.Type == DATATYPES.UNKNOWN || right.Type == DATATYPES.UNKNOWN)
         {
@@ -535,46 +587,19 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     }
 
     /// <summary>
-    /// Solves a logic operation.
+    /// Scalar <c>and/or/xor/nand/nor/xnor</c> on std_logic or bit values (IEEE 1164 tables, <see cref="StdLogic"/>).
     /// </summary>
-    /// <param name="var1">The first variable.</param>
-    /// <param name="var2">The second variable.</param>
-    /// <returns>The result of the logic operation.</returns>
     public object SolveLogicOperation(Variable var1, Variable var2)
     {
-        char a = Convert.ToChar(var1.Value?.ToString()?.Replace("'", "") ?? throw new Exception("Malformed data"));
-        char b = Convert.ToChar(var2.Value?.ToString()?.Replace("'", "") ?? throw new Exception("Malformed data"));
-        char result;
-        switch (OperatorName.ToLower())
-        {
-            case "and":
-                result = (a == '1' && b == '1') ? '1' : '0';
-                break;
-            case "or":
-                result = (a == '1' || b == '1') ? '1' : '0';
-                break;
-            case "xor":
-                result = (a != b) ? '1' : '0';
-                break;
-            case "xnor":
-                // Previously fell through to 'U' — the precedence / token
-                // recognition was fine (Operator.cs:63), but the bit-level
-                // evaluator never had a case for it, so `a xnor b` always
-                // produced undefined. This restores the missing branch;
-                // vectors pick it up transparently via SolveVectorLogicOperation.
-                result = (a == b) ? '1' : '0';
-                break;
-            case "nand":
-                result = (a == '1' && b == '1') ? '0' : '1';
-                break;
-            case "nor":
-                result = (a == '0' && b == '0') ? '1' : '0';
-                break;
-            default:
-                result = 'U';
-                break;
-        }
-        return result;
+        char a = ScalarChar(var1), b = ScalarChar(var2);
+        return LogicFunction is { } op ? op(a, b) : 'U';
+    }
+
+    /// <summary>The single std_logic character a scalar operand holds (literal quotes stripped).</summary>
+    private static char ScalarChar(Variable v)
+    {
+        string s = StripLiteralQuotes(v.Value ?? throw new Exception("Malformed data"));
+        return s.Length == 1 ? s[0] : Convert.ToChar(s);
     }
 
     /// <summary>
@@ -585,8 +610,8 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// </summary>
     public object SolveBooleanLogicOperation(Variable var1, Variable var2)
     {
-        bool b1 = ToBool(var1.Value);
-        bool b2 = ToBool(var2.Value);
+        bool b1 = Truth.Of(var1.Value);
+        bool b2 = Truth.Of(var2.Value);
         return OperatorName.ToLower() switch
         {
             "and"  => b1 && b2,
@@ -597,14 +622,6 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             "xnor" => b1 == b2,
             _      => false
         };
-    }
-
-    internal static bool ToBool(object? value)
-    {
-        if (value is bool b) return b;
-        string s = value?.ToString() ?? "";
-        if (bool.TryParse(s, out bool parsed)) return parsed;
-        return s == "1" || s.Equals("true", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -647,16 +664,14 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             bool vectorish = v.Type == DATATYPES.STD_LOGIC_VECTOR ||
                 (v.Type != DATATYPES.INTEGER && v.Type != DATATYPES.NATURAL &&
                  str.Length > 1 && str.All(c => c == '0' || c == '1'));
-            if (vectorish)
-            {
-                try { return Convert.ToInt32(str, 2); }
-                catch { /* fall through to decimal */ }
-            }
+            if (vectorish && str.Length <= 31 && StdLogic.TryToUnsigned(str, out long bits))
+                return (int)bits;
             // Handle VHDL meta-values ('U', 'X', 'Z', etc.) and integer literals
             if (int.TryParse(str, out int intVal))
                 return intVal;
             return 0;
         }
+        static bool IsIntegral(Variable v) => v.Value is int or long || !(v.Value?.ToString() ?? "").Contains('.');
         double GetDouble(Variable v) {
             if (v.Value == null || v.Value.GetType() == typeof(object))
             {
@@ -706,6 +721,9 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                 int width = opName == "*"
                     ? leftW + rightW
                     : Math.Max(leftW, rightW);
+                // numeric_std: a metavalue in a vector operand makes the whole result 'X' (no warning).
+                if (HasMeta(leftVariable) || HasMeta(rightVariable))
+                    return new string('X', width);
                 int li  = GetInt(leftVariable);
                 int ri  = GetInt(rightVariable);
                 int raw = SolveIntOperation(li, ri);
@@ -748,7 +766,10 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                     result = SolveIntOperation(GetInt(leftVariable), GetInt(rightVariable));
                 break;
                 case DATATYPES.NATURAL:
-                    result = SolveRealOperation(GetDouble(leftVariable), GetDouble(rightVariable));
+                    // NATURAL also types real literals (`2.5`); two integral operands stay integer (`7/2 = 3`).
+                    result = IsIntegral(leftVariable) && IsIntegral(rightVariable)
+                        ? SolveIntOperation(GetInt(leftVariable), GetInt(rightVariable))
+                        : SolveRealOperation(GetDouble(leftVariable), GetDouble(rightVariable));
                 break;
                 default:
                     // Default to integer operation or return 0 for unhandled types
@@ -765,25 +786,8 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// <param name="leftVariable">The left variable.</param>
     /// <param name="rightVariable">The right variable.</param>
     /// <returns>The result of the integer operation.</returns>
-    public int SolveIntOperation(int leftVariable, int rightVariable){
-        switch(OperatorName){
-            case "+":
-                return leftVariable + rightVariable;
-            case "-":
-                return leftVariable - rightVariable;
-            case "*":
-                return leftVariable * rightVariable;
-            case "**":
-                return (int)Math.Pow(leftVariable, rightVariable);
-            case "/":
-                // Divide-by-zero guard — see Operator.SolveIntOperation.
-                return rightVariable == 0 ? 0 : leftVariable / rightVariable;
-            case "mod":
-                return rightVariable == 0 ? 0 : leftVariable % rightVariable;
-            default:
-                return 0;
-        }
-    }
+    public int SolveIntOperation(int leftVariable, int rightVariable) =>
+        (int)IntegerArithmetic.Apply(OperatorName, leftVariable, rightVariable);
 
     /// <summary>
     /// Solves a real operation.
@@ -791,25 +795,8 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// <param name="leftVariable">The left variable.</param>
     /// <param name="rightVariable">The right variable.</param>
     /// <returns>The result of the real operation.</returns>
-    public double SolveRealOperation(double leftVariable, double rightVariable){
-        switch(OperatorName){
-            case "+":
-                return leftVariable + rightVariable;
-            case "-":
-                return leftVariable - rightVariable;
-            case "*":
-                return leftVariable * rightVariable;
-            case "**":
-                return Math.Pow(leftVariable, rightVariable);
-            case "/":
-                // Divide-by-zero guard — see Operator.SolveIntOperation.
-                return rightVariable == 0 ? 0 : leftVariable / rightVariable;
-            case "mod":
-                return rightVariable == 0 ? 0 : leftVariable % rightVariable;
-            default:
-                return 0;
-        }
-    }
+    public double SolveRealOperation(double leftVariable, double rightVariable) =>
+        IntegerArithmetic.ApplyReal(OperatorName, leftVariable, rightVariable);
 
     /// <summary>
     /// Solves a logic operation.
@@ -830,38 +817,27 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             return !b;
         }
 
-        string s = variable.Value?.ToString() ?? string.Empty;
+        string s = StripLiteralQuotes(variable.Value);
         if (string.Equals(s, "True",  StringComparison.OrdinalIgnoreCase)) return false;
         if (string.Equals(s, "False", StringComparison.OrdinalIgnoreCase)) return true;
-        if (s.Length == 0) return '1';   // uninitialised — treat as `not 0` = '1'
-
-        // Vector `not`: invert every bit and return the inverted string.
-        // The previous path only looked at s[0], so `not "111111"` returned
-        // '0' (a single scalar) instead of "000000". Detect vector either
-        // by the variable's declared type or by the string holding 2+ bits.
-        bool isVector = variable.Type == DATATYPES.STD_LOGIC_VECTOR ||
-                        (s.Length > 1 && s.All(c => c == '0' || c == '1' || c == 'u' || c == 'x' || c == 'z' || c == 'U' || c == 'X' || c == 'Z'));
-        if (isVector && OperatorName.Equals("not", StringComparison.OrdinalIgnoreCase))
+        if (IsReduction)
         {
-            var chars = new char[s.Length];
-            for (int i = 0; i < s.Length; i++)
+            var (baseOp, invert) = OperatorName.ToLowerInvariant() switch
             {
-                chars[i] = s[i] switch
-                {
-                    '0' => '1',
-                    '1' => '0',
-                    _   => 'x',
-                };
-            }
-            return new string(chars);
+                "nand" => ("and", true), "nor" => ("or", true), "xnor" => ("xor", true), var n => (n, false),
+            };
+            char r = StdLogic.Reduce(StdLogic.Binary(baseOp)!, s, baseOp == "and" ? '1' : '0');
+            return invert ? StdLogic.Not(r) : r;
         }
+        if (OperatorName == "??") return s.Length == 1 && StdLogic.Condition(s[0]);
+        if (OperatorName.Equals("abs", StringComparison.OrdinalIgnoreCase))
+            return int.TryParse(s, out int n) ? Math.Abs(n) : throw new ParserException($"abs is only supported on integers here ('{s}')");
+        if (s.Length == 0) return '1';   // uninitialised — treat as `not 0` = '1'
+        if (!OperatorName.Equals("not", StringComparison.OrdinalIgnoreCase)) return '0';
 
-        char item = s[0];
-        return OperatorName.ToLower() switch
-        {
-            "not" => item == '1' ? '0' : '1',
-            _     => (object)'0'
-        };
+        // Vector `not` inverts every element; a scalar inverts its one value (IEEE 1164).
+        bool isVector = variable.Type == DATATYPES.STD_LOGIC_VECTOR || (s.Length > 1 && StdLogic.IsVector(s));
+        return isVector ? StdLogic.Not(s) : StdLogic.Not(s[0]);
     }
 
     /// <summary>
@@ -903,14 +879,15 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         // stored against a 4-bit Variable still bit-aligns correctly.
         if (clean1.Length < size1) clean1 = clean1.PadLeft(size1, '0');
         if (clean2.Length < size2) clean2 = clean2.PadLeft(size2, '0');
-        string result = "";
-        for (int i = 0; i < size1; i++)
+        if (OperatorName is "?=" or "?/=")
         {
-            Variable valueA = new("tempA", clean1[i], DATATYPES.STD_LOGIC),
-            valueB = new("tempB", clean2[i], DATATYPES.STD_LOGIC);
-            result += Convert.ToString(SolveLogicOperation(valueA, valueB));
+            // Vector matching equality: the AND of the element matches.
+            char eq = StdLogic.MatchEq(clean1, clean2);
+            return OperatorName == "?=" ? eq : StdLogic.Not(eq);
         }
-        return result;
+        return LogicFunction is { } op
+            ? StdLogic.Vector(op, clean1, clean2)
+            : new string('U', size1);
     }
 
     private static string StripLiteralQuotes(object? value)

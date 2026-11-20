@@ -128,22 +128,6 @@ public class CaseStructure : ISControl
     }
 
     /// <summary>
-    /// Numeric-first choice match for expression selectors — identical in
-    /// spirit to <see cref="SelectedAssignment"/>'s matcher: when both sides
-    /// parse as integers (decimal, binary bit-string, or hex) they compare by
-    /// value, otherwise by case-insensitive string equality. Used only on the
-    /// expression-selector path so the plain-signal path stays byte-identical.
-    /// </summary>
-    internal static bool ChoiceMatchesNumeric(string choice, string selector)
-    {
-        string a = choice.Replace("\"", "").Replace("'", "").Trim();
-        string b = selector.Replace("\"", "").Replace("'", "").Trim();
-        if (HdlLiteral.TryParseInt(a, out long ai) && HdlLiteral.TryParseInt(b, out long bi))
-            return ai == bi;
-        return a.Equals(b, StringComparison.OrdinalIgnoreCase);
-    }
-
-    /// <summary>
     /// Gets the raw selector name/expression as written in the source
     /// (e.g. <c>sel</c> in <c>case sel is</c>). Unlike <see cref="Selector"/>
     /// this is a plain string that survives even when the selector could not be
@@ -226,14 +210,7 @@ public class CaseStructure : ISControl
             // Check if selector matches any of the choices
             foreach (var choice in branch.Choices)
             {
-                string cleanChoice = choice.Replace("\"", "").Replace("'", "").Trim();
-                string cleanSelector = selectorValue.Replace("\"", "").Replace("'", "").Trim();
-
-                bool hit = IsMatching
-                    ? MatchesWithWildcards(cleanChoice, cleanSelector)
-                    : exprSelector
-                        ? ChoiceMatchesNumeric(cleanChoice, cleanSelector)
-                        : cleanChoice.Equals(cleanSelector, StringComparison.OrdinalIgnoreCase);
+                bool hit = CaseChoice.Matches(choice, selectorValue, IsMatching, exprSelector);
                 if (hit)
                 {
                     Executer executer = new(branch.Tasks);
@@ -249,25 +226,6 @@ public class CaseStructure : ISControl
             Executer executer = new(othersBranch.Tasks);
             await executer.ExecuteAsync();
         }
-    }
-
-    /// <summary>
-    /// VHDL-2008 matching-case comparison: `-` in the choice matches any bit
-    /// of the selector at that position; everything else is a bit-for-bit
-    /// exact compare (case-insensitive). A length mismatch is treated as
-    /// non-match rather than an error so the run continues to the next arm
-    /// (or falls through to `others`) instead of throwing mid-simulation.
-    /// </summary>
-    private static bool MatchesWithWildcards(string choice, string selector)
-    {
-        if (choice.Length != selector.Length) return false;
-        for (int i = 0; i < choice.Length; i++)
-        {
-            char c = choice[i];
-            if (c == '-') continue; // don't-care
-            if (char.ToUpperInvariant(c) != char.ToUpperInvariant(selector[i])) return false;
-        }
-        return true;
     }
 
     /// <summary>
@@ -360,7 +318,7 @@ public class CaseStructure : ISControl
 
             foreach (var ch in br.Choices)
             {
-                if (seenChoices.Any(prev => ChoiceMatchesNumeric(prev, ch)))
+                if (seenChoices.Any(prev => CaseChoice.Matches(prev, ch, numeric: true)))
                     throw new ParserException(
                         $"duplicate case choice '{ch}'", _streamer.Current ?? _streamer.Previous);
                 seenChoices.Add(ch);

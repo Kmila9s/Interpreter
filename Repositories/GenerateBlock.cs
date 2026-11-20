@@ -502,23 +502,9 @@ public class GenerateBlock : ISControl
         try
         {
             Operation condOp = new(ConditionExpression, _variables);
-            var result = condOp.Execute();
-
-            if (result is bool boolResult)
-                return boolResult;
-            if (result is char charResult)
-                return charResult == '1';
-            if (result is string strResult)
-                return strResult == "1" || strResult.Equals("true", StringComparison.OrdinalIgnoreCase);
-            if (result is Variable varResult)
-            {
-                var val = varResult.Value;
-                if (val is bool b) return b;
-                if (val is char c) return c == '1';
-                if (val is string s) return s == "1" || s.Equals("true", StringComparison.OrdinalIgnoreCase);
-            }
+            return Truth.Of(condOp.Execute());
         }
-        catch { }
+        catch (Exception e) when (e is not SimulationRuntimeException) { }
 
         return false;
     }

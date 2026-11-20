@@ -445,7 +445,7 @@ public class ProcedureCallStatement : ISControl
                 op.Execute();
             }
         }
-        catch
+        catch (Exception e) when (e is not SimulationRuntimeException)
         {
             // Malformed assignment — swallow to keep the run alive; the
             // pre-F-G-14 behaviour also silently ignored the statement.

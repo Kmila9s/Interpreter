@@ -352,6 +352,9 @@ public partial class Process : ISControl
             }
             _streamer.Expect(PARENTHESIS);
         }
+        // The optional `is` of `process [(…)] is` (VHDL-93).
+        if (string.Equals(_streamer.Current?.Value, "is", StringComparison.OrdinalIgnoreCase))
+            _streamer.MoveNext();
     }
 
 

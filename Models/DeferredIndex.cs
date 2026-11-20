@@ -60,7 +60,8 @@ public class DeferredIndex
             : VectorIndexing.Element(Source, High, vec.Length);
         string value = span is { } s ? vec.Substring(s.Start, s.Width) : new string('U', width);
         string name = VectorIndexing.PartName(Source.Name, High, IsSlice ? Low : null);
-        return new Variable(name, value,
-            IsSlice || element ? Constants.DATATYPES.STD_LOGIC_VECTOR : Constants.DATATYPES.STD_LOGIC);
+        return new Variable(name, value, Source.Type == Constants.DATATYPES.STRING
+            ? (IsSlice ? Constants.DATATYPES.STRING : Constants.DATATYPES.CHARACTER)
+            : IsSlice || element ? Constants.DATATYPES.STD_LOGIC_VECTOR : Constants.DATATYPES.STD_LOGIC);
     }
 }

@@ -84,22 +84,9 @@ public static partial class StaticExpression
             {
                 string op = t[pos++].ToLowerInvariant();
                 if (!Factor(ref pos, out long r) || (op is "/" or "mod" or "rem" && r == 0)) return false;
-                v = op switch
-                {
-                    "*" => v * r,
-                    "/" => v / r,
-                    "rem" => v % r,
-                    _ => Mod(v, r),
-                };
+                v = IntegerArithmetic.Apply(op, v, r);
             }
             return true;
-        }
-
-        /// <summary>VHDL <c>mod</c>: the result takes the sign of the divisor.</summary>
-        private static long Mod(long v, long r)
-        {
-            long m = v % r;
-            return m != 0 && (m < 0) != (r < 0) ? m + r : m;
         }
 
         private bool Factor(ref int pos, out long v)
