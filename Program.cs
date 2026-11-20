@@ -693,7 +693,7 @@ class Program
 
                 if (isEndOfArchitecture)
                 {
-                    Entity entity = Entities.FirstOrDefault(p => p.Name.Equals(currentEntityName)) ?? default!;
+                    Entity entity = Entities.FirstOrDefault(p => p.Name.Equals(currentEntityName, StringComparison.OrdinalIgnoreCase)) ?? default!;
                     if (entity == null) throw new Exception($"Entity '{currentEntityName}' not found");
 
                     Architecture arch = new(entity.Ports, entity.Generics);

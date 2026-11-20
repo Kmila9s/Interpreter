@@ -187,7 +187,7 @@ public class ForLoopStructure : ILoopStructure
             // bounds). Falls back to the conventional (size-1 downto 0) form
             // when no range was recorded — identical to the legacy behaviour.
             int effLeft, effRight; bool effDownto;
-            if (sig != null && sig.HasDeclaredRange)
+            if (sig is not null && sig.HasDeclaredRange)
             {
                 effLeft = sig.LeftBound!.Value; effRight = sig.RightBound!.Value; effDownto = sig.IsDownto;
             }
