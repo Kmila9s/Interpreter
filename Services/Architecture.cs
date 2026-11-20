@@ -414,6 +414,15 @@ public class Architecture : ISControl
                                     SkipGenerateBody(label);
                                 }
                                 return;
+                            case "case":
+                                // Case generate (VHDL-2008, G80): the simulator elaborates it to the
+                                // chosen alternative (GenerateUnroller); this analysis pass has no
+                                // model for it, so it is blackboxed like a failing for/if generate.
+                                while (_streamer.Current != null && !_streamer.Current.Value.Equals("generate", StringComparison.OrdinalIgnoreCase))
+                                    _streamer.MoveNext();
+                                _streamer.MoveNext(); // the header's 'generate'
+                                SkipGenerateBody(label);
+                                return;
                             case "entity":
                             case "component":       // `u : component c port map …` (G24)
                             case "configuration":   // `u : configuration work.cfg port map …` (G20)
