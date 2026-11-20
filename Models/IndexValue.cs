@@ -73,7 +73,7 @@ public sealed class IndexValue
         {
             // Parse once; Evaluate re-reads its operands' live values.
             _cachedOperation ??= new Services.Operation(Expression!, Scope!);
-            return ToInt(_cachedOperation.Evaluate());
+            return ToInt(_cachedOperation.EvaluateResult());
         }
         catch (Exception e) when (e is not SimulationRuntimeException)
         {
@@ -81,12 +81,9 @@ public sealed class IndexValue
         }
     }
 
-    /// <summary>Integer value of an expression result (int, long, bit string, decimal or hex text), or -1.</summary>
-    private static int ToInt(object? value) => value switch
-    {
-        null => -1,
-        int i => i,
-        long l => (int)l,
-        _ => HdlLiteral.TryParseInt(value.ToString(), out long parsed) ? (int)parsed : -1,
-    };
+    /// <summary>Integer value of an expression result (a number; a vector read unsigned), or -1.</summary>
+    private static int ToInt(Variable result) =>
+        result.Value is null ? -1
+        : Services.Operator.TryNumber(result, out var n) ? (int)n
+        : -1;
 }

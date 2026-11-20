@@ -68,6 +68,9 @@ public class CaseStructure : ISControl
 {
     /// <summary>The variables in scope during case selector and branch evaluation.</summary>
     private readonly HashSet<Variable> _variables = new();
+
+    /// <summary>1-based source line of the statement (errors in its selector report it).</summary>
+    private int _line;
     /// <summary>The token stream used for parsing the case structure.</summary>
     private readonly TokenStream _streamer;
     /// <summary>Reader of the branch bodies (null until <see cref="Syntetize"/> for a stand-alone case).</summary>
@@ -121,7 +124,7 @@ public class CaseStructure : ISControl
     public string EvaluateSelectorExpression()
     {
         if (string.IsNullOrEmpty(_selectorExpr)) return string.Empty;
-        var op = new Operation(_selectorExpr, _variables);
+        var op = new Operation(_selectorExpr, _variables, _line);
         var result = op.Execute();
         string value = result is Variable vr ? (vr.Value?.ToString() ?? "") : (result?.ToString() ?? "");
         return value.Replace("\"", "").Replace("'", "").Trim();
@@ -234,6 +237,7 @@ public class CaseStructure : ISControl
     public void Syntetize()
     {
         Interpreter.Services.ParseTrace.Log($"CaseStructure @{(_streamer.Current?.Line ?? 0) + 1}");
+        _line = _streamer.Current?.SourceLine ?? 0;
         _reader ??= new SequentialStatementReader(_streamer, _variables);
         _streamer.Expect(KEYWORDS); // consume 'case'
         // VHDL-2008 matching-case (Tier 4.2, 2026-07-28) — the lexer splits

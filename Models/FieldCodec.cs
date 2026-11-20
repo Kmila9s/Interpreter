@@ -100,26 +100,12 @@ public static class FieldCodec
     };
 
     /// <summary><paramref name="value"/> as <paramref name="width"/> binary characters (two's complement, truncated).</summary>
-    public static string IntegerBits(long value, int width)
-    {
-        var chars = new char[width];
-        for (int i = width - 1; i >= 0; i--, value >>= 1)
-            chars[i] = (value & 1) == 1 ? '1' : '0';
-        return new string(chars);
-    }
+    public static string IntegerBits(long value, int width) => LogicVector.FromInteger(value, width);
 
-    private static long IntegerFrom(string bits, bool signed)
-    {
-        long value = 0;
-        foreach (char c in bits)
-        {
-            if (c is not ('0' or '1')) return 0;
-            value = (value << 1) | (uint)(c - '0');
-        }
-        if (signed && bits.Length is > 0 and < 64 && bits[0] == '1')
-            value -= 1L << bits.Length;
-        return value;
-    }
+    /// <summary>The integer of a field's bits (0 for a metavalue).</summary>
+    private static long IntegerFrom(string bits, bool signed) =>
+        bits.All(c => c is '0' or '1') && LogicVector.TryToInteger(bits, signed ? Signedness.Signed : Signedness.Unsigned, out var v)
+            ? (long)v : 0;
 
     /// <summary>Position of the literal <paramref name="value"/> in <paramref name="literals"/> (a raw number passes through), or 0.</summary>
     public static long EnumIndex(IReadOnlyList<string>? literals, object? value)

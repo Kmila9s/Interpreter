@@ -45,25 +45,51 @@ public sealed partial class AssignmentTarget
 
     /// <summary>
     /// Writes <paramref name="value"/>: immediately for variables
-    /// (<paramref name="immediate"/>), otherwise as a scheduled update — after
-    /// <paramref name="afterNs"/> when given — that keeps statement order. A
-    /// partial write whose selectors do not resolve (dynamic index out of
-    /// range) is dropped.
+    /// (<paramref name="immediate"/>), otherwise as a zero-delay scheduled
+    /// update. A partial write whose selectors do not resolve is dropped.
     /// </summary>
-    public void Assign(SignalScheduler scheduler, object value, int sourceLine, long afterNs, bool immediate)
+    public void Assign(SignalScheduler? scheduler, object value, int sourceLine, bool immediate)
     {
-        (int Start, int Width)? span;
+        if (immediate || scheduler is null)
+        {
+            (int Start, int Width)? span;
+            try
+            {
+                if (!TryEncode(ref value, out span)) return;
+            }
+            catch (SimulationRuntimeException e) { throw e.At(sourceLine); }
+            Write(value, span);
+        }
+        else Schedule(scheduler, [new WaveformElement(value, 0)], sourceLine, DelayMechanism.Inertial, -1);
+    }
+
+    /// <summary>
+    /// Schedules the waveform <paramref name="elements"/> on the current
+    /// process's driver of <see cref="Base"/> (the part named by the selectors,
+    /// resolved now; a dynamic index makes the driver cover the whole object).
+    /// </summary>
+    public void Schedule(SignalScheduler scheduler, IReadOnlyList<WaveformElement> elements, int sourceLine,
+        DelayMechanism mechanism, long rejectNs)
+    {
+        (int Start, int Width)? span = null;
+        var encoded = new WaveformElement[elements.Count];
         try
         {
-            if (!TryEncode(ref value, out span)) return;
+            for (int i = 0; i < elements.Count; i++)
+            {
+                object value = elements[i].Value;
+                if (!TryEncode(ref value, out span)) return;
+                encoded[i] = elements[i] with { Value = value };
+            }
         }
         catch (SimulationRuntimeException e) { throw e.At(sourceLine); }
-        if (immediate)
-            Write(value, span);
-        else if (afterNs > 0)
-            scheduler.ScheduleAfterNs(Base, value, afterNs, sourceLine, span);
-        else
-            scheduler.Schedule(Base, value, sourceLine, span);
+        scheduler.ScheduleWaveform(Base, encoded, sourceLine, span, wholeDriver: IsPartial && !Path.IsStatic, mechanism, rejectNs);
+    }
+
+    /// <summary>Drives <paramref name="value"/> from outside the design (the stimulus of an <c>inout</c> port, see <see cref="SignalScheduler.DriveExternal"/>).</summary>
+    public void DriveExternal(SignalScheduler scheduler, object value)
+    {
+        if (TryEncode(ref value, out var span)) scheduler.DriveExternal(Base, value, span);
     }
 
     /// <summary>Writes <paramref name="value"/> now (variables, external stimulus).</summary>
@@ -80,11 +106,28 @@ public sealed partial class AssignmentTarget
     private bool TryEncode(ref object value, out (int Start, int Width)? span)
     {
         span = null;
-        if (!IsPartial) return true;
+        if (!IsPartial) { CheckBounds(value); return true; }
         if (Path.Resolve() is not { } at) return false;
         span = (at.Start, at.Width);
         value = at.Field is { } field ? FieldCodec.Encode(field, value) : FieldCodec.LogicBits(value, at.Width);
         return true;
+    }
+
+    /// <summary>
+    /// GHDL's <c>bound check failure</c> for a whole-object write: an integer outside
+    /// its subtype's range (<c>natural</c>, <c>range 0 to 9</c>; the base type
+    /// <c>integer</c> itself wraps, unchecked), or a logic vector of another length.
+    /// </summary>
+    private void CheckBounds(object value)
+    {
+        var b = Base;
+        if (b.ScalarRange is { } range && value switch { int i => i, long l => l, _ => (long?)null } is long n
+            && (n < range.Low || n > range.High))
+            throw new SimulationRuntimeException("bound check failure");
+        if (b.Type == Constants.DATATYPES.STD_LOGIC_VECTOR && b.Size > 0 && b.Layout is null && b.ElementSize == 0
+            && value is string bits && bits.Length != b.Size && bits.Length > 0 && StdLogic.IsVector(bits)
+            && !HdlLiteral.TryOthersFill(bits, out _))
+            throw new SimulationRuntimeException("bound check failure");
     }
 
     private void Write(object value, (int Start, int Width)? span) =>

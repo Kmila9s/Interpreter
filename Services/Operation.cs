@@ -50,7 +50,7 @@ public enum SignalAttributeType
 /// <see cref="ScheduledOperation.Execute"/> has a twin dispatch loop that
 /// must stay in sync when new item kinds land.
 /// </remarks>
-public class Operation : IOperation {
+public class Operation : IOperation, IConcurrentStatement {
     /// <summary>
     /// Gets the result of the operation.
     /// </summary>
@@ -111,12 +111,33 @@ public class Operation : IOperation {
     public AssignmentTarget? Target { get; private set; }
 
     /// <summary>
-    /// Nanosecond inertial-delay captured from `after N &lt;unit&gt;` clauses on
-    /// the RHS of a signal assignment. 0 means "no delay" (the default).
-    /// `ScheduledOperation.Execute` routes through
-    /// `SignalScheduler.ScheduleAfter` when this is set. Bench bug #8.
+    /// The delay mechanism and waveform of a signal assignment
+    /// (<c>y &lt;= transport a after 2 ns, b after 5 ns</c>); null for variable
+    /// assignments and conditions. This operation evaluates the first element's
+    /// value; <see cref="WaveformValues"/> evaluates the others and the delays.
     /// </summary>
-    public long AfterDelayNs { get; set; }
+    public Waveform? Waveform { get; private set; }
+
+    /// <summary>The value expressions of the waveform elements after the first.</summary>
+    private List<Operation>? _laterElements;
+
+    /// <summary>
+    /// The waveform to schedule, given the first element's value
+    /// <paramref name="first"/>: every element with its delay evaluated now.
+    /// </summary>
+    public IReadOnlyList<WaveformElement> WaveformValues(object first)
+    {
+        if (Waveform is not { } w) return [new WaveformElement(first, 0)];
+        if (w.IsPlain) return [new WaveformElement(first, 0)];
+        var result = new WaveformElement[w.Elements.Count];
+        result[0] = new(first, w.ElementDelayNs(0, Variables, SourceLine));
+        for (int i = 1; i < result.Length; i++)
+            result[i] = new(_laterElements![i - 1].Evaluate(), w.ElementDelayNs(i, Variables, SourceLine));
+        return result;
+    }
+
+    /// <summary>The pulse-rejection limit in ns (negative = the first delay).</summary>
+    public long RejectNs => Waveform?.Reject is { } r ? Models.Waveform.DelayNs(r, Variables, SourceLine) : -1;
 
     /// <summary>
     /// True for variable assignments (<c>:=</c>) inside a process body.
@@ -188,6 +209,13 @@ public class Operation : IOperation {
                 {
                     Result = foundVar;
                     RawData = splitted[1].Trim();
+                    if (isSignalAssignment)
+                    {
+                        Waveform = Models.Waveform.Parse(RawData);
+                        RawData = Waveform.FirstValue;
+                        if (Waveform.Elements.Count > 1)
+                            _laterElements = [.. Waveform.Elements.Skip(1).Select(e => new Operation(e.Value, this.Variables, SourceLine))];
+                    }
                 }
             }
             else
@@ -256,7 +284,7 @@ public class Operation : IOperation {
     /// as <c>0 - term</c> / <c>0 + term</c> (<c>a &lt;= -7;</c>, <c>x := -n * 2;</c>). A logical
     /// operator in that position is a VHDL-2008 unary reduction (<c>and v</c>).
     /// </summary>
-    private static List<object> WithUnarySigns(List<object> items)
+    internal static List<object> WithUnarySigns(List<object> items)
     {
         var result = new List<object>(items.Count + 1);
         foreach (var item in items)
@@ -280,17 +308,26 @@ public class Operation : IOperation {
     /// writing anything. Shared by <see cref="Execute"/> and
     /// <see cref="ScheduledOperation.Run"/>.
     /// </summary>
-    public object Evaluate()
+    public object Evaluate() => EvaluateResult().Value!;
+
+    /// <summary><see cref="Evaluate"/> with the result's type, width and type mark.</summary>
+    public Variable EvaluateResult()
     {
-        try { return EvaluateItems(); }
+        try { return EvaluateRpn(Items, RawData, Result?.Name); }
         catch (SimulationRuntimeException e) { throw e.At(SourceLine); }
     }
 
-    private object EvaluateItems()
+    /// <summary>
+    /// Evaluates an expression in postfix order (<see cref="ShuntingYard"/>) against
+    /// its operands' current values: the single expression evaluator, shared by
+    /// assignments, conditions and function arguments (<see cref="Models.DeferredExpression"/>).
+    /// The result carries its type, width and type mark (signed/unsigned).
+    /// </summary>
+    internal static Variable EvaluateRpn(IEnumerable<object> items, string expression, string? target = null)
     {
         Stack<Variable> variables = new();
 
-        foreach(var item in Items){
+        foreach(var item in items){
             if(item is Variable newVar){
                 variables.Push(newVar);
             }
@@ -330,6 +367,9 @@ public class Operation : IOperation {
             else if(item is Models.IDeferredOperand deferred){
                 variables.Push(deferred.Evaluate());
             }
+            else if(item is Models.DeferredExpression nested){
+                variables.Push(nested.Evaluate());
+            }
             else if(item is Operator op){
                 // Only treat as unary NOT if it's actually a logic operation with NOT precedence
                 // v0.13.0 Fix: Added type check to prevent ** (power) operator from being treated as NOT
@@ -341,11 +381,13 @@ public class Operation : IOperation {
 
                 if(isUnaryNot){
                     var value = variables.Pop();
-                    variables.Push(new("Temp", op.Execute(value), value.Type));
+                    variables.Push(Shaped(new("Temp", op.Execute(value), value.Type), value.TypeMark));
                 } else {
                     var right = variables.Pop();
                     var left = variables.Pop();
                     Variable vari = new("Temp", op.Execute(left, right), left.Type);
+                    if (op.OperatorType == Constants.OperatorType.ARITH_OPERATION && vari.Value is string)
+                        vari.Type = Constants.DATATYPES.STD_LOGIC_VECTOR;   // integer op vector is a vector
                     if (op.OperatorType == Constants.OperatorType.COMPARATION)
                     {
                         vari.IsPort = false;
@@ -375,14 +417,36 @@ public class Operation : IOperation {
                         vari.Type = text ? Constants.DATATYPES.STRING : Constants.DATATYPES.STD_LOGIC_VECTOR;
                         if (vari.Value is string concat) vari.Size = concat.Length;
                     }
-                    variables.Push(vari);
+                    variables.Push(Shaped(vari, ResultMark(left, right)));
                 }
             }
         }
         if (variables.Count != 1)
             throw new InvalidOperationException(
-                $"Malformed expression: stack not reduced to a single result ({variables.Count} items left). RHS=`{RawData}` Target=`{Result?.Name}`");
-        return variables.Pop().Value;
+                $"Malformed expression: stack not reduced to a single result ({variables.Count} items left). RHS=`{expression}` Target=`{target}`");
+        return variables.Pop();
+    }
+
+    /// <summary>A vector result's width is its length; its type mark is <paramref name="mark"/>.</summary>
+    private static Variable Shaped(Variable v, string? mark)
+    {
+        if (v.Type == Constants.DATATYPES.STD_LOGIC_VECTOR && v.Value is string bits) v.Size = bits.Length;
+        v.TypeMark = mark;
+        return v;
+    }
+
+    /// <summary>
+    /// The type mark of a binary result: <c>signed</c> when an operand is signed,
+    /// else <c>unsigned</c> when one is unsigned (numeric_std overload resolution),
+    /// else the left operand's.
+    /// </summary>
+    private static string? ResultMark(Variable left, Variable right)
+    {
+        var l = TypeMarks.SignednessOf(left.TypeMark);
+        var r = TypeMarks.SignednessOf(right.TypeMark);
+        if (l == Signedness.Signed || r == Signedness.Signed) return "signed";
+        if (l == Signedness.Unsigned || r == Signedness.Unsigned) return "unsigned";
+        return left.TypeMark ?? right.TypeMark;
     }
 
     /// <summary>The target must be writable: VHDL forbids assigning an input port.</summary>
@@ -400,8 +464,8 @@ public class Operation : IOperation {
     {
         EnsureWritable();
         var value = Evaluate();
-        if (AggregateTarget is { } aggregate) aggregate.Assign(null, value, SourceLine, 0, immediate: true);
-        else if (Target is { IsPartial: true } part) part.Assign(null, value, SourceLine, 0, immediate: true);
+        if (AggregateTarget is { } aggregate) aggregate.Assign(null, value, SourceLine, immediate: true);
+        else if (Target is { IsPartial: true } part) part.Assign(null, value, SourceLine, immediate: true);
         else Result.Value = value;
         return Result;
     }
@@ -439,42 +503,6 @@ public class Operation : IOperation {
             if (currentItem == ";")
             {
                 _currentSyntetizeIndex++;
-                continue;
-            }
-
-            // `after N <unit>` inertial delay. Capture the delay (in ns)
-            // onto the Operation so `ScheduledOperation.Execute` can route
-            // through `SignalScheduler.ScheduleAfter`. The RHS expression
-            // before the `after` keyword is what we'll evaluate at apply
-            // time; everything from `after` onward is metadata.
-            // Bench Phase E bug #8 fix (2026-06-03).
-            if (currentItem.ToLower() == "after")
-            {
-                _currentSyntetizeIndex++; // skip 'after'
-                if (_currentSyntetizeIndex < _data.Length &&
-                    long.TryParse(_data[_currentSyntetizeIndex], out long value))
-                {
-                    _currentSyntetizeIndex++;
-                    if (_currentSyntetizeIndex < _data.Length && IsTimeUnit(_data[_currentSyntetizeIndex]))
-                    {
-                        string unit = _data[_currentSyntetizeIndex].ToLower();
-                        _currentSyntetizeIndex++;
-                        AfterDelayNs = unit switch
-                        {
-                            "fs" => value / 1_000_000L,
-                            "ps" => value / 1_000L,
-                            "ns" => value,
-                            "us" => value * 1_000L,
-                            "ms" => value * 1_000_000L,
-                            "sec" or "s" => value * 1_000_000_000L,
-                            _ => value,
-                        };
-                    }
-                    else
-                    {
-                        AfterDelayNs = value; // assume ns when unit is missing
-                    }
-                }
                 continue;
             }
 
@@ -570,6 +598,23 @@ public class Operation : IOperation {
                 continue;
             }
 
+            // A physical literal (`10 ns`, `2.5 us`) is one time value, in femtoseconds.
+            if (_currentSyntetizeIndex + 1 < _data.Length && PhysicalTime.IsUnit(_data[_currentSyntetizeIndex + 1])
+                && PhysicalTime.TryLiteral(currentItem, _data[_currentSyntetizeIndex + 1], out long timeFs))
+            {
+                items.Add(PhysicalTime.Value(timeFs, $"Literal-{Interlocked.Increment(ref _literalCounter)}"));
+                _currentSyntetizeIndex += 2;
+                continue;
+            }
+
+            // `now`: the simulation time, read when the expression is evaluated.
+            if (currentItem.Equals("now", StringComparison.OrdinalIgnoreCase) && !Variables.Contains(currentItem))
+            {
+                items.Add(new NowOperand());
+                _currentSyntetizeIndex++;
+                continue;
+            }
+
             if (_operators.IsMatch(currentItem.ToLower()))
             {
                 isComparation = true;
@@ -582,8 +627,11 @@ public class Operation : IOperation {
             else if (_finder.IsLiteral(currentItem))
             {
                 Constants.DATATYPES type = _finder.GetDataType(currentItem);
+                // A based bit-string literal (x"0F", o"7", b"01") stands for its bits.
+                object literal = currentItem.Length > 2 && currentItem[1] == '"' && HdlLiteral.TryBits(currentItem, out string based)
+                    ? based : currentItem;
                 // v0.17.0: Use atomic counter instead of expensive Guid.NewGuid()
-                item = new Variable($"Literal-{Interlocked.Increment(ref _literalCounter)}", currentItem, type) { IsConstant = true };
+                item = new Variable($"Literal-{Interlocked.Increment(ref _literalCounter)}", literal, type) { IsConstant = true };
             }
             else if (_variableRegex.IsMatch(currentItem))
             {
@@ -852,20 +900,9 @@ public class Operation : IOperation {
         // single integer token. Anything else — abort and don't consume.
         int bodyLen = close - nextIdx - 1;
         long ns;
-        if (bodyLen == 2 &&
-            long.TryParse(_data[nextIdx + 1], out var qty))
+        if (bodyLen == 2 && PhysicalTime.TryLiteral(_data[nextIdx + 1], _data[nextIdx + 2], out long fs))
         {
-            string unit = _data[nextIdx + 2].ToLower();
-            ns = unit switch
-            {
-                "fs"  => qty / 1_000_000,
-                "ps"  => qty / 1_000,
-                "ns"  => qty,
-                "us"  => qty * 1_000,
-                "ms"  => qty * 1_000_000,
-                "sec" => qty * 1_000_000_000,
-                _     => qty
-            };
+            ns = fs / PhysicalTime.FsPerNs;
         }
         else if (bodyLen == 1 && long.TryParse(_data[nextIdx + 1], out var raw))
         {
@@ -938,37 +975,7 @@ public class Operation : IOperation {
             }
         }
 
-        // Determine result type
-        Constants.DATATYPES resultType = functionName switch
-        {
-            "rising_edge" or "falling_edge" => Constants.DATATYPES.BOOLEAN,
-            "to_integer" or "conv_integer" => Constants.DATATYPES.INTEGER,
-            _ => Constants.DATATYPES.STD_LOGIC_VECTOR
-        };
-
-        // v0.17.0 Fix: For edge detection functions, defer evaluation until execution time
-        // These functions depend on the current simulation state which isn't available at parse time
-        if (Models.DeferredFunction.ShouldDefer(functionName))
-        {
-            return (true, new Models.DeferredFunction(functionName, args.ToArray(), resultType, Variables));
-        }
-
-        // Evaluate the function immediately for other functions
-        object result = StandardFunctions.EvaluateFunction(functionName, args.ToArray(), Variables);
-
-        // v0.17.0 Fix: Preserve actual boolean value instead of converting to string
-        object resultValue = resultType == Constants.DATATYPES.BOOLEAN
-            ? (result ?? false)
-            : (result?.ToString() ?? "false");
-
-        var resultVar = new Variable(
-            $"Function-{functionName}",
-            resultValue,
-            resultType
-        );
-        resultVar.PortType = Constants.PortType.OUT;
-
-        return (true, resultVar);
+        return (true, StandardCall(functionName, args));
     }
 
     /// <summary>
@@ -1112,7 +1119,7 @@ public class Operation : IOperation {
                 {
                     argBuffer.Add(intVal);
                 }
-                else if (_arithOperators.IsMatch(token) || _logicOperators.IsMatch(token.ToLower()))
+                else if (token == "&" || _arithOperators.IsMatch(token) || _logicOperators.IsMatch(token.ToLower()))
                 {
                     // Binary / unary operator inside a function-call argument.
                     // Recording it as an Operator (not a bare string) lets
@@ -1132,41 +1139,18 @@ public class Operation : IOperation {
         }
         FlushArg();
 
-        // Determine result type
-        Constants.DATATYPES resultType = functionName.ToLower() switch
-        {
-            "rising_edge" or "falling_edge" or "is_x" or "std_match" => Constants.DATATYPES.BOOLEAN,
-            "to_integer" or "conv_integer" or "clog2" => Constants.DATATYPES.INTEGER,
-            "to_x01" or "to_x01z" or "to_ux01" when args.FirstOrDefault() is Variable { Type: Constants.DATATYPES.STD_LOGIC } =>
-                Constants.DATATYPES.STD_LOGIC,
-            "to_stdulogic" => Constants.DATATYPES.STD_LOGIC,
-            "to_bit" => Constants.DATATYPES.BIT,
-            _ => Constants.DATATYPES.STD_LOGIC_VECTOR
-        };
-
-        // v0.17.0 Fix: For edge detection functions, defer evaluation until execution time
-        if (Models.DeferredFunction.ShouldDefer(functionName))
-        {
-            return (true, new Models.DeferredFunction(functionName, args.ToArray(), resultType, Variables));
-        }
-
-        // Evaluate the function immediately for other functions
-        object result = StandardFunctions.EvaluateFunction(functionName, args.ToArray(), Variables);
-
-        // v0.17.0 Fix: Preserve actual boolean value instead of converting to string
-        object resultValue = resultType == Constants.DATATYPES.BOOLEAN
-            ? (result ?? false)
-            : (result?.ToString() ?? "false");
-
-        var resultVar = new Variable(
-            $"Function-{functionName}",
-            resultValue,
-            resultType
-        );
-        resultVar.PortType = Constants.PortType.OUT;
-
-        return (true, resultVar);
+        // v0.17.0: functions read while simulating (edges, conversions of live values) are deferred.
+        return (true, StandardCall(functionName, args));
     }
+
+    /// <summary>
+    /// A standard-function call: deferred (evaluated while simulating) when its value
+    /// depends on live state, else its value now — the single place both parse paths build one.
+    /// </summary>
+    private object StandardCall(string functionName, List<object> args) =>
+        Models.DeferredFunction.ShouldDefer(functionName)
+            ? new Models.DeferredFunction(functionName, args.ToArray(), StandardFunctions.ResultType(functionName, args), Variables)
+            : StandardFunctions.Result(functionName, StandardFunctions.EvaluateFunction(functionName, args.ToArray(), Variables), args);
 
     // Reduce a buffered function-call argument (mix of Variables,
     // DeferredFunctions, DeferredIndex, ints, and Operators) into a single
@@ -1236,35 +1220,32 @@ public class Operation : IOperation {
         return v;
     }
 
-    /// <summary>
-    /// Parse a user-defined function call and return either a
-    /// <see cref="Models.DeferredUserFunction"/> wrapper (when the function
-    /// body is registered — Evaluate each fire) or a static stub
-    /// <see cref="Variable"/> (unknown / IEEE-stub — pre-existing legacy path).
-    /// </summary>
-    /// <remarks>
-    /// 2026-07-20 — pre-fix, this method evaluated argument expressions
-    /// eagerly and baked the function result into a <see cref="Variable"/>
-    /// pushed onto the operation's <c>Items</c>. On re-fire of the
-    /// enclosing <see cref="Operation"/> the frozen variable just
-    /// re-pushed its stale value — an LFSR routed through a user
-    /// <c>function</c> would transition once then freeze. Now the wrapper
-    /// carries the argument <b>expressions</b> and re-evaluates them
-    /// against the live scope on every <see cref="Models.DeferredUserFunction.Evaluate"/>
-    /// call. Returned as <c>object</c> so the caller pushes it as-is onto
-    /// <c>Items</c> — <see cref="Execute()"/> switches on the type and
-    /// invokes <c>Evaluate</c> per fire.
-    /// </remarks>
-    /// <summary>The assignment's right-hand side as written (empty when there is no <c>&lt;=</c>/<c>:=</c>).</summary>
-    private string RawRhs
+    /// <inheritdoc/>
+    public IEnumerable<string> ReadTexts => [TargetSelectors(AssignmentSides(_rawData).Lhs), RawRhs];
+
+    /// <summary>The text before and after the assignment operator (<c>&lt;=</c>, else <c>:=</c>); empty sides when there is none.</summary>
+    private static (string Lhs, string Rhs) AssignmentSides(string statement)
     {
-        get
-        {
-            int opIdx = _rawData.IndexOf("<=", StringComparison.Ordinal);
-            if (opIdx < 0) opIdx = _rawData.IndexOf(":=", StringComparison.Ordinal);
-            return opIdx >= 0 ? _rawData[(opIdx + 2)..].Trim() : string.Empty;
-        }
+        int opIdx = statement.IndexOf("<=", StringComparison.Ordinal);
+        if (opIdx < 0) opIdx = statement.IndexOf(":=", StringComparison.Ordinal);
+        return opIdx < 0 ? (string.Empty, string.Empty) : (statement[..opIdx].Trim(), statement[(opIdx + 2)..].Trim());
     }
+
+    /// <summary>
+    /// The selectors of an assignment target <paramref name="lhs"/> (<c>(addr)</c> of
+    /// <c>mem(addr)</c>): read by the statement, unlike the target's name. Empty for an aggregate target.
+    /// </summary>
+    internal static string TargetSelectors(string lhs)
+    {
+        lhs = lhs.Trim();
+        if (lhs.StartsWith('(')) return string.Empty;
+        int end = 0;
+        while (end < lhs.Length && (char.IsLetterOrDigit(lhs[end]) || lhs[end] == '_')) end++;
+        return lhs[end..];
+    }
+
+    /// <summary>The assignment's right-hand side as written (empty when there is no <c>&lt;=</c>/<c>:=</c>).</summary>
+    private string RawRhs => AssignmentSides(_rawData).Rhs;
 
     /// <summary>
     /// A qualified expression <c>T'(e)</c> has the value of <c>(e)</c>: the
@@ -1489,6 +1470,25 @@ public class Operation : IOperation {
         return mv;
     }
 
+    /// <summary>
+    /// Parse a user-defined function call and return either a
+    /// <see cref="Models.DeferredUserFunction"/> wrapper (when the function
+    /// body is registered — Evaluate each fire) or a static stub
+    /// <see cref="Variable"/> (unknown / IEEE-stub — pre-existing legacy path).
+    /// </summary>
+    /// <remarks>
+    /// 2026-07-20 — pre-fix, this method evaluated argument expressions
+    /// eagerly and baked the function result into a <see cref="Variable"/>
+    /// pushed onto the operation's <c>Items</c>. On re-fire of the
+    /// enclosing <see cref="Operation"/> the frozen variable just
+    /// re-pushed its stale value — an LFSR routed through a user
+    /// <c>function</c> would transition once then freeze. Now the wrapper
+    /// carries the argument <b>expressions</b> and re-evaluates them
+    /// against the live scope on every <see cref="Models.DeferredUserFunction.Evaluate"/>
+    /// call. Returned as <c>object</c> so the caller pushes it as-is onto
+    /// <c>Items</c> — <see cref="Execute()"/> switches on the type and
+    /// invokes <c>Evaluate</c> per fire.
+    /// </remarks>
     private (bool success, object item) ParseUserDefinedFunctionCall(string functionName)
     {
         // Skip the function name (already processed), move to "("
@@ -1577,17 +1577,6 @@ public class Operation : IOperation {
         resultVar.HasPlaceholderType = true; // black-box result: the real type is unknown
 
         return (true, resultVar);
-    }
-
-    /// <summary>
-    /// Checks if a token is a VHDL time unit.
-    /// </summary>
-    /// <param name="token">The token to check.</param>
-    /// <returns>True if the token is a time unit.</returns>
-    private static bool IsTimeUnit(string token)
-    {
-        string[] timeUnits = { "fs", "ps", "ns", "us", "ms", "sec", "min", "hr" };
-        return timeUnits.Contains(token.ToLower());
     }
 
     /// <summary>

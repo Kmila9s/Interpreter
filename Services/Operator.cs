@@ -349,8 +349,8 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                 // equality so `state = S_HALT` resolves correctly.
                 string s1 = var1.Value?.ToString() ?? "0";
                 string s2 = var2.Value?.ToString() ?? "0";
-                bool ok1 = int.TryParse(s1, out int i1);
-                bool ok2 = int.TryParse(s2, out int i2);
+                bool ok1 = TryInteger(var1, out var i1);
+                bool ok2 = TryInteger(var2, out var i2);
                 if (!ok1 && !ok2)
                 {
                     string op = OperatorName.ToLower();
@@ -361,26 +361,7 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
                     // don't track). Default to false.
                     return false;
                 }
-                if (!ok1) i1 = 0;
-                if (!ok2) i2 = 0;
-                switch (OperatorName.ToLower())
-                {
-                    case "=":
-                        return i1 == i2;
-                    case "!=":
-                    case "/=":
-                        return i1 != i2;
-                    case ">":
-                        return i1 > i2;
-                    case "<":
-                        return i1 < i2;
-                    case ">=":
-                        return i1 >= i2;
-                    case "<=":
-                        return i1 <= i2;
-                    default:
-                        throw new Exception($"Operator type do not detected or even supported: {OperatorName}");
-                }
+                return Relational(i1.CompareTo(i2));
             }
             default:
                 throw new Exception($"Datatype do not detected or even supported: {OperatorName}");
@@ -388,64 +369,64 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     }
 
     /// <summary>
-    /// Comparison helper that handles any combination of operand types
-    /// where at least one side is a STD_LOGIC_VECTOR. Both operands are
-    /// normalised to integers via <see cref="ParseAsUnsignedInt"/> (binary
-    /// string for vectors, plain decimal for INTEGER literals) before
-    /// comparison, matching numeric_std unsigned semantics. Equality keeps
-    /// string comparison so a vector with width drift compares cleanly.
+    /// Comparison with at least one vector side: numeric (any width, by each
+    /// operand's signedness) against an integer, for the relational operators
+    /// and for numeric_std operands; the predefined element-wise equality for
+    /// two plain vectors.
     /// </summary>
     private object SolveVectorComparation(Variable var1, Variable var2)
     {
-        string s1 = var1.Value?.ToString() ?? string.Empty;
-        string s2 = var2.Value?.ToString() ?? string.Empty;
+        string s1 = StripLiteralQuotes(var1.Value);
+        string s2 = StripLiteralQuotes(var2.Value);
+
+        // Numeric comparison: vector against an integer, the relational operators,
+        // and `=`/`/=` of numeric_std signed/unsigned operands (resized, H = 1). Plain
+        // std_logic_vector equality is the predefined element-wise one.
+        bool relational = OperatorName is not ("=" or "/=" or "!=");
+        bool numeric = var1.Type != var2.Type || relational
+            || IsNumericStd(var1) || IsNumericStd(var2);
+        if (!numeric)
+            return Relational(string.Equals(s1, s2, StringComparison.Ordinal) ? 0 : 1);
 
         // numeric_std: a metavalue in a numeric comparison returns FALSE (TRUE for `/=`) with a warning.
-        bool numeric = var1.Type != var2.Type || OperatorName is not ("=" or "/=" or "!=");
-        if (numeric && (HasMeta(var1) || HasMeta(var2)))
+        if (HasMeta(var1) || HasMeta(var2))
         {
             bool ne = OperatorName is "/=" or "!=";
             NumericStdWarning($"\"{(ne ? "/=" : OperatorName)}\": metavalue detected, returning {(ne ? "TRUE" : "FALSE")}");
             return ne;
         }
-
-        switch (OperatorName.ToLower())
-        {
-            case "=":
-                // For vector ⇆ integer equality, compare numerically — the
-                // string forms ("0010" vs "2") would otherwise miscompare.
-                if (var1.Type != var2.Type)
-                {
-                    return ParseAsUnsignedInt(var1) == ParseAsUnsignedInt(var2);
-                }
-                return s1.Equals(s2, StringComparison.Ordinal);
-            case "!=":
-            case "/=":
-                if (var1.Type != var2.Type)
-                {
-                    return ParseAsUnsignedInt(var1) != ParseAsUnsignedInt(var2);
-                }
-                return !s1.Equals(s2, StringComparison.Ordinal);
-            case "<":
-            case ">":
-            case "<=":
-            case ">=":
-            {
-                int i1 = ParseAsUnsignedInt(var1);
-                int i2 = ParseAsUnsignedInt(var2);
-                return OperatorName.ToLower() switch
-                {
-                    "<"  => i1 <  i2,
-                    ">"  => i1 >  i2,
-                    "<=" => i1 <= i2,
-                    ">=" => i1 >= i2,
-                    _    => false
-                };
-            }
-            default:
-                throw new Exception($"Operator type do not detected or even supported for vectors: {OperatorName}");
-        }
+        if (!TryNumber(var1, out var a) || !TryNumber(var2, out var b)) return OperatorName is "/=" or "!=";
+        return Relational(a.CompareTo(b));
     }
+
+    /// <summary>True for an operand typed by numeric_std (<c>signed</c>/<c>unsigned</c>).</summary>
+    private static bool IsNumericStd(Variable v) => TypeMarks.SignednessOf(v.TypeMark) != Signedness.None;
+
+    /// <summary>
+    /// How a vector operand reads as a number: its own type when signed/unsigned,
+    /// else the package the design uses for std_logic_vector (<see cref="PackageRegistry.VectorArithmetic"/>).
+    /// </summary>
+    internal static Signedness SignednessOf(Variable v) =>
+        TypeMarks.SignednessOf(v.TypeMark) is var s and not Signedness.None ? s : PackageRegistry.Instance.ArithmeticFor(v.Name);
+
+    /// <summary>The integer value of an integer operand (a number, not bits); false when it is not one (an enum literal).</summary>
+    internal static bool TryInteger(Variable v, out System.Numerics.BigInteger value)
+    {
+        switch (v.Value)
+        {
+            case int i: value = i; return true;
+            case long l: value = l; return true;
+            case System.Numerics.BigInteger b: value = b; return true;
+            case bool: value = 0; return false;
+        }
+        return System.Numerics.BigInteger.TryParse(v.Value?.ToString()?.Trim(), out value);
+    }
+
+    /// <summary>The number an operand stands for: a vector by its signedness, an integer by its value.</summary>
+    internal static bool TryNumber(Variable v, out System.Numerics.BigInteger value) =>
+        v.Type == DATATYPES.STD_LOGIC_VECTOR
+            ? LogicVector.TryToInteger(StripLiteralQuotes(v.Value), SignednessOf(v), out value)
+            : TryInteger(v, out value);
 
     /// <summary>
     /// Reads a Variable's value as a non-negative integer, honouring the
@@ -519,25 +500,6 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// <summary>Publishes a numeric_std assertion warning (<c>NUMERIC_STD.&lt;what&gt;</c>), as GHDL prints it.</summary>
     internal static void NumericStdWarning(string what) =>
         ReportBus.Instance.Emit($"[assert-warning] NUMERIC_STD.{what}");
-
-    private static int ParseAsUnsignedInt(Variable v)
-    {
-        if (v.Value == null) return 0;
-        string s = v.Value.ToString() ?? string.Empty;
-
-        // Vector-typed signals always come in as binary strings — interpret
-        // them that way regardless of int.TryParse's decimal interpretation.
-        if (v.Type == DATATYPES.STD_LOGIC_VECTOR && s.Length <= 31 && StdLogic.TryToUnsigned(s, out long bits))
-            return (int)bits;
-
-        if (int.TryParse(s, out int direct)) return direct;
-
-        if (s.Length > 0 && s.All(c => c == '0' || c == '1'))
-        {
-            try { return Convert.ToInt32(s, 2); } catch { return 0; }
-        }
-        return 0;
-    }
 
     /// <summary>
     /// Attempts to coerce types for type-mismatched operands.
@@ -637,157 +599,51 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// <param name="leftVariable">The left variable.</param>
     /// <param name="rightVariable">The right variable.</param>
     /// <returns>The result of the arithmetic operation.</returns>
-    public object SolveArithOperation(Variable leftVariable, Variable rightVariable){
-        object result = new();
-        // Helper to safely get integer from variable value, handling VHDL meta-values
-        int GetInt(Variable v) {
-            if (v.Value == null || v.Value.GetType() == typeof(object))
-            {
-                // Uninitialized variable - try to use 0 or parse name if it's a literal
-                if (int.TryParse(v.Name?.Replace("Literal-", "").Split('-')[0], out int parsed))
-                    return parsed;
-                return 0;
-            }
-            string str = v.Value.ToString() ?? "0";
-            // Vector-typed signals carry their value as a binary string
-            // ("00000010" = 2). We MUST try binary BEFORE decimal because
-            // int.TryParse("00000010") happily returns 10 (decimal), which
-            // silently corrupted unsigned arithmetic the moment a counter
-            // crossed any value whose binary representation looks like a
-            // valid decimal — bench Phase D / bug #6 (2026-06-02).
-            // BUT: don't apply the heuristic to INTEGER/NATURAL types —
-            // their decimal value can incidentally consist of only 0/1
-            // digits ("10" = ten, not two; "11" = eleven, not three) and
-            // forcing a binary parse silently corrupted intra-loop
-            // `count := count + 1` accumulation in 034 hamming once the
-            // count crossed 9. Bug #14 follow-up.
-            bool vectorish = v.Type == DATATYPES.STD_LOGIC_VECTOR ||
-                (v.Type != DATATYPES.INTEGER && v.Type != DATATYPES.NATURAL &&
-                 str.Length > 1 && str.All(c => c == '0' || c == '1'));
-            if (vectorish && str.Length <= 31 && StdLogic.TryToUnsigned(str, out long bits))
-                return (int)bits;
-            // Handle VHDL meta-values ('U', 'X', 'Z', etc.) and integer literals
-            if (int.TryParse(str, out int intVal))
-                return intVal;
-            return 0;
-        }
-        static bool IsIntegral(Variable v) => v.Value is int or long || !(v.Value?.ToString() ?? "").Contains('.');
-        double GetDouble(Variable v) {
-            if (v.Value == null || v.Value.GetType() == typeof(object))
-            {
-                if (double.TryParse(v.Name?.Replace("Literal-", "").Split('-')[0], out double parsed))
-                    return parsed;
-                return 0.0;
-            }
-            string str = v.Value.ToString() ?? "0";
-            if (double.TryParse(str, out double dblVal))
-                return dblVal;
-            return 0.0;
-        }
-
-        // v3.3 (numeric_std runtime): when either operand is a vector, do
-        // width-aware modular arithmetic and return a STD_LOGIC_VECTOR string
-        // of the wider operand's width. This is the simulation-side mirror
-        // of the synth path's ADD/SUB/MUL cells — `count <= count + 1` where
-        // `count : unsigned(3 downto 0)` now produces a 4-bit string the
-        // signal scheduler can write back without a type round-trip,
-        // including correct wraparound at the bit boundary.
-        bool leftVec  = leftVariable.Type == DATATYPES.STD_LOGIC_VECTOR;
+    public object SolveArithOperation(Variable leftVariable, Variable rightVariable)
+    {
+        string op = OperatorName.ToLowerInvariant();
+        bool leftVec = leftVariable.Type == DATATYPES.STD_LOGIC_VECTOR;
         bool rightVec = rightVariable.Type == DATATYPES.STD_LOGIC_VECTOR;
+
+        // Vectors (numeric_std, std_logic_arith/signed/unsigned): any width, signed or
+        // unsigned, result width by numeric_std's rules, wrapped to it.
         if (leftVec || rightVec)
         {
-            if (leftVariable.IsStub || rightVariable.IsStub)
+            if (leftVariable.IsStub || rightVariable.IsStub) return 0;
+            string lb = StripLiteralQuotes(leftVariable.Value), rb = StripLiteralQuotes(rightVariable.Value);
+            int width = LogicVector.ResultWidth(op, leftVec ? Math.Max(1, lb.Length) : null, rightVec ? Math.Max(1, rb.Length) : null);
+            if (HasMeta(leftVariable) || HasMeta(rightVariable))
             {
-                // Stubs preserve the legacy "return 0" behaviour — we don't
-                // know the intended width, so any vector-formatted answer
-                // would be a guess.
-                result = 0;
+                // numeric_std returns all 'X' silently; the Synopsys packages warn.
+                if (!IsNumericStd(leftVariable) && !IsNumericStd(rightVariable))
+                    ReportBus.Instance.Emit("[assert-warning] There is an 'U'|'X'|'W'|'Z'|'-' in an arithmetic operand, the result will be 'X'(es).");
+                return new string('X', width);
             }
-            else
-            {
-                int leftW  = leftVec  ? Math.Max(1, leftVariable.Size)  : 1;
-                int rightW = rightVec ? Math.Max(1, rightVariable.Size) : 1;
-                // numeric_std width semantics:
-                //   `+` / `-`  → max(left, right) (modular wrap is the
-                //                 expected behaviour for narrow accumulators)
-                //   `*`         → left + right    (full product needs the
-                //                 sum-of-widths or the high bits get
-                //                 silently masked — bench bug #22, surfaced
-                //                 by P1's `unsigned(A(4 downto 0)) * unsigned(B(4 downto 0))`
-                //                 once Phase E.3 started extracting the slice
-                //                 properly instead of widening to the whole
-                //                 vector).
-                string opName = OperatorName?.ToLower() ?? string.Empty;
-                int width = opName == "*"
-                    ? leftW + rightW
-                    : Math.Max(leftW, rightW);
-                // numeric_std: a metavalue in a vector operand makes the whole result 'X' (no warning).
-                if (HasMeta(leftVariable) || HasMeta(rightVariable))
-                    return new string('X', width);
-                int li  = GetInt(leftVariable);
-                int ri  = GetInt(rightVariable);
-                int raw = SolveIntOperation(li, ri);
-
-                // Modular wrap to the result width — matches numeric_std
-                // unsigned semantics where overflow rolls over inside the
-                // declared bit width.
-                if (width >= 31)
-                {
-                    result = Convert.ToString(raw, 2).PadLeft(width, '0');
-                }
-                else
-                {
-                    int mask    = (1 << width) - 1;
-                    int wrapped = raw & mask;
-                    result = Convert.ToString(wrapped, 2).PadLeft(width, '0');
-                }
-            }
-            return result;
+            if (!TryNumber(leftVariable, out var a) || !TryNumber(rightVariable, out var b)) return new string('X', width);
+            return LogicVector.FromInteger(LogicVector.Apply(op, a, b), width);
         }
 
-        if(leftVariable.Type != rightVariable.Type){
-            if(
-                (leftVariable.Type == DATATYPES.INTEGER || leftVariable.Type == DATATYPES.NATURAL) &&
-                (rightVariable.Type == DATATYPES.INTEGER || rightVariable.Type == DATATYPES.NATURAL)
-            ){
-                result = SolveIntOperation(GetInt(leftVariable), GetInt(rightVariable));
-            }
-            // v0.13.0: Skip type check for stub variables (undeclared identifiers)
-            else if (leftVariable.IsStub || rightVariable.IsStub)
-            {
-                // Return a default value for operations involving stub variables
-                result = 0;
-            }
-            else
-                throw new InvalidOperationException($"The datatypes do not match: {leftVariable.Name}:{leftVariable.Type} - {rightVariable.Name}:{rightVariable.Name}");
-        }else{
-            switch(leftVariable.Type){
-                case DATATYPES.INTEGER:
-                    result = SolveIntOperation(GetInt(leftVariable), GetInt(rightVariable));
-                break;
-                case DATATYPES.NATURAL:
-                    // NATURAL also types real literals (`2.5`); two integral operands stay integer (`7/2 = 3`).
-                    result = IsIntegral(leftVariable) && IsIntegral(rightVariable)
-                        ? SolveIntOperation(GetInt(leftVariable), GetInt(rightVariable))
-                        : SolveRealOperation(GetDouble(leftVariable), GetDouble(rightVariable));
-                break;
-                default:
-                    // Default to integer operation or return 0 for unhandled types
-                    result = 0;
-                break;
-            }
-        }
-        return result;
+        if (leftVariable.IsStub || rightVariable.IsStub) return 0;
+        if (leftVariable.Type is not (DATATYPES.INTEGER or DATATYPES.NATURAL) || rightVariable.Type is not (DATATYPES.INTEGER or DATATYPES.NATURAL))
+            throw new InvalidOperationException($"The datatypes do not match: {leftVariable.Name}:{leftVariable.Type} - {rightVariable.Name}:{rightVariable.Type}");
+
+        // Reals (`2.5`) share the NATURAL classification; two integral operands stay integer (`7/2 = 3`).
+        if (!IsIntegral(leftVariable) || !IsIntegral(rightVariable))
+            return SolveRealOperation(GetDouble(leftVariable), GetDouble(rightVariable));
+        // Two 32-bit integers: + - * / mod rem in long (cannot overflow); else any width.
+        if (leftVariable.Value is int li && rightVariable.Value is int ri && op is "+" or "-" or "*" or "/" or "mod" or "rem")
+            return LogicVector.ToInt32(IntegerArithmetic.Apply(op, li, ri));
+        TryInteger(leftVariable, out var x);
+        TryInteger(rightVariable, out var y);
+        var result = LogicVector.Apply(op, x, y);
+        // Physical time values (fs) are 64-bit; integer wraps at 32 bits as in GHDL.
+        return PhysicalTime.IsTime(leftVariable) || PhysicalTime.IsTime(rightVariable) ? (object)(long)result : LogicVector.ToInt32(result);
     }
 
-    /// <summary>
-    /// Solves an integer operation.
-    /// </summary>
-    /// <param name="leftVariable">The left variable.</param>
-    /// <param name="rightVariable">The right variable.</param>
-    /// <returns>The result of the integer operation.</returns>
-    public int SolveIntOperation(int leftVariable, int rightVariable) =>
-        (int)IntegerArithmetic.Apply(OperatorName, leftVariable, rightVariable);
+    private static bool IsIntegral(Variable v) => v.Value is int or long or System.Numerics.BigInteger || !(v.Value?.ToString() ?? "").Contains('.');
+
+    private static double GetDouble(Variable v) =>
+        double.TryParse(v.Value?.ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double d) ? d : 0.0;
 
     /// <summary>
     /// Solves a real operation.
@@ -831,7 +687,13 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         }
         if (OperatorName == "??") return s.Length == 1 && StdLogic.Condition(s[0]);
         if (OperatorName.Equals("abs", StringComparison.OrdinalIgnoreCase))
-            return int.TryParse(s, out int n) ? Math.Abs(n) : throw new ParserException($"abs is only supported on integers here ('{s}')");
+        {
+            if (variable.Type == DATATYPES.STD_LOGIC_VECTOR)
+                return StdLogic.IsX(s) ? new string('X', s.Length)
+                    : LogicVector.TryToInteger(s, SignednessOf(variable), out var v) ? LogicVector.FromInteger(System.Numerics.BigInteger.Abs(v), s.Length) : s;
+            return TryInteger(variable, out var n) ? LogicVector.ToInt32(System.Numerics.BigInteger.Abs(n))
+                : throw new ParserException($"abs is not defined for '{s}'");
+        }
         if (s.Length == 0) return '1';   // uninitialised — treat as `not 0` = '1'
         if (!OperatorName.Equals("not", StringComparison.OrdinalIgnoreCase)) return '0';
 
@@ -890,7 +752,7 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             : new string('U', size1);
     }
 
-    private static string StripLiteralQuotes(object? value)
+    internal static string StripLiteralQuotes(object? value)
     {
         var s = value?.ToString() ?? string.Empty;
         if (s.Length >= 2 && s[0] == '"' && s[^1] == '"') return s.Substring(1, s.Length - 2);
@@ -906,56 +768,8 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
     /// <returns>The shifted/rotated vector as string.</returns>
     private object SolveShiftOperation(Variable vector, Variable amount)
     {
-        string vecStr = vector.Value?.ToString() ?? new string('0', vector.Size);
-        int shiftAmt;
-
-        // Get shift amount from the variable (safe parsing for meta-values)
-        if (amount.Type == DATATYPES.INTEGER || amount.Type == DATATYPES.NATURAL)
-        {
-            if (!int.TryParse(amount.Value?.ToString() ?? "0", out shiftAmt))
-                shiftAmt = 0;
-        }
-        else
-        {
-            // Try to parse from value
-            if (!int.TryParse(amount.Value?.ToString() ?? "0", out shiftAmt))
-                shiftAmt = 0;
-        }
-
-        int len = vecStr.Length;
-        if (len == 0) return vecStr;
-
-        // Clamp shift amount
-        shiftAmt = Math.Abs(shiftAmt) % len;
-        if (shiftAmt == 0) return vecStr;
-
-        string result;
-        switch (OperatorName.ToLower())
-        {
-            case "sll": // Shift Left Logical - fill with '0' on right
-                result = vecStr.Substring(shiftAmt) + new string('0', shiftAmt);
-                break;
-            case "srl": // Shift Right Logical - fill with '0' on left
-                result = new string('0', shiftAmt) + vecStr.Substring(0, len - shiftAmt);
-                break;
-            case "sla": // Shift Left Arithmetic - fill with rightmost bit on right
-                char fillRight = vecStr[len - 1];
-                result = vecStr.Substring(shiftAmt) + new string(fillRight, shiftAmt);
-                break;
-            case "sra": // Shift Right Arithmetic - fill with leftmost bit (sign) on left
-                char signBit = vecStr[0];
-                result = new string(signBit, shiftAmt) + vecStr.Substring(0, len - shiftAmt);
-                break;
-            case "rol": // Rotate Left
-                result = vecStr.Substring(shiftAmt) + vecStr.Substring(0, shiftAmt);
-                break;
-            case "ror": // Rotate Right
-                result = vecStr.Substring(len - shiftAmt) + vecStr.Substring(0, len - shiftAmt);
-                break;
-            default:
-                result = vecStr;
-                break;
-        }
-        return result;
+        string bits = StripLiteralQuotes(vector.Value);
+        TryInteger(amount, out var n);
+        return LogicVector.Shift(bits, OperatorName, (long)n, SignednessOf(vector));
     }
 }

@@ -44,18 +44,23 @@ public class ScheduledOperation
         operation.EnsureWritable();
         object computedValue = operation.Evaluate();
 
-        // Whole or part target, `after N ns` delay, or immediate variable
-        // (`:=`) semantics: one place decides how the value is written.
+        // Whole or part target, waveform with its delay mechanism, or immediate
+        // variable (`:=`) semantics: one place decides how the value is written.
+        if (operation.IsVariableAssignment)
+        {
+            if (operation.AggregateTarget is { } va) va.Assign(scheduler, computedValue, operation.SourceLine, immediate: true);
+            else if (operation.Target is { } vt) vt.Assign(scheduler, computedValue, operation.SourceLine, immediate: true);
+            else operation.Result.Value = computedValue;   // procedure-local temporary (no declared target)
+            return;
+        }
+        var waveform = operation.WaveformValues(computedValue);
+        var mechanism = operation.Waveform?.Mechanism ?? DelayMechanism.Inertial;
         if (operation.AggregateTarget is { } aggregate)
-            aggregate.Assign(scheduler, computedValue, operation.SourceLine,
-                             operation.AfterDelayNs, operation.IsVariableAssignment);
+            aggregate.Schedule(scheduler, waveform, operation.SourceLine, mechanism, operation.RejectNs);
         else if (operation.Target is { } target)
-            target.Assign(scheduler, computedValue, operation.SourceLine,
-                          operation.AfterDelayNs, operation.IsVariableAssignment);
-        else if (operation.IsVariableAssignment)
-            operation.Result.Value = computedValue;   // procedure-local temporary (no declared target)
+            target.Schedule(scheduler, waveform, operation.SourceLine, mechanism, operation.RejectNs);
         else
-            scheduler.Schedule(operation.Result, computedValue, operation.SourceLine);
+            throw new InvalidOperationException($"signal assignment without a target at Line {operation.SourceLine}");
     }
 
     /// <summary>

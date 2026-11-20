@@ -16,6 +16,8 @@ internal static class VhdlUnitText
     // clause; the matching `)` is found by counting parens (ExtractParenBlockAfter).
     internal static readonly Regex PortStartRe = new(@"\bport\s*\(", RegexOptions.IgnoreCase | RegexOptions.Singleline);
     internal static readonly Regex GenericStartRe = new(@"\bgeneric\s*\(", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    internal static readonly Regex PortMapStartRe = new(@"\bport\s+map\s*\(", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    internal static readonly Regex GenericMapStartRe = new(@"\bgeneric\s+map\s*\(", RegexOptions.IgnoreCase | RegexOptions.Singleline);
 
     // Match a signal/constant declaration at line start OR after a `;`, so
     // several on one line (`signal s1 : ...; signal c1 : ...; signal c2 : ...;`)
@@ -35,8 +37,19 @@ internal static class VhdlUnitText
                 var t = nm.Trim();
                 if (!string.IsNullOrEmpty(t)) names.Add(t.ToLowerInvariant());
             }
+        // Subprograms too: each inlined instance gets its own copy, bound to its
+        // own signals (G67) instead of every instance sharing the last one.
+        foreach (Match sp in SubprogramDeclRe.Matches(decl))
+        {
+            string name = sp.Groups["name"].Value.ToLowerInvariant();
+            if (!names.Contains(name)) names.Add(name);
+        }
         return names;
     }
+
+    private static readonly Regex SubprogramDeclRe = new(
+        @"\b(?:pure\s+|impure\s+)?(?:function|procedure)\s+(?<name>[A-Za-z]\w*)",
+        RegexOptions.IgnoreCase);
 
     // Splits the body of a `port(...)` or `generic(...)` block into
     // individual identifier names. Each clause looks like
@@ -108,7 +121,7 @@ internal static class VhdlUnitText
         // the `case` keyword from the depth counter and caused
         // SplitArchitecture to terminate prematurely at the inner
         // `end process` instead of the architecture-level `end`.
-        var rx = new Regex(@"\b(architecture|process|function|procedure|generate|block|begin|end|if|case|loop|then|is)\b(?:[ \t]+(function|procedure|process|generate|block|architecture|if|case|loop)\b)?",
+        var rx = new Regex(@"\b(architecture|process|function|procedure|generate|block|begin|end|if|elsif|else|case|loop|then|is)\b(?:[ \t]+(function|procedure|process|generate|block|architecture|if|case|loop)\b)?",
                            RegexOptions.IgnoreCase);
         // First locate the architecture-level `begin`.
         Match m = rx.Match(masked, startIdx);
@@ -163,6 +176,15 @@ internal static class VhdlUnitText
                     // `end generate`: their `generate` must not open a second level.
                     innerDepth++;
                     conditionPending = true;
+                    break;
+                case "elsif":
+                    // `elsif C then` (sequential) or `elsif C generate`: a branch of the
+                    // open if, never a new level.
+                    conditionPending = true;
+                    break;
+                case "else":
+                    // `else generate` continues the open if generate.
+                    if (em.Groups[2].Value.Equals("generate", StringComparison.OrdinalIgnoreCase)) conditionPending = false;
                     break;
                 case "then":
                 case "is":

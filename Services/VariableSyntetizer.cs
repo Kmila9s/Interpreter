@@ -182,6 +182,12 @@ public class VariableSyntetizer : ISControl
                     break;
                 continue;
             }
+            // `file f : text open read_mode is "data.txt";` (std.textio input, G80)
+            if (_streamer.Current?.Value?.ToLower() == "file")
+            {
+                ParseFileDeclaration();
+                continue;
+            }
             // Skip attribute declarations and specifications
             if (_streamer.Current?.Value?.ToLower() == "attribute")
             {
@@ -193,19 +199,6 @@ public class VariableSyntetizer : ISControl
             {
                 SkipDisconnectSpec();
                 continue;
-            }
-
-            // Check for constant declarations with function calls (e.g., constant X := func(Y);)
-            // v0.13.0: Constants with function calls cannot be evaluated at parse time
-            // Only skip if the initialization contains a function call (identifier followed by '(')
-            if (_streamer.Current?.Value?.ToLower() == "constant")
-            {
-                if (HasFunctionCallInConstant())
-                {
-                    SkipConstantDeclaration();
-                    continue;
-                }
-                // Otherwise, fall through to normal variable parsing
             }
 
             List<Variable> variables = new();
@@ -254,8 +247,8 @@ public class VariableSyntetizer : ISControl
                     {
                         "in" => Constants.PortType.IN,
                         "out" => Constants.PortType.OUT,
-                        "inout" => Constants.PortType.OUT, // Treat inout as out for resource estimation
-                        "buffer" => Constants.PortType.OUT, // Treat buffer as out
+                        "inout" => Constants.PortType.INOUT,
+                        "buffer" => Constants.PortType.BUFFER,
                         _ => Constants.PortType.IN
                     };
                     _streamer.MoveNext(); // Consume direction keyword
@@ -391,7 +384,7 @@ public class VariableSyntetizer : ISControl
                 var prevShape = _currentShape;
                 _currentShape = ShapeOf(subtype);
 
-                value = ParseInitializationValue();
+                value = subtype.TypeName == PhysicalTime.TypeMark ? ParseTimeInitializer() : ParseInitializationValue();
 
                 _currentShape = prevShape;
             }
@@ -693,9 +686,11 @@ public class VariableSyntetizer : ISControl
                     var other => other ?? new object(),
                 };
             }
-            catch (Exception) when (!ParseTrace.Enabled)
+            catch (Exception e) when (e is not ParserException)
             {
-                value = new object();
+                // G54: never the default value in silence.
+                throw new ParserException($"cannot evaluate the initial value {call}({args}): {e.Message}",
+                    _streamer.Current ?? _streamer.Previous);
             }
         }
         // Check for identifier reference
@@ -1016,155 +1011,6 @@ public class VariableSyntetizer : ISControl
     }
 
     /// <summary>
-    /// Checks if a constant declaration contains a function call in its initialization.
-    /// Uses lookahead without consuming tokens.
-    /// </summary>
-    /// <returns>True if the constant has a function call like func(args), false otherwise.</returns>
-    private bool HasFunctionCallInConstant()
-    {
-        _streamer.SetRollBack();
-
-        // Look ahead to find ':=' and then check what follows
-        bool foundAssign = false;
-        int iterations = 0;
-        const int MAX_LOOKAHEAD = 50;
-
-        while (_streamer.Current != null && iterations < MAX_LOOKAHEAD)
-        {
-            iterations++;
-            string val = _streamer.Current.Value;
-
-            // Stop if we hit semicolon or begin
-            if (val == ";" || val.ToLower() == "begin" || val.ToLower() == _breaker)
-            {
-                break;
-            }
-
-            if (val == ":=")
-            {
-                foundAssign = true;
-                _streamer.MoveNext();
-                continue;
-            }
-
-            // After ':=', check if we have identifier followed by '('
-            // which indicates a function call
-            if (foundAssign)
-            {
-                // Skip any leading '(' for aggregate initializers like "(others => '0')"
-                if (val == "(")
-                {
-                    _streamer.RollBack();
-                    return false; // This is an aggregate, not a function call
-                }
-
-                // Check for identifier followed by '('
-                if (_streamer.Current?.Type == IDENTIFIERS)
-                {
-                    string ident = _streamer.Current.Value;
-                    _streamer.MoveNext();
-
-                    // If next is '(', it's a function call
-                    if (_streamer.Current?.Value == "(")
-                    {
-                        _streamer.RollBack();
-                        return true;
-                    }
-                }
-
-                // If we got here without finding function call pattern, it's a simple constant
-                _streamer.RollBack();
-                return false;
-            }
-
-            _streamer.MoveNext();
-        }
-
-        _streamer.RollBack();
-        return false;
-    }
-
-    /// <summary>
-    /// Skips a constant declaration until ';'.
-    /// Constants with function calls cannot be evaluated at parse time.
-    /// </summary>
-    /// <remarks>
-    /// <para>v0.13.0: Added to handle constants with function call initializations.</para>
-    /// <code>
-    /// constant TREE_DEPTH : integer := clog2(NUM_INPUTS);  -- Skipped
-    /// constant ZERO : std_logic_vector(7 downto 0) := (others => '0');  -- Skipped
-    /// </code>
-    /// </remarks>
-    private void SkipConstantDeclaration()
-    {
-        // Skip 'constant' keyword
-        _streamer.MoveNext();
-
-        // Capture the constant name(s) so later expressions can resolve them.
-        // Without this, constants defined as `constant X : integer := func(Y);`
-        // would be silently dropped, and any downstream use of X would fail
-        // with "Undeclared variable". Register a placeholder Variable per name;
-        // value resolution can refine this later if function evaluation is added.
-        var declaredNames = new List<string>();
-        while (_streamer.Current != null && _streamer.Current.Type == IDENTIFIERS)
-        {
-            declaredNames.Add(_streamer.Current.Value);
-            _streamer.MoveNext();
-            if (_streamer.Current?.Value == ",") _streamer.MoveNext();
-            else break;
-        }
-
-        int parenDepth = 0;
-        int iterations = 0;
-        const int MAX_ITERATIONS = 1000;
-
-        // Skip until we find ';' at depth 0
-        while (_streamer.Current != null && iterations < MAX_ITERATIONS)
-        {
-            iterations++;
-            string val = _streamer.Current.Value;
-
-            if (val == "(")
-            {
-                parenDepth++;
-            }
-            else if (val == ")")
-            {
-                parenDepth--;
-            }
-            else if (val == ";" && parenDepth == 0)
-            {
-                _streamer.MoveNext(); // skip ';'
-                break;
-            }
-
-            // Safety: if we hit 'begin', we've gone too far
-            if (val.ToLower() == "begin" || val.ToLower() == _breaker)
-            {
-                break;
-            }
-
-            _streamer.MoveNext();
-        }
-
-        foreach (var name in declaredNames)
-        {
-            if (string.IsNullOrEmpty(name)) continue;
-            if (Variables.Any(v => v.Name.Equals(name, StringComparison.OrdinalIgnoreCase))) continue;
-            // Seed Value=0 so downstream Convert.ToInt32(...) calls succeed instead
-            // of falling into the `_value ?? new()` branch and getting a raw object.
-            Variables.Add(new Variable { Name = name, Value = 0 });
-            SkipDiagnosticLog.Instance.AddInfo(
-                "VHD-CONSTANT-PLACEHOLDER",
-                name,
-                $"Constant '{name}' has a function-call initializer that the " +
-                "parser does not yet evaluate. Registered with placeholder " +
-                "value 0 — vector widths derived from this constant will be " +
-                "incorrect at runtime.");
-        }
-    }
-
-    /// <summary>
     /// Skips a component declaration until 'end component;'
     /// </summary>
     private void SkipComponentDeclaration()
@@ -1239,7 +1085,8 @@ public class VariableSyntetizer : ISControl
             Constants.DATATYPES.BIT => "0",
             Constants.DATATYPES.BOOLEAN => false,
             Constants.DATATYPES.INTEGER or Constants.DATATYPES.NATURAL =>
-                subtype.TypeName is "time" or "real" ? 0 : (int)(subtype.ScalarLeft ?? int.MinValue),
+                subtype.TypeName == PhysicalTime.TypeMark ? long.MinValue          // time'left
+                : subtype.TypeName == "real" ? 0 : (int)(subtype.ScalarLeft ?? int.MinValue),
             Constants.DATATYPES.STRING => new string('\0', subtype.Width),
             Constants.DATATYPES.CHARACTER => "\0",
             _ => new object(),
@@ -1259,6 +1106,7 @@ public class VariableSyntetizer : ISControl
     /// </summary>
     private static Variable ApplyShape(Variable v, SubtypeIndication subtype)
     {
+        v.TypeMark = BaseTypeMark(subtype);
         if (subtype.Left is int left && subtype.Right is int right)
             v.SetDeclaredRange(left, right, subtype.IsDownto);
         var t = subtype.Custom;
@@ -1291,6 +1139,138 @@ public class VariableSyntetizer : ISControl
                 break;
         }
         return v;
+    }
+
+    /// <summary>
+    /// The declarative part of a subprogram, up to its <c>begin</c>, one declaration at a
+    /// time with the shared declaration parser. A declaration whose range or initial
+    /// value depends on the parameters (<c>integer range 0 to s'length</c>,
+    /// <c>:= 2 ** (bits - 1)</c>) is elaborated at each call in VHDL; it is kept typed
+    /// by its type mark only, so valid code is never rejected. A nested subprogram
+    /// makes the whole part go through the parser at once.
+    /// </summary>
+    private List<Variable> ParseSubprogramLocals(HashSet<Variable> scope, TypeRegistry types)
+    {
+        var locals = new List<Variable>();
+        if (string.Equals(_streamer.Current?.Value, "begin", StringComparison.OrdinalIgnoreCase)) return locals;
+        int regionStart = _streamer.Position, regionEnd = regionStart, depth = 0;
+        bool nestedSubprogram = false;
+        for (var t = _streamer.Slice(regionStart, int.MaxValue); regionEnd - regionStart < t.Count; regionEnd++)
+        {
+            string v = t[regionEnd - regionStart].Value.ToLowerInvariant();
+            if (v is "function" or "procedure") nestedSubprogram = true;
+            if (v == "(") depth++; else if (v == ")") depth--;
+            else if (v == "begin" && depth == 0 && !nestedSubprogram) break;
+        }
+        if (nestedSubprogram)
+        {
+            var whole = new VariableSyntetizer(_streamer, scope, TypeRegistry: types);
+            whole.Syntetize(_currentCt);
+            return [.. whole.Variables];
+        }
+        var region = _streamer.Slice(regionStart, regionEnd);
+        int start = 0;
+        depth = 0;
+        for (int i = 0; i < region.Count; i++)
+        {
+            if (region[i].Value == "(") depth++;
+            else if (region[i].Value == ")") depth--;
+            if (region[i].Value != ";" || depth != 0) continue;
+            var decl = region.Skip(start).Take(i - start + 1).ToList();
+            start = i + 1;
+            var stream = new TokenStream([.. decl, new Token("begin", KEYWORDS)]);
+            try
+            {
+                var parser = new VariableSyntetizer(stream, [.. scope, .. locals], TypeRegistry: types);
+                parser.Syntetize(_currentCt);
+                locals.AddRange(parser.Variables);
+                foreach (var t in parser.ParsedTypes.Types.Values) types.TryRegister(t);
+            }
+            catch (Exception e) when (e is ParserException or TokenStream.StreamerException)
+            {
+                // Not static here (it depends on the parameters): an object keeps its type
+                // mark; another declaration (an attribute specification…) declares no object.
+                int colon = decl.FindIndex(t => t.Value == ":");
+                if (decl[0].Value.ToLowerInvariant() is not ("variable" or "constant") || colon < 0 || colon + 1 >= decl.Count) continue;
+                string mark = decl[colon + 1].Value;
+                foreach (var name in decl.Skip(1).Take(colon - 1).Where(t => t.Type == IDENTIFIERS))
+                    locals.Add(new Variable(name.Value, string.Empty, Variable.GetDatatype(mark)) { TypeMark = mark.ToLowerInvariant() });
+            }
+        }
+        while (_streamer.Position < regionEnd) _streamer.MoveNext();
+        return locals;
+    }
+
+    /// <summary>
+    /// A file declaration: <c>file f : text open read_mode is "name";</c> (or the
+    /// VHDL-87 <c>is in "name"</c>). Read mode opens the file for <c>readline</c>;
+    /// writing to a file is not supported yet (an error, never a silent no-op).
+    /// </summary>
+    private void ParseFileDeclaration()
+    {
+        var start = _streamer.Current!;
+        _streamer.MoveNext(); // file
+        var names = new List<string>();
+        while (_streamer.Current is { Type: IDENTIFIERS } n)
+        {
+            names.Add(n.Value);
+            _streamer.MoveNext();
+            if (_streamer.Current?.Value == ",") _streamer.MoveNext(); else break;
+        }
+        var words = new List<Token>();
+        while (_streamer.Current is { } t && t.Value != ";") { words.Add(t); _streamer.MoveNext(); }
+        if (_streamer.Current?.Value == ";") _streamer.MoveNext();
+        string? path = words.FirstOrDefault(w => w.IsStringLiteral)?.Value.Trim('"');
+        bool writes = words.Any(w => w.Value.Equals("write_mode", StringComparison.OrdinalIgnoreCase) || w.Value.Equals("append_mode", StringComparison.OrdinalIgnoreCase)
+            || w.Value.Equals("out", StringComparison.OrdinalIgnoreCase));
+        if (writes)
+            throw new ParserException("files opened for writing are not supported yet (use writeline(output, …))", start);
+        foreach (var name in names)
+        {
+            var file = new Variable(name, string.Empty, Constants.DATATYPES.UNKNOWN) { TypeMark = "text" };
+            if (path is not null) TextioFiles.OpenRead(file, path);
+            Variables.Add(file);
+        }
+    }
+
+    /// <summary>
+    /// The initial value of a <c>time</c> object (<c>:= 4 ns</c>, <c>:= PERIOD / 2</c>):
+    /// the expression up to the declaration's end, in femtoseconds.
+    /// </summary>
+    private object ParseTimeInitializer()
+    {
+        var tokens = new List<string>();
+        int depth = 0;
+        while (_streamer.Current is { } t && !(depth == 0 && (t.Value == ";" || t.Value == ")")))
+        {
+            if (t.Value == "(") depth++;
+            else if (t.Value == ")") depth--;
+            tokens.Add(t.Value);
+            _streamer.MoveNext();
+        }
+        string text = string.Join(" ", tokens);
+        // Generics (`PERIOD`) and the objects declared so far; an expression over
+        // signals is kept as text and evaluated where it is used (`wait for`, `after`).
+        if (!TimeValue.TryEvaluateNs(text, [.. _comparator, .. Variables], out double ns)) return text;
+        return (long)Math.Round(ns * PhysicalTime.FsPerNs);
+    }
+
+    /// <summary>
+    /// The type mark an object of <paramref name="subtype"/> has: the predefined
+    /// or user type a user subtype constrains (its base, recursively), else the
+    /// written mark — <c>subtype byte is signed(7 downto 0)</c> gives <c>signed</c>.
+    /// </summary>
+    private static string BaseTypeMark(SubtypeIndication subtype)
+    {
+        var t = subtype.Custom;
+        for (int guard = 0; t is { Kind: TypeKind.Subtype } && guard < 16; guard++)
+        {
+            string baseName = t.BaseTypeName.ToLowerInvariant();
+            var next = PackageSubtypeScanner.LookupGlobally(baseName);
+            if (next is null || ReferenceEquals(next, t)) return baseName;
+            t = next;
+        }
+        return (t?.Name ?? subtype.TypeName).ToLowerInvariant();
     }
 
     /// <summary>
@@ -1565,6 +1545,7 @@ public class VariableSyntetizer : ISControl
         if (typeDef != null)
         {
             ParsedTypes.TryRegister(typeDef);
+            PackageRegistry.Instance.RegisterDesignType(typeDef);
             _typeRegistry?.TryRegister(typeDef);
 
             // Bug #16 fix: register every enum literal as a constant Variable
@@ -1992,6 +1973,7 @@ public class VariableSyntetizer : ISControl
         var returnType = Constants.DATATYPES.UNKNOWN;
         int returnTypeSize = 0;
         string? customReturnTypeName = null;
+        string? returnTypeMark = null;
         string bodyRaw = string.Empty;
 
         if (_streamer.Current?.Value == "(")
@@ -2004,6 +1986,7 @@ public class VariableSyntetizer : ISControl
         {
             _streamer.MoveNext(); // consume 'return'
             string retTypeTok = _streamer.Current?.Value ?? "std_logic";
+            returnTypeMark = retTypeTok.ToLowerInvariant();
             returnType = Variable.GetDatatype(retTypeTok);
             if (returnType == Constants.DATATYPES.UNKNOWN)
                 customReturnTypeName = retTypeTok;
@@ -2039,60 +2022,16 @@ public class VariableSyntetizer : ISControl
             _streamer.MoveNext();
         }
 
-        // Parse local declarations (variables, constants) until top-level
-        // `begin`. Tier 4.3 (2026-07-28): capture `variable <n> : <type>[(hi
-        // downto lo)] [:= <init>];` into a list so synth-time body inlining
-        // can recognise SSA writes to locals via the scope-alias stack.
-        // Constants and other declaration kinds are still skipped.
-        var localVariables = new List<Variable>();
-        while (_streamer.Current != null && _streamer.Current.Value?.ToLower() != "begin")
-        {
-            ParseTrace.Step(ref _fnIter, _streamer, _currentCt);
-            if (_streamer.Current.Value?.ToLower() == "variable")
-            {
-                _streamer.MoveNext(); // 'variable'
-                string localName = _streamer.Current?.Value ?? string.Empty;
-                if (!string.IsNullOrEmpty(localName)) _streamer.MoveNext();
-                if (_streamer.Current?.Value == ":") _streamer.MoveNext();
-                string localTypeTok = _streamer.Current?.Value ?? "std_logic";
-                var localType = Variable.GetDatatype(localTypeTok);
-                if (_streamer.Current != null) _streamer.MoveNext();
-                int localSize = 0;
-                if (_streamer.Current?.Value == "(")
-                {
-                    _streamer.MoveNext(); // '('
-                    if (int.TryParse(_streamer.Current?.Value, out int hi))
-                    {
-                        _streamer.MoveNext(); // hi
-                        _streamer.MoveNext(); // downto/to
-                        if (int.TryParse(_streamer.Current?.Value, out int lo))
-                        {
-                            localSize = Math.Abs(hi - lo) + 1;
-                            _streamer.MoveNext(); // lo
-                        }
-                    }
-                    while (_streamer.Current != null && _streamer.Current.Value != ")")
-                    {
-                        _streamer.MoveNext();
-                    }
-                    if (_streamer.Current?.Value == ")") _streamer.MoveNext();
-                }
-                // Skip optional `:= <init>` and any trailing tokens up to ';'.
-                while (_streamer.Current != null && _streamer.Current.Value != ";"
-                    && _streamer.Current.Value?.ToLower() != "begin")
-                {
-                    _streamer.MoveNext();
-                }
-                if (_streamer.Current?.Value == ";") _streamer.MoveNext();
-
-                if (!string.IsNullOrEmpty(localName))
-                {
-                    localVariables.Add(new Variable(localName, string.Empty, localType) { Size = localSize });
-                }
-                continue;
-            }
-            _streamer.MoveNext();
-        }
+        // Local declarations (variables, constants, types) until the body's `begin`,
+        // read by the same declaration parser as a process's: user types (arrays of
+        // vectors, records), constant bounds and initial values (G54: a local
+        // `m : mem_t` was untyped and the function returned '0').
+        var localScope = new HashSet<Variable>(_comparator);
+        localScope.UnionWith(Variables);
+        foreach (var p in parameters) localScope.Add(p.CreateVariable());
+        var localTypes = new TypeRegistry();
+        foreach (var t in (_typeRegistry?.Types.Values ?? []).Concat(ParsedTypes.Types.Values)) localTypes.TryRegister(t);
+        var localVariables = ParseSubprogramLocals(localScope, localTypes);
         if (_streamer.Current?.Value?.ToLower() == "begin")
         {
             _streamer.MoveNext(); // consume 'begin'
@@ -2193,6 +2132,7 @@ public class VariableSyntetizer : ISControl
                 ReturnType = returnType,
                 ReturnTypeSize = returnTypeSize,
                 CustomReturnTypeName = customReturnTypeName,
+                ReturnTypeMark = returnTypeMark,
                 BodyRaw = bodyRaw,
                 LocalVariables = localVariables,
                 IsPure = true,
@@ -2302,6 +2242,7 @@ public class VariableSyntetizer : ISControl
                     Name = n,
                     Type = dataType,
                     CustomTypeName = customTypeName,
+                    TypeMark = typeTok.ToLowerInvariant(),
                     Mode = mode,
                     Size = size,
                     HighBound = hi,

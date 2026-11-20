@@ -3,53 +3,102 @@ using Parser.Models;
 
 namespace Interpreter.Services;
 
-/// <summary>
-/// Represents a scheduled signal update.
-/// </summary>
-/// <param name="Target">The target signal/variable to update.</param>
-/// <param name="NewValue">The new value to assign.</param>
-/// <param name="Delay">Optional delay for "after X ns" syntax.</param>
-/// <param name="SourceLine">Source line number that produced this update.</param>
-/// <param name="Span">Start and width, in the target's value string, of the part written (resolved when the
-/// statement ran), or null for the whole signal.</param>
-public record SignalUpdate(
-    Variable Target,
-    object NewValue,
-    TimeSpan? Delay = null,
-    int SourceLine = 0,
-    (int Start, int Width)? Span = null
-);
+/// <summary>Delay mechanism of a signal assignment (<c>transport</c> or <c>[reject t] inertial</c>, the default).</summary>
+public enum DelayMechanism { Inertial, Transport }
+
+/// <summary>One element of a waveform: <c>value after t</c> (<paramref name="AfterNs"/> = 0: the next delta).</summary>
+public readonly record struct WaveformElement(object Value, long AfterNs);
 
 /// <summary>
-/// Manages scheduled signal updates for delta cycle simulation.
-/// Implements VHDL semantics where signal assignments are scheduled, not immediate.
+/// The signal update machinery of the delta-cycle engine, with VHDL's driver
+/// model (IEEE 1076 §14.7): every process — and every concurrent statement,
+/// which is a process — that assigns a signal owns a <em>driver</em> of it. A
+/// driver holds its current value and its projected waveform (pending
+/// transactions); assignments edit the waveform (transport, inertial with
+/// pulse rejection), the transactions mature at their time, and the signal
+/// takes the resolution of all its drivers: the IEEE 1164 table for
+/// std_logic-based types (<see cref="StdLogic.Resolve"/>), and an error for
+/// an unresolved type with more than one driver («several sources»).
 /// </summary>
+/// <remarks>
+/// The writing process is the <see cref="CurrentOwner"/> the engine sets while
+/// it runs a process or a concurrent statement (procedures write with their
+/// caller's driver). A driver covers the scalar subelements its assignments
+/// name statically (<c>v(3 downto 2)</c>, <c>p.lo</c>) and the whole signal
+/// when an index is dynamic (<c>w(i)</c>). A signal with one driver covering
+/// it whole takes that driver's value as is (no resolution).
+/// </remarks>
 public class SignalScheduler
 {
-    /// <summary>
-    /// Updates to apply at current delta cycle.
-    /// </summary>
-    private readonly Queue<SignalUpdate> _currentDeltaUpdates = new();
+    /// <summary>A pending transaction of one driver.</summary>
+    private sealed class Transaction
+    {
+        public ulong Tick;
+        /// <summary>True when due in the next delta (zero delay, or matured).</summary>
+        public bool Now;
+        public (int Start, int Width)? Span;
+        public object Value = string.Empty;
+        public int Line;
+        public long Seq;
+    }
 
-    /// <summary>
-    /// Updates scheduled for future time (after X ns).
-    /// Key is the tick at which the update should be applied.
-    /// </summary>
-    private readonly SortedDictionary<ulong, Queue<SignalUpdate>> _futureUpdates = new();
+    /// <summary>One driver: its owner, current driving value, coverage and projected waveform.</summary>
+    private sealed class Driver
+    {
+        public required object Owner;
+        public object? Value;
+        /// <summary>The positions (characters of the value) this driver drives; null = the whole signal.</summary>
+        public bool[]? Covers;
+        /// <summary>Pending transactions in time order (the ones due now first, in statement order).</summary>
+        public readonly List<Transaction> Waveform = [];
+    }
 
-    /// <summary>
-    /// Lock object for thread safety.
-    /// </summary>
+    /// <summary>The drivers of one signal.</summary>
+    private sealed class SignalDrivers
+    {
+        public required Variable Signal;
+        public readonly List<Driver> Drivers = [];
+        /// <summary>The signal's value before any driver existed: a new driver's initial driving value.</summary>
+        public object? Initial;
+    }
+
+    /// <summary>Owner of writes made outside any process (tests, legacy callers).</summary>
+    public static readonly object AnonymousOwner = new();
+
+    /// <summary>Owner of the stimulus driving an <c>inout</c> port of the top from outside the design.</summary>
+    public static readonly object ExternalOwner = new();
+
+    private readonly Dictionary<Variable, SignalDrivers> _signals = [];
+    private readonly List<SignalDrivers> _active = [];
+    private readonly HashSet<SignalDrivers> _activeSet = new(ReferenceEqualityComparer.Instance);
+    private readonly SortedDictionary<ulong, List<SignalDrivers>> _future = [];
     private readonly object _lock = new();
+    private long _seq;
+    private int _pendingNow;
+    private ulong _currentTick;
+    private int _tickResolutionNs = 10;
 
     /// <summary>
-    /// Cached current tick + tick resolution so `after N ns` assignments
-    /// (`ScheduledOperation` → `ScheduleAfterNs`) can compute a future
-    /// tick without having to plumb the engine state through every caller.
-    /// Updated by `AdvanceTime` and the engine's setup. Bench bug #8.
+    /// The process or concurrent statement whose assignments are being executed:
+    /// the owner of the drivers they write. Set by the engine around each run
+    /// (<see cref="OwnedBy"/>); null means <see cref="AnonymousOwner"/>.
     /// </summary>
-    private ulong _currentTick = 0;
-    private int _tickResolutionNs = 10;
+    public object? CurrentOwner { get; set; }
+
+    /// <summary>Makes <paramref name="owner"/> the <see cref="CurrentOwner"/> until the returned scope is disposed (nesting restores the previous one).</summary>
+    public OwnerScope OwnedBy(object owner)
+    {
+        var previous = CurrentOwner;
+        CurrentOwner = owner;
+        return new OwnerScope(this, previous);
+    }
+
+    /// <summary>Restores the previous <see cref="CurrentOwner"/> on dispose.</summary>
+    public readonly struct OwnerScope(SignalScheduler scheduler, object? previous) : IDisposable
+    {
+        /// <inheritdoc/>
+        public void Dispose() => scheduler.CurrentOwner = previous;
+    }
 
     /// <summary>
     /// Tick resolution in nanoseconds used to convert delays into future ticks
@@ -61,110 +110,209 @@ public class SignalScheduler
         set { lock (_lock) _tickResolutionNs = Math.Max(1, value); }
     }
 
-    /// <summary>
-    /// F-G-08 pass 2 (2026-07-16): reusable scratch buffer returned by
-    /// <see cref="ApplyCurrentUpdatesWithLines"/>. The caller consumes the
-    /// returned dictionary synchronously before the next apply call (see
-    /// <c>DeltaCycleEngine.RunDeltaCycleAsync</c>, which snapshots the
-    /// per-frame copy into its own container), so reuse is safe. Saves one
-    /// dict allocation per delta.
-    /// </summary>
-    private readonly Dictionary<Variable, int> _changedScratch = new();
+    private readonly Dictionary<Variable, int> _changedScratch = [];
+    private readonly Dictionary<Variable, object?> _oldValuesScratch = [];
 
     /// <summary>
-    /// Schedules a signal update for the current delta cycle.
-    /// The update will be applied when ApplyCurrentUpdates() is called.
+    /// Schedules <paramref name="newValue"/> for the next delta (a zero-delay,
+    /// inertial assignment by the <see cref="CurrentOwner"/>).
     /// </summary>
-    /// <param name="target">The target signal to update.</param>
-    /// <param name="newValue">The new value to assign.</param>
-    /// <param name="sourceLine">Source line number that produced this update.</param>
-    /// <param name="span">Part written (start and width in the value string, e.g. of <c>v(3 downto 2)</c> or <c>p.lo</c>), or null for the whole signal.
-    /// Part writes keep their statement order relative to every other write of the same delta.</param>
-    public void Schedule(Variable target, object newValue, int sourceLine = 0, (int Start, int Width)? span = null)
-    {
-        lock (_lock)
-        {
-            _currentDeltaUpdates.Enqueue(new SignalUpdate(target, newValue, null, sourceLine, span));
-        }
-    }
+    /// <param name="target">The signal written.</param>
+    /// <param name="newValue">The value (for a part, its characters).</param>
+    /// <param name="sourceLine">1-based source line of the statement (0 = unknown).</param>
+    /// <param name="span">The part written (start and width in the value string), or null for the whole signal.</param>
+    public void Schedule(Variable target, object newValue, int sourceLine = 0, (int Start, int Width)? span = null) =>
+        ScheduleWaveform(target, [new WaveformElement(newValue, 0)], sourceLine, span, wholeDriver: false, DelayMechanism.Inertial, -1);
 
     /// <summary>
-    /// Convenience overload: schedules an update at `currentTick +
-    /// ceil(delayNs / tickResNs)`. Tracks delay in nanoseconds rather than
-    /// `TimeSpan` so sub-100ns delays (1 ns, 10 ns) round correctly.
-    /// Bench bug #8 fix.
+    /// Schedules a waveform (<c>v1 after t1, v2 after t2, …</c>) on the
+    /// <see cref="CurrentOwner"/>'s driver of <paramref name="target"/>, editing
+    /// its projected waveform as the LRM does: transactions at or after the
+    /// first new one are deleted; with <see cref="DelayMechanism.Inertial"/>,
+    /// the older ones inside the pulse-rejection window
+    /// (<paramref name="rejectNs"/>, or the first delay when negative) are
+    /// deleted too unless they lead, with the new value, up to it.
     /// </summary>
-    public void ScheduleAfterNs(Variable target, object newValue, long delayNs, int sourceLine = 0, (int Start, int Width)? span = null)
+    public void ScheduleWaveform(Variable target, IReadOnlyList<WaveformElement> elements, int sourceLine,
+        (int Start, int Width)? span, bool wholeDriver, DelayMechanism mechanism, long rejectNs)
     {
+        if (elements.Count == 0) return;
         lock (_lock)
         {
-            int res = Math.Max(1, _tickResolutionNs);
-            ulong delayTicks = (ulong)Math.Max(1, (delayNs + res - 1) / res);
-            ulong futureTick = _currentTick + delayTicks;
-            if (!_futureUpdates.TryGetValue(futureTick, out var queue))
+            var signal = SignalOf(target);
+            var driver = DriverOf(signal, CurrentOwner ?? AnonymousOwner, span, wholeDriver, sourceLine);
+            for (int i = 0; i < elements.Count; i++)
             {
-                queue = new Queue<SignalUpdate>();
-                _futureUpdates[futureTick] = queue;
+                var e = elements[i];
+                var t = new Transaction
+                {
+                    Now = e.AfterNs <= 0,
+                    Tick = e.AfterNs <= 0 ? _currentTick : _currentTick + DelayTicks(e.AfterNs),
+                    Span = span,
+                    Value = e.Value,
+                    Line = sourceLine,
+                    Seq = ++_seq,
+                };
+                if (i == 0) Preempt(driver, t, mechanism, rejectNs < 0 ? e.AfterNs : rejectNs);
+                Insert(driver, t);
+                if (t.Now)
+                {
+                    _pendingNow++;
+                    Activate(signal);
+                }
+                else
+                {
+                    if (!_future.TryGetValue(t.Tick, out var list)) _future[t.Tick] = list = [];
+                    list.Add(signal);
+                }
             }
-            queue.Enqueue(new SignalUpdate(target, newValue, TimeSpan.FromTicks(delayNs * 10), sourceLine, span));
         }
     }
 
     /// <summary>
-    /// Applies all pending updates for the current delta cycle.
+    /// Sets the value the outside world drives on <paramref name="target"/> (the
+    /// stimulus of an <c>inout</c> port of the top, or of a part of it) and
+    /// resolves the signal now against the design's drivers: an external
+    /// change, like a stimulus on an input, seen as an event of this time.
     /// </summary>
-    /// <returns>Set of signals that actually changed value.</returns>
-    public HashSet<Variable> ApplyCurrentUpdates()
+    public void DriveExternal(Variable target, object value, (int Start, int Width)? span = null)
     {
-        // Back-compat thin wrapper around ApplyCurrentUpdatesWithLines —
-        // discards the source-line map for callers that only care about
-        // which signals changed.
-        return new HashSet<Variable>(ApplyCurrentUpdatesWithLines().Keys);
+        lock (_lock)
+        {
+            var signal = SignalOf(target);
+            var driver = DriverOf(signal, ExternalOwner, span, wholeDriver: false, line: 0);
+            driver.Value = span is { } part
+                ? VectorIndexing.Write(target, driver.Value?.ToString() ?? string.Empty, part, value?.ToString() ?? string.Empty)
+                : ExpandAggregateMarker(value!, target);
+            target.Value = Resolved(signal);
+        }
+    }
+
+    /// <summary>Delay in ticks of <paramref name="delayNs"/>, rounded up and at least <paramref name="min"/>.</summary>
+    private ulong DelayTicks(long delayNs, long min = 1)
+    {
+        int res = Math.Max(1, _tickResolutionNs);
+        return (ulong)Math.Max(min, (delayNs + res - 1) / res);
+    }
+
+    private SignalDrivers SignalOf(Variable target)
+    {
+        if (!_signals.TryGetValue(target, out var signal))
+            _signals[target] = signal = new SignalDrivers { Signal = target, Initial = target.Value };
+        return signal;
     }
 
     /// <summary>
-    /// Expand an `(others=>X)` aggregate-marker string to a literal bitstring
-    /// matching the target signal's declared width. Without this, the marker
-    /// emitted by <c>Operation.ParseOthersAggregate</c> and the init-value
-    /// path in <c>VariableSyntetizer</c> would land in the target's Value
-    /// verbatim — the VCD writer then emits the 11-char string (non-bit chars
-    /// map to 'x') instead of, say, eight clean zeros. The init-value path
-    /// has its own eager-expansion guard at construction; this is the
-    /// engine-side guard for sequential / concurrent <c>signal &lt;=
-    /// (others =&gt; '0')</c> assignments.
+    /// The driver of <paramref name="owner"/> on <paramref name="signal"/>, created
+    /// on its first assignment (driving the signal's initial value) and widened
+    /// to cover the part written. A second driver of an unresolved type is the
+    /// «several sources for unresolved signal» error of GHDL's elaboration.
     /// </summary>
-    private static object ExpandAggregateMarker(object newValue, Variable target)
+    private static Driver DriverOf(SignalDrivers signal, object owner, (int Start, int Width)? span, bool wholeDriver, int line)
     {
-        return target.Size > 0 && HdlLiteral.TryOthersFill(newValue as string, out char fill)
+        Driver? driver = null;
+        foreach (var d in signal.Drivers)
+            if (ReferenceEquals(d.Owner, owner)) { driver = d; break; }
+        if (driver is null)
+        {
+            if (signal.Drivers.Count > 0 && !TypeMarks.IsResolved(signal.Signal))
+                throw new SimulationRuntimeException($"several sources for unresolved signal \"{signal.Signal.Name}\"", line);
+            driver = new Driver { Owner = owner, Value = signal.Initial };
+            if (span is { } s && !wholeDriver) driver.Covers = new bool[Width(signal.Signal)];
+            signal.Drivers.Add(driver);
+        }
+        if (driver.Covers is { } covers)
+        {
+            if (span is { } s && !wholeDriver)
+            {
+                for (int i = s.Start; i < s.Start + s.Width && i < covers.Length; i++) covers[i] = true;
+                if (Array.TrueForAll(covers, c => c)) driver.Covers = null;   // every element: the fast path
+            }
+            else driver.Covers = null;
+        }
+        return driver;
+    }
+
+    private static int Width(Variable v) => v.Value?.ToString()?.Length ?? 0;
+
+    /// <summary>
+    /// Deletes the transactions <paramref name="t"/> preempts on its driver:
+    /// those at or after its time (on the same or a smaller part), and with
+    /// inertial delay the ones inside the rejection window
+    /// [<c>t − reject</c>, <c>t</c>) unless a run of them with <paramref name="t"/>'s
+    /// value immediately precedes it.
+    /// </summary>
+    private void Preempt(Driver driver, Transaction t, DelayMechanism mechanism, long rejectNs)
+    {
+        var w = driver.Waveform;
+        if (w.Count == 0) return;
+        for (int i = w.Count - 1; i >= 0; i--)
+        {
+            var o = w[i];
+            if (Before(o, t) || !Within(o.Span, t.Span)) continue;
+            if (o.Now) _pendingNow--;   // a due transaction replaced in the same delta
+            w.RemoveAt(i);
+        }
+        if (mechanism != DelayMechanism.Inertial || t.Now) return;
+        ulong windowStart = rejectNs <= 0 ? t.Tick : t.Tick - Math.Min(t.Tick, DelayTicks(rejectNs, min: 0));
+        bool keep = true;
+        for (int i = w.Count - 1; i >= 0; i--)
+        {
+            var o = w[i];
+            if (o.Now || o.Tick < windowStart || !Within(o.Span, t.Span)) continue;
+            if (keep && Equals(o.Value, t.Value)) continue;
+            keep = false;
+            w.RemoveAt(i);
+        }
+    }
+
+    /// <summary>True when <paramref name="o"/> happens strictly before <paramref name="t"/>.</summary>
+    private static bool Before(Transaction o, Transaction t) =>
+        !t.Now && (o.Now || o.Tick < t.Tick);
+
+    /// <summary>True when part <paramref name="inner"/> lies inside part <paramref name="outer"/> (null = whole).</summary>
+    private static bool Within((int Start, int Width)? inner, (int Start, int Width)? outer) =>
+        outer is not { } o || inner is { } i && i.Start >= o.Start && i.Start + i.Width <= o.Start + o.Width;
+
+    /// <summary>Inserts <paramref name="t"/> keeping time order (due-now first; equal times in statement order).</summary>
+    private static void Insert(Driver driver, Transaction t)
+    {
+        var w = driver.Waveform;
+        int at = w.Count;
+        while (at > 0 && Before(t, w[at - 1])) at--;
+        w.Insert(at, t);
+    }
+
+    private void Activate(SignalDrivers signal)
+    {
+        if (_activeSet.Add(signal)) _active.Add(signal);
+    }
+
+    /// <summary>Applies all pending updates for the current delta cycle.</summary>
+    /// <returns>Set of signals that actually changed value.</returns>
+    public HashSet<Variable> ApplyCurrentUpdates() => new(ApplyCurrentUpdatesWithLines().Keys);
+
+    /// <summary>
+    /// Expands an <c>(others=>X)</c> aggregate marker to a literal bit string of
+    /// the target's declared width.
+    /// </summary>
+    private static object ExpandAggregateMarker(object newValue, Variable target) =>
+        target.Size > 0 && HdlLiteral.TryOthersFill(newValue as string, out char fill)
             ? new string(fill, target.Size)
             : newValue;
-    }
 
     /// <summary>
-    /// Phase B+ Deep AST (2026-05-19): drains the per-delta queue, returning
-    /// the signals that actually changed along with the 1-based source line
-    /// of the operation that drove each change (0 when unknown). When
-    /// multiple updates target the same signal in the same delta, the
-    /// LAST update wins for both value AND line — matches scheduler semantics.
-    ///
-    /// Tier 4.1 (2026-07-28): back-compat thin shim over
-    /// <see cref="ApplyCurrentUpdatesWithLinesAndOldValues"/>. Existing callers
-    /// that only need the changed-lines map keep working; the engine's hot
-    /// path uses the two-out variant to feed <c>SignalAttributeHandler.OnDeltaCommit</c>.
+    /// Commits the delta: the signals whose value changed, each with the 1-based
+    /// source line of the last transaction that drove it (0 when unknown).
     /// </summary>
-    public Dictionary<Variable, int> ApplyCurrentUpdatesWithLines()
-    {
-        var (changed, _) = ApplyCurrentUpdatesWithLinesAndOldValues();
-        return changed;
-    }
-
-    private readonly Dictionary<Variable, object?> _oldValuesScratch = new();
+    public Dictionary<Variable, int> ApplyCurrentUpdatesWithLines() => ApplyCurrentUpdatesWithLinesAndOldValues().ChangedLines;
 
     /// <summary>
-    /// Tier 4.1: same commit pass as <see cref="ApplyCurrentUpdatesWithLines"/>
-    /// but also exposes the per-signal value-immediately-before-the-commit.
-    /// <c>SignalAttributeHandler.OnDeltaCommit</c> consumes the OldValues dict
-    /// to populate `'last_value`, `'event`, and `'stable(T)` per-delta state.
+    /// Commits the delta: every driver applies its due transactions in statement
+    /// order, then each active signal takes the resolution of its drivers. Returns
+    /// the signals whose value changed (with the line of the last transaction)
+    /// and their value before the delta (<c>'last_value</c>, <c>'event</c>). A
+    /// signal assigned and restored within one delta does not change.
     /// </summary>
     public (Dictionary<Variable, int> ChangedLines, Dictionary<Variable, object?> OldValues)
         ApplyCurrentUpdatesWithLinesAndOldValues()
@@ -175,135 +323,144 @@ public class SignalScheduler
         oldValues.Clear();
         lock (_lock)
         {
-            while (_currentDeltaUpdates.Count > 0)
+            foreach (var signal in _active)
             {
-                var update = _currentDeltaUpdates.Dequeue();
-                object? oldValue = update.Target.Value;
-                update.Target.Value = update.Span is { } part
-                    ? VectorIndexing.Write(update.Target, oldValue?.ToString() ?? string.Empty,
-                                           part, update.NewValue?.ToString() ?? string.Empty)
-                    : ExpandAggregateMarker(update.NewValue, update.Target);
-                if (!Equals(oldValue, update.Target.Value))
+                int line = 0;
+                foreach (var driver in signal.Drivers)
                 {
-                    changed[update.Target] = update.SourceLine;
-                    // First writer for this target within the delta wins the
-                    // "before" snapshot; if the same signal is updated more
-                    // than once, later writes replace update.Target.Value
-                    // but the ORIGINAL delta-start value is what LRM's
-                    // `'last_value` demands.
-                    if (!oldValues.ContainsKey(update.Target))
-                        oldValues[update.Target] = oldValue;
+                    var w = driver.Waveform;
+                    int n = 0;
+                    while (n < w.Count && w[n].Now)
+                    {
+                        var t = w[n++];
+                        driver.Value = t.Span is { } part
+                            ? VectorIndexing.Write(signal.Signal, driver.Value?.ToString() ?? string.Empty,
+                                                   part, t.Value?.ToString() ?? string.Empty)
+                            : ExpandAggregateMarker(t.Value, signal.Signal);
+                        if (t.Line > 0) line = t.Line;
+                    }
+                    if (n > 0) w.RemoveRange(0, n);
+                }
+                object? before = signal.Signal.Value;
+                object? after = Resolved(signal);
+                if (!Equals(before, after))
+                {
+                    signal.Signal.Value = after;
+                    if (!Equals(before, signal.Signal.Value))
+                    {
+                        changed[signal.Signal] = line;
+                        oldValues[signal.Signal] = before;
+                    }
                 }
             }
+            _active.Clear();
+            _activeSet.Clear();
+            _pendingNow = 0;
         }
         return (changed, oldValues);
     }
 
     /// <summary>
-    /// Moves future updates that are now due to the current queue.
-    /// Call this at the beginning of each time step.
+    /// The effective value of <paramref name="signal"/>: its only driver's value
+    /// when that driver covers it whole, else per position the resolution of the
+    /// drivers covering it (positions no driver covers keep their value).
     /// </summary>
-    /// <param name="newTick">The new simulation tick.</param>
+    private static object? Resolved(SignalDrivers signal)
+    {
+        var drivers = signal.Drivers;
+        if (drivers.Count == 1 && drivers[0].Covers is null) return drivers[0].Value;
+        string current = signal.Signal.Value?.ToString() ?? string.Empty;
+        var result = current.ToCharArray();
+        var driven = new bool[result.Length];
+        foreach (var d in drivers)
+        {
+            string value = d.Value?.ToString() ?? string.Empty;
+            int n = Math.Min(value.Length, result.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (d.Covers is { } c && (i >= c.Length || !c[i])) continue;
+                result[i] = driven[i] ? StdLogic.Resolve(result[i], value[i]) : value[i];
+                driven[i] = true;
+            }
+        }
+        return new string(result);
+    }
+
+    /// <summary>
+    /// Enters tick <paramref name="newTick"/>: the transactions due at or before
+    /// it mature and are committed by the next <see cref="ApplyCurrentUpdatesWithLinesAndOldValues"/>
+    /// — before any process resumes at this time, so a process woken now reads them.
+    /// </summary>
     public void AdvanceTime(ulong newTick)
     {
         lock (_lock)
         {
             _currentTick = newTick;
-            // v0.17.0: Avoid LINQ allocation - SortedDictionary is ordered, so we can break early
-            // Also reuse a static list to avoid repeated allocations
-            while (_futureUpdates.Count > 0)
+            while (_future.Count > 0)
             {
-                var firstEntry = _futureUpdates.First();
-                if (firstEntry.Key > newTick)
-                    break; // All remaining entries are in the future
-
-                var updates = firstEntry.Value;
-                while (updates.Count > 0)
+                var first = _future.First();
+                if (first.Key > newTick) break;
+                foreach (var signal in first.Value)
                 {
-                    _currentDeltaUpdates.Enqueue(updates.Dequeue());
+                    bool any = false;
+                    foreach (var driver in signal.Drivers)
+                        foreach (var t in driver.Waveform)
+                            if (!t.Now && t.Tick <= newTick) { t.Now = true; _pendingNow++; any = true; }
+                    if (any) Activate(signal);
                 }
-                _futureUpdates.Remove(firstEntry.Key);
+                _future.Remove(first.Key);
             }
         }
     }
 
-    /// <summary>
-    /// Returns true if there are pending updates for the current delta cycle.
-    /// </summary>
+    /// <summary>True when transactions are due in the next delta.</summary>
     public bool HasPendingUpdates
     {
-        get
-        {
-            lock (_lock)
-            {
-                return _currentDeltaUpdates.Count > 0;
-            }
-        }
+        get { lock (_lock) return _pendingNow > 0; }
     }
 
-    /// <summary>
-    /// Returns true if there are any future scheduled updates.
-    /// </summary>
+    /// <summary>True when transactions are pending at a future time.</summary>
     public bool HasFutureUpdates
     {
-        get
-        {
-            lock (_lock)
-            {
-                return _futureUpdates.Count > 0;
-            }
-        }
+        get { lock (_lock) return _future.Count > 0; }
     }
 
-    /// <summary>
-    /// Gets the number of pending updates for the current delta cycle.
-    /// </summary>
+    /// <summary>Number of transactions due in the next delta.</summary>
     public int PendingCount
     {
-        get
-        {
-            lock (_lock)
-            {
-                return _currentDeltaUpdates.Count;
-            }
-        }
+        get { lock (_lock) return _pendingNow; }
     }
 
-    /// <summary>
-    /// Gets the next tick at which a future update is scheduled.
-    /// Returns null if no future updates are scheduled.
-    /// </summary>
+    /// <summary>The next tick at which a transaction is scheduled, or null.</summary>
     public ulong? NextScheduledTick
     {
-        get
-        {
-            lock (_lock)
-            {
-                return _futureUpdates.Count > 0 ? _futureUpdates.Keys.First() : null;
-            }
-        }
+        get { lock (_lock) return _future.Count > 0 ? _future.Keys.First() : null; }
     }
 
-    /// <summary>
-    /// Clears all scheduled updates (both current and future).
-    /// </summary>
+    /// <summary>Forgets every driver and pending transaction.</summary>
     public void Clear()
     {
         lock (_lock)
         {
-            _currentDeltaUpdates.Clear();
-            _futureUpdates.Clear();
+            _signals.Clear();
+            _active.Clear();
+            _activeSet.Clear();
+            _future.Clear();
+            _pendingNow = 0;
         }
     }
 
-    /// <summary>
-    /// Clears only the current delta cycle updates.
-    /// </summary>
+    /// <summary>Drops the transactions due in the next delta.</summary>
     public void ClearCurrent()
     {
         lock (_lock)
         {
-            _currentDeltaUpdates.Clear();
+            foreach (var signal in _active)
+                foreach (var driver in signal.Drivers)
+                    driver.Waveform.RemoveAll(t => t.Now);
+            _active.Clear();
+            _activeSet.Clear();
+            _pendingNow = 0;
         }
     }
 }

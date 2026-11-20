@@ -23,14 +23,6 @@ public interface IArithOperation{
     object SolveArithOperation(Variable leftVariable, Variable rightVariable);
 
     /// <summary>
-    /// Solves a binary arithmetic operation specifically for integers.
-    /// </summary>
-    /// <param name="leftVariable">The left integer operand.</param>
-    /// <param name="rightVariable">The right integer operand.</param>
-    /// <returns>The integer result of the operation.</returns>
-    int SolveIntOperation(int leftVariable, int rightVariable);
-
-    /// <summary>
     /// Solves a binary arithmetic operation specifically for real numbers (doubles).
     /// </summary>
     /// <param name="leftVariable">The left real number operand.</param>

@@ -34,6 +34,26 @@ internal sealed class BranchTarget<TBranch> where TBranch : notnull
     /// <summary>True when the target is a declared object or an aggregate of them.</summary>
     public bool IsDeclared => Destination is not null || IsAggregate;
 
+    /// <summary>The delay mechanism written after <c>&lt;=</c> (with the first branch), applied to every branch.</summary>
+    private string _mechanism = string.Empty;
+
+    /// <summary><c>&lt;=</c> for a signal assignment, <c>:=</c> for a VHDL-2008 conditional/selected variable assignment (G77).</summary>
+    public string Operator { get; set; } = "<=";
+
+    /// <summary>
+    /// <c>target &lt;= value</c> for one branch. The delay mechanism
+    /// (<c>transport</c>, <c>reject t inertial</c>) is written once, before the
+    /// first branch's value, and applies to all of them.
+    /// </summary>
+    private string AssignmentText(string value)
+    {
+        if (Operator == ":=") return $"{Text} := {value}";
+        string prefix = Waveform.MechanismPrefix(value);
+        if (prefix.Length > 0) _mechanism = prefix;
+        else value = _mechanism + value;
+        return $"{Text} <= {value}";
+    }
+
     /// <summary>Records and resolves the target.</summary>
     public void Set(string text)
     {
@@ -73,7 +93,7 @@ internal sealed class BranchTarget<TBranch> where TBranch : notnull
         if (Text.Length == 0 || string.IsNullOrWhiteSpace(value)) return;
         try
         {
-            _assignments[branch] = new Operation($"{Text} <= {value}", _scope, sourceLine, isAssignmentStatement: true);
+            _assignments[branch] = new Operation(AssignmentText(value), _scope, sourceLine, isAssignmentStatement: true);
         }
         catch (ParserException) { throw; }
         catch { /* never destabilise a valid design on an unexpected ctor failure */ }
@@ -87,7 +107,7 @@ internal sealed class BranchTarget<TBranch> where TBranch : notnull
     public void Assign(TBranch branch, string value, SignalScheduler? scheduler)
     {
         if (!_assignments.TryGetValue(branch, out var op))
-            _assignments[branch] = op = new Operation($"{Text} <= {value}", _scope);
+            _assignments[branch] = op = new Operation(AssignmentText(value), _scope);
         if (scheduler != null) ScheduledOperation.Run(op, scheduler);
         else op.Execute();
     }

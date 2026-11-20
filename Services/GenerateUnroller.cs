@@ -21,10 +21,13 @@ internal static class GenerateUnroller
     /// <summary>The unrolled declarative part and body, and the local names it added (already prefixed).</summary>
     public sealed record Result(string Decl, string Body, List<string> NewLocals);
 
-    private static readonly Regex HeadRe = new(@"(?<label>\b[A-Za-z]\w*)\s*:\s*(?<kind>for|if)\b", RegexOptions.IgnoreCase);
+    private static readonly Regex HeadRe = new(@"(?<label>\b[A-Za-z]\w*)\s*:\s*(?<kind>for|if|case)\b", RegexOptions.IgnoreCase);
+    /// <summary>A branch boundary of an if generate (<c>elsif C generate</c>, <c>else generate</c>), outside literals and nesting.</summary>
+    private static readonly Regex IfBranchRe = new(@"\b(?:elsif\b(?<cond>[^;]*?)|else\s*)\bgenerate\b", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    /// <summary>An alternative of a case generate: <c>[label :] when choices =&gt;</c>.</summary>
+    private static readonly Regex CaseAlternativeRe = new(@"(?:\b[A-Za-z]\w*\s*:\s*)?\bwhen\b(?<choices>[^;]*?)=>", RegexOptions.IgnoreCase | RegexOptions.Singleline);
     private static readonly Regex GenerateWordRe = new(@"\b(?:end\s+generate|generate)\b", RegexOptions.IgnoreCase);
     private static readonly Regex ForHeaderRe = new(@"^\s*(?<k>\w+)\s+in\s+(?<a>.+?)\s+(?<dir>to|downto)\s+(?<b>.+?)\s*$", RegexOptions.IgnoreCase | RegexOptions.Singleline);
-    private static readonly Regex BranchGenerateRe = new(@"\b(?:elsif|else|when)\b[^;]*?\bgenerate\b", RegexOptions.IgnoreCase | RegexOptions.Singleline);
     private static readonly Regex StatementLabelRe = new(@"(?:^|;|\bbegin\b|\bgenerate\b)\s*(?<l>[A-Za-z]\w*)\s*:(?!=)", RegexOptions.IgnoreCase | RegexOptions.Multiline);
     private static readonly Regex TypeNameRe = new(@"\b(?:sub)?type\s+(?<n>\w+)\s+is\b", RegexOptions.IgnoreCase);
     private static readonly Regex NestingRe = new(
@@ -33,7 +36,7 @@ internal static class GenerateUnroller
 
     /// <summary>True when <paramref name="body"/> has a generate that this pass would unroll.</summary>
     public static bool NeedsUnroll(string body) =>
-        Generates(body).Any(ShouldUnroll);
+        Generates(body).Any(g => ShouldUnroll(g) || HasBranches(g));
 
     /// <summary>Unrolls the generates of <paramref name="body"/>; names in ranges and conditions resolve through <paramref name="lookup"/>.</summary>
     public static Result Unroll(string decl, string body, Func<string, string?> lookup)
@@ -45,7 +48,7 @@ internal static class GenerateUnroller
     }
 
     /// <summary>One generate statement: its span, label, kind, header, body and the body split at its own <c>begin</c>.</summary>
-    private sealed record Generate(int Start, int End, string Label, bool IsFor, string Header, string Inner)
+    private sealed record Generate(int Start, int End, string Label, bool IsFor, string Header, string Inner, bool IsCase = false)
     {
         private (string Decl, string Statements)? _split;
         public (string Decl, string Statements) Split => _split ??= SplitDecl(Inner);
@@ -82,7 +85,8 @@ internal static class GenerateUnroller
             cursor = semi + 1;
             yield return new Generate(head.Index, cursor, head.Groups["label"].Value,
                 head.Groups["kind"].Value.Equals("for", StringComparison.OrdinalIgnoreCase),
-                text[(head.Index + head.Length)..gen.Index], text[innerStart..w.Index]);
+                text[(head.Index + head.Length)..gen.Index], text[innerStart..w.Index],
+                head.Groups["kind"].Value.Equals("case", StringComparison.OrdinalIgnoreCase));
         }
     }
 
@@ -115,12 +119,23 @@ internal static class GenerateUnroller
     {
         var sb = new StringBuilder();
         int cursor = 0;
-        foreach (var g in Generates(text))
+        foreach (var found in Generates(text))
         {
+            var g = found;
             sb.Append(text, cursor, g.Start - cursor);
             cursor = g.End;
             string original = text[g.Start..g.End];
-            if (!ShouldUnroll(g) || !TryIterations(g, lookup, out var parameter, out var iterations))
+            string? parameter;
+            List<long> iterations;
+            if (HasBranches(g))
+            {
+                // if … elsif … else generate / case … generate (G80): elaborated to the one
+                // branch whose condition or choice holds, which is then an if generate.
+                if (!TrySelectBranch(g, lookup, out string? branch)) { sb.Append(original); continue; }
+                g = g with { Inner = branch ?? string.Empty, IsCase = false };
+                (parameter, iterations) = (null, branch is null ? [] : [0]);
+            }
+            else if (!ShouldUnroll(g) || !TryIterations(g, lookup, out parameter, out iterations))
             {
                 sb.Append(original);
                 continue;
@@ -176,6 +191,62 @@ internal static class GenerateUnroller
         }
     }
 
+    /// <summary>True for a case generate, or an if generate with <c>elsif</c>/<c>else</c> branches.</summary>
+    private static bool HasBranches(Generate g) =>
+        g.IsCase || !g.IsFor && TopLevel(IfBranchRe, g.Inner).Any();
+
+    /// <summary>Matches of <paramref name="re"/> in <paramref name="inner"/> outside its nested generates.</summary>
+    private static IEnumerable<Match> TopLevel(Regex re, string inner)
+    {
+        var nested = Generates(inner).ToList();
+        return re.Matches(VhdlText.MaskStringLiterals(inner)).Where(m => !nested.Any(n => m.Index >= n.Start && m.Index < n.End));
+    }
+
+    /// <summary>
+    /// The statements of the branch an if/case generate elaborates to (null when no
+    /// condition holds and there is no <c>else</c>/<c>others</c>); false when a
+    /// condition or the case expression cannot be folded.
+    /// </summary>
+    private static bool TrySelectBranch(Generate g, Func<string, string?> lookup, out string? branch)
+    {
+        branch = null;
+        if (g.IsCase)
+        {
+            if (!StaticExpression.TryEvaluate(g.Header, lookup, out long selector)) return false;
+            var alternatives = TopLevel(CaseAlternativeRe, g.Inner).ToList();
+            for (int i = 0; i < alternatives.Count; i++)
+            {
+                int start = alternatives[i].Index + alternatives[i].Length;
+                int end = i + 1 < alternatives.Count ? alternatives[i + 1].Index : g.Inner.Length;
+                foreach (var choice in alternatives[i].Groups["choices"].Value.Split('|'))
+                {
+                    string c = choice.Trim();
+                    long v = 0;
+                    bool others = c.Equals("others", StringComparison.OrdinalIgnoreCase);
+                    if (!others && !StaticExpression.TryEvaluate(c, lookup, out v)) return false;
+                    if (others || v == selector) { branch = g.Inner[start..end]; return true; }
+                }
+            }
+            return true;
+        }
+        var boundaries = TopLevel(IfBranchRe, g.Inner).ToList();
+        string? condition = g.Header;
+        for (int i = 0; i <= boundaries.Count; i++)
+        {
+            int start = i == 0 ? 0 : boundaries[i - 1].Index + boundaries[i - 1].Length;
+            int end = i < boundaries.Count ? boundaries[i].Index : g.Inner.Length;
+            bool holds = true;
+            if (condition is not null)
+            {
+                if (!StaticExpression.TryEvaluate(condition, lookup, out long c)) return false;
+                holds = c != 0;
+            }
+            if (holds) { branch = g.Inner[start..end]; return true; }
+            condition = i < boundaries.Count && boundaries[i].Groups["cond"].Success ? boundaries[i].Groups["cond"].Value : null;
+        }
+        return true;
+    }
+
     /// <summary>
     /// The parameter values of a for generate (range order), or one/zero
     /// iterations of an if generate; false when the range or condition cannot be
@@ -188,7 +259,6 @@ internal static class GenerateUnroller
         parameter = null;
         if (!g.IsFor)
         {
-            if (BranchGenerateRe.IsMatch(VhdlText.MaskStringLiterals(g.Inner))) return false;
             if (!StaticExpression.TryEvaluate(g.Header, lookup, out long cond)) return false;
             if (cond != 0) values.Add(0);
             return true;

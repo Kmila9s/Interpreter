@@ -48,10 +48,13 @@ public class ConditionalBranch
 /// determines the assigned value. If no condition is true, the default value is used.
 /// </para>
 /// </remarks>
-public class ConditionalAssignment : ISControl
+public class ConditionalAssignment : ISControl, IConcurrentStatement
 {
     /// <summary>The variables in scope during condition and value evaluation.</summary>
     private readonly HashSet<Variable> _variables;
+    /// <summary>1-based source line of the statement (errors in its condition/selector report it).</summary>
+    private int _line;
+
     /// <summary>The token stream used for parsing the conditional assignment, or null if constructed explicitly.</summary>
     private readonly TokenStream? _streamer;
     /// <summary>The target and each branch's assignment.</summary>
@@ -77,6 +80,10 @@ public class ConditionalAssignment : ISControl
     /// Gets the list of conditional branches.
     /// </summary>
     public List<ConditionalBranch> Branches { get; private set; } = new();
+
+    /// <inheritdoc/>
+    public IEnumerable<string> ReadTexts =>
+        [Operation.TargetSelectors(_target.Text), .. Branches.Select(b => b.ValueExpression), .. Branches.Select(b => b.ConditionExpression ?? string.Empty)];
 
     /// <summary>
     /// Initializes a new instance of the <see cref="ConditionalAssignment"/> class.
@@ -131,7 +138,7 @@ public class ConditionalAssignment : ISControl
             if (string.IsNullOrEmpty(branch.ConditionExpression))
                 continue;
 
-            branch.Condition ??= new Operation(branch.ConditionExpression, _variables);
+            branch.Condition ??= new Operation(branch.ConditionExpression, _variables, _line);
             if (Truth.Of(branch.Condition.Evaluate()))
             {
                 _target.Assign(branch, branch.ValueExpression, scheduler);
@@ -150,6 +157,7 @@ public class ConditionalAssignment : ISControl
     {
         if (_streamer == null) return;
 
+        _line = _streamer.Current?.SourceLine ?? 0;
         _target.Read(_streamer);
 
         // Expect '<='
@@ -255,8 +263,11 @@ public class ConditionalAssignment : ISControl
         if (!operation.Contains("when", StringComparison.OrdinalIgnoreCase))
             return null;
 
-        // Find the assignment operator
-        int assignIndex = operation.IndexOf("<=");
+        // Find the assignment operator: `<=` (signal) or `:=` (VHDL-2008 variable),
+        // whichever comes first (a `<=` after `:=` is a comparison in a condition).
+        int signalAt = operation.IndexOf("<=", StringComparison.Ordinal), variableAt = operation.IndexOf(":=", StringComparison.Ordinal);
+        bool isVariable = variableAt >= 0 && (signalAt < 0 || variableAt < signalAt);
+        int assignIndex = isVariable ? variableAt : signalAt;
         if (assignIndex < 0)
             return null;
 
@@ -264,6 +275,8 @@ public class ConditionalAssignment : ISControl
         string valuePart = operation[(assignIndex + 2)..].Trim();
 
         var assignment = new ConditionalAssignment(variables, targetPart);
+        assignment._line = sourceLine;
+        assignment._target.Operator = isVariable ? ":=" : "<=";
 
         // Parse branches from value part
         ParseBranchesFromString(assignment, valuePart);

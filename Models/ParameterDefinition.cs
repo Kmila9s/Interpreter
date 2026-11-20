@@ -48,6 +48,9 @@ public class ParameterDefinition
     /// </summary>
     public ParameterMode Mode { get; set; } = ParameterMode.In;
 
+    /// <summary>The declared type mark (lower case), as <see cref="Variable.TypeMark"/>.</summary>
+    public string? TypeMark { get; set; }
+
     /// <summary>
     /// F-G-14 (Session 23, 2026-07-18): true when the formal is declared
     /// with the <c>signal</c> object class. Signals passed as procedure
@@ -89,7 +92,8 @@ public class ParameterDefinition
     {
         var variable = new Variable(Name, value?.ToString() ?? "", Type)
         {
-            CustomTypeName = CustomTypeName
+            CustomTypeName = CustomTypeName,
+            TypeMark = TypeMark,
         };
 
         if (Type == Constants.DATATYPES.STD_LOGIC_VECTOR)

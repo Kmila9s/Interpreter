@@ -40,6 +40,9 @@ public sealed class WaitForStatement : ISControl
 {
     private readonly TokenStream? _streamer;
     private readonly HashSet<Variable>? _variables;
+    /// <summary>1-based source line of the statement (errors in its condition/selector report it).</summary>
+    private int _line;
+
 
     /// <summary>Delay in nanoseconds parsed from the source; 0 for bare wait.</summary>
     public long DelayNs { get; private set; } = 0;
@@ -97,6 +100,7 @@ public sealed class WaitForStatement : ISControl
     {
         if (_streamer == null) return;
         var waitToken = _streamer.Current;
+        _line = waitToken?.SourceLine ?? 0;
         _streamer.MoveNext(); // consume 'wait'
 
         var on = new List<Token>();
@@ -128,11 +132,19 @@ public sealed class WaitForStatement : ISControl
             throw new ParserException("';' expected at the end of the wait statement", _streamer.Previous);
         _streamer.MoveNext(); // consume ';'
 
-        if (forTokens.Count > 0 && (on.Count > 0 || until.Count > 0))
-            throw new ParserException("a wait with both a condition and a timeout is not supported yet", waitToken);
-        if (forTokens.Count > 0) { SetDelay(forTokens); return; }
-        if (on.Count == 0 && until.Count == 0) { IsTerminal = true; return; } // bare `wait;`
+        if (on.Count == 0 && until.Count == 0)
+        {
+            if (forTokens.Count > 0) SetDelay(forTokens);
+            else IsTerminal = true;   // bare `wait;`
+            return;
+        }
+        // `wait on … until … [for T]`: the condition, with an optional timeout (G78).
         SetCondition(on, until);
+        if (forTokens.Count > 0)
+        {
+            SetDelay(forTokens);
+            IsTerminal = !IsCondition && !IsTimed;
+        }
     }
 
     /// <summary><c>wait for &lt;time expression&gt;;</c>.</summary>
@@ -150,7 +162,7 @@ public sealed class WaitForStatement : ISControl
     private void SetCondition(List<Token> on, List<string> until)
     {
         if (_variables == null) { IsTerminal = true; return; }
-        if (until.Count > 0) Condition = new Operation(string.Join(" ", until), _variables);
+        if (until.Count > 0) Condition = new Operation(string.Join(" ", until), _variables, _line);
 
         if (on.Count > 0)
         {
@@ -164,7 +176,7 @@ public sealed class WaitForStatement : ISControl
         else
         {
             // Implicit sensitivity of `wait until`: every signal named in the condition.
-            Sensitivity.UnionWith(Process.SignalsNamedIn(until, _variables));
+            Sensitivity.UnionWith(ImplicitSensitivity.SignalsIn(until, _variables));
         }
 
         // Nothing can wake the process: it halts, like a bare wait.

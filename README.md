@@ -1425,6 +1425,46 @@ while (_streamer.Current != null)
 
 ## 10. Changelog
 
+### Version 3.1.6 (2026-11-20) — drivers, numbers and time
+
+*   **Drivers (G43, G63, G71).** `SignalScheduler` keeps one driver per (owner,
+    signal) with per-bit coverage and a projected waveform; the owner is the
+    running process or concurrent task (`CurrentOwner`/`OwnedBy`). Each delta
+    resolves the drivers of every bit with `StdLogic.Resolve` (IEEE 1164); a
+    single driver writes directly (fast path). Two drivers on an unresolved type
+    raise «several sources for unresolved signal». `Waveform` parses
+    `transport`/`inertial`/`reject` and several `after` elements; matured
+    transactions commit before zero-delay ones. Top-port stimuli are an
+    external driver.
+*   **`inout`/`buffer` (G53, G70).** Registered with their mode everywhere; an
+    `inout` formal is renamed to its actual when elaborating; an `out` formal
+    associated with `open` is declared locally.
+*   **Implicit sensitivity (G62, G67, G72, G73).** `ImplicitSensitivity` takes
+    the signals named in a statement's text (`IConcurrentStatement.ReadTexts`),
+    never inside called subprograms; no statement runs every delta any more.
+    `process (all)`; a process with neither sensitivity list nor `wait` is an
+    error. Subprograms declared in an instance's architecture are renamed per
+    instance.
+*   **Time (G64, G78).** `PhysicalTime`: `time` in femtoseconds (`long`), `now`
+    evaluated at run time (`NowOperand`), `time` arithmetic and comparison,
+    `wait … until … for`. Every condition (`if`, `while`, `wait`, `assert`,
+    `case`, conditional and selected assignments) carries its line.
+*   **Arithmetic (G44, G59, G65, G66, G68, G69, G76).** `LogicVector` is the
+    single numeric core (`BigInteger`, `long` fast path): numeric_std result
+    widths, sign from `TypeMark`, `resize`/`shift`/`rotate` in one place.
+    `std_logic_signed`/`unsigned` follow each unit's context clause;
+    `NUMERIC_STD."="` warning; `integer` wraps at 32 bits like GHDL and
+    subtypes raise «bound check failure». Based literals are bits; decimal
+    `"10"` is 10. `DeferredExpression` evaluates on the RPN of `Operation`.
+*   **Identifiers (G74)** are case-insensitive in sensitivity lists,
+    `architecture … of` and `Variable` comparisons.
+*   **Constructs (G54, G77, G79, G80, G81).** Constants initialised by a user
+    function, conditional/selected variable assignments, nested aggregate
+    targets, binding with `generic map`/`port map`, `if … elsif … else generate`
+    and `case … generate` (`GenerateUnroller`), textio input (`TextioFiles`,
+    `readline`/`read`/`endfile`), `report` inside procedures and `T'image(e)`
+    in `report`. `kmila check` blackboxes a `case … generate`.
+
 ### Version 3.1.4 (2026-11-18) — elaboration
 
 *   **Design library (G18–G22).** `DesignLibrary` holds what GHDL's work library

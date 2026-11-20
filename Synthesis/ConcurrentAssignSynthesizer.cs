@@ -721,7 +721,7 @@ internal static class ConcurrentAssignSynthesizer
             ? v.PortType switch
             {
                 PortType.IN => NetOrigin.PortIn,
-                PortType.OUT => NetOrigin.PortOut,
+                PortType.OUT or PortType.BUFFER => NetOrigin.PortOut,
                 PortType.INOUT => NetOrigin.PortInOut,
                 _ => NetOrigin.PortIn,
             }

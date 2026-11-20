@@ -95,10 +95,19 @@ public class StimulusEvent
     /// </summary>
     public AssignmentTarget? Target { get; init; }
 
-    /// <summary>Applies the stimulus to its signal (or to the selected part of it).</summary>
-    public void Apply()
+    /// <summary>
+    /// Applies the stimulus to its signal (or to the selected part of it). An
+    /// <c>inout</c> port is driven through <paramref name="scheduler"/>'s external
+    /// driver, so its value is the resolution with the design's own drivers.
+    /// </summary>
+    public void Apply(Interpreter.Services.SignalScheduler? scheduler = null)
     {
-        if (Target is { } part) part.WriteNow(Value);
+        if (scheduler is not null && Signal.PortType == Constants.PortType.INOUT)
+        {
+            if (Target is { } p) p.DriveExternal(scheduler, Value);
+            else scheduler.DriveExternal(Signal, Value);
+        }
+        else if (Target is { } part) part.WriteNow(Value);
         else Signal.Value = Value;
     }
 }

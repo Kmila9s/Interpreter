@@ -47,10 +47,13 @@ public class SelectionChoice
 /// The 'others' clause provides a default value.
 /// </para>
 /// </remarks>
-public class SelectedAssignment : ISControl
+public class SelectedAssignment : ISControl, IConcurrentStatement
 {
     /// <summary>The variables in scope during selector and value evaluation.</summary>
     private readonly HashSet<Variable> _variables;
+    /// <summary>1-based source line of the statement (errors in its condition/selector report it).</summary>
+    private int _line;
+
     /// <summary>The token stream used for parsing the selected assignment, or null if constructed explicitly.</summary>
     private readonly TokenStream? _streamer;
     /// <summary>The target and each choice's assignment.</summary>
@@ -83,6 +86,10 @@ public class SelectedAssignment : ISControl
     /// Gets the list of selection choices.
     /// </summary>
     public List<SelectionChoice> Choices { get; private set; } = new();
+
+    /// <inheritdoc/>
+    public IEnumerable<string> ReadTexts =>
+        [Operation.TargetSelectors(_target.Text), SelectorExpression, .. Choices.Select(c => c.ValueExpression)];
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SelectedAssignment"/> class.
@@ -128,7 +135,7 @@ public class SelectedAssignment : ISControl
         if (!_target.IsDeclared || string.IsNullOrEmpty(SelectorExpression) || Choices.Count == 0)
             return Task.CompletedTask;
 
-        _selector ??= new Operation(SelectorExpression, _variables);
+        _selector ??= new Operation(SelectorExpression, _variables, _line);
         string selectorValue = ExtractValue(_selector.Evaluate());
 
         SelectionChoice? matched = null;
@@ -183,6 +190,7 @@ public class SelectedAssignment : ISControl
         // Capture the statement's source line up-front (before tokens are
         // consumed) for the gated validation pass at the end of this method.
         int sourceLine = _streamer.Current?.SourceLine ?? 0;
+        _line = sourceLine;
 
         // Expect 'with'
         if (_streamer.Current?.Value.ToLower() == "with")
@@ -207,9 +215,10 @@ public class SelectedAssignment : ISControl
 
         _target.Read(_streamer);
 
-        // Expect '<='
-        if (_streamer.Current?.Value == "<=")
+        // Expect '<=' (signal) or ':=' (VHDL-2008 selected variable assignment, G77)
+        if (_streamer.Current?.Value is "<=" or ":=")
         {
+            _target.Operator = _streamer.Current.Value;
             _streamer.MoveNext();
         }
 

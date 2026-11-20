@@ -21,7 +21,7 @@ namespace Interpreter.Services;
 /// Generate statements holding instances or local declarations are unrolled
 /// first (<see cref="GenerateUnroller"/>, G57).</para>
 /// </remarks>
-public sealed class SourceElaborator
+public sealed partial class SourceElaborator
 {
     // ---------- Public entry points ----------
 
@@ -46,6 +46,7 @@ public sealed class SourceElaborator
 
         var generics = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         ExtractGenericDefaults(generics, top.EntityText);
+        PackageRegistry.Instance.RegisterUnitArithmetic(string.Empty, top.Context + "\n" + arch.Context);
         var (decl, body, _) = Inline(arch.DeclPart, arch.Body, arch.Specs, block, lib, generics, depth: 0, pathPrefix: string.Empty);
 
         var sb = new StringBuilder();
@@ -122,7 +123,7 @@ public sealed class SourceElaborator
     private const int MaxElaborationDepth = 8;
 
     /// <summary>What an instance elaborates to: the entity, its architecture and the block configuration that applies inside it.</summary>
-    private sealed record Resolved(EntityRecord Entity, ArchRecord Arch, BlockConfig? Block);
+    private sealed record Resolved(EntityRecord Entity, ArchRecord Arch, BlockConfig? Block, Binding? Binding = null);
 
     /// <summary>
     /// Binds instance <paramref name="im"/>; null when it is left as written (unknown
@@ -135,6 +136,7 @@ public sealed class SourceElaborator
         string kind = im.Groups["kind"].Value.ToLowerInvariant();
         string? archName = im.Groups["arch"].Success ? im.Groups["arch"].Value : null;
         BlockConfig? block = null;
+        Binding? binding = null;
         string entityName = name;
 
         if (kind == "configuration")
@@ -145,6 +147,7 @@ public sealed class SourceElaborator
         else if (kind != "entity")
         {
             var cc = config?.Find(label, name) ?? specs.Find(label, name);
+            binding = cc?.Binding;
             if (cc?.Binding is { Open: true }) { open = true; return null; }
             if (cc?.Binding?.Configuration is { } cfgName)
             {
@@ -158,9 +161,18 @@ public sealed class SourceElaborator
                 block = cc?.Nested;
             }
         }
-        if (!lib.Entities.TryGetValue(entityName, out var entity)) return null;
+        if (!lib.Entities.TryGetValue(entityName, out var entity))
+        {
+            // An entity instantiation names its unit: missing is an error (GHDL: unit not
+            // found), never a silently empty instance. An unbound component stays open.
+            if (kind == "entity")
+                throw new ParserException($"entity \"{entityName}\" of instance \"{label}\" not found in library \"work\"", 0, 0, label);
+            return null;
+        }
         var arch = DesignLibrary.SelectArchitecture(entity, archName ?? block?.Architecture);
-        return arch == null ? null : new Resolved(entity, arch, block);
+        if (arch == null && kind == "entity")
+            throw new ParserException($"entity \"{entityName}\" of instance \"{label}\" has no architecture{(archName is null ? "" : $" \"{archName}\"")}", 0, 0, label);
+        return arch == null ? null : new Resolved(entity, arch, block, binding);
     }
 
     /// <summary>
@@ -214,7 +226,10 @@ public sealed class SourceElaborator
             }
             // Unknown unit: left as written, so the parser reports it.
             if (resolved == null) { bodySb.Append(im.Value); continue; }
-            var (child, childArch, childBlock) = resolved;
+            var (child, childArch, childBlock, binding) = resolved;
+            // A binding with its own maps (G80): entity ⇐ component ⇐ actual.
+            if (binding?.PortMap is { } bindingPorts) portMapRaw = ComposeMap(bindingPorts, portMapRaw);
+            if (binding?.GenericMap is { } bindingGenerics) genericMapRaw = ComposeMap(bindingGenerics, genericMapRaw, substitute: true);
 
             // For each port, allocate an alias signal in the parent's decl section.
             // The inlined body references the alias rather than the mapped
@@ -229,16 +244,31 @@ public sealed class SourceElaborator
             // F-G-06 sibling-collision fix: the caller's path prefix composes into
             // the alias prefix (`u1__u_scan__foo` / `u2__u_scan__foo`).
             string aliasPrefix = $"{pathPrefix}{label}__";
+            // The numeric package the child's own context clause selects (std_logic_signed…).
+            PackageRegistry.Instance.RegisterUnitArithmetic(aliasPrefix, child.Context + "\n" + childArch.Context);
             // A formal written with selectors (`p.lo => a`, `v(0) => b`) renames
             // and declares its base port once; each association wires its part.
             // An input left `open` or not associated takes its default (LRM 6.5.6.3): its
-            // alias is declared with the default and has no driver.
+            // alias is declared with the default and has no driver; an output left
+            // `open` gets its own alias too, so it never drives a parent signal of
+            // the same name.
             portMappings.RemoveAll(kv => kv.Value.Equals("open", StringComparison.OrdinalIgnoreCase));
             var associated = portMappings.Select(kv => FormalBase(kv.Key)).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var unassociated = portInfo.Where(p => !p.Value.IsOutput && !associated.Contains(p.Key))
+            var unassociated = portInfo.Where(p => !associated.Contains(p.Key))
                 .Select(p => p.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            // An `inout` formal is its actual (G53): the child reads the resolved
+            // value and its drivers join the actual's, with no copy in either
+            // direction (two copies of a resolved signal would latch each other).
+            var inoutActuals = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var kv in portMappings)
-                rename[FormalBase(kv.Key)] = aliasPrefix + FormalBase(kv.Key);
+            {
+                if (!portInfo.TryGetValue(FormalBase(kv.Key), out var pi) || !pi.IsInout) continue;
+                if (!string.Equals(kv.Key, FormalBase(kv.Key), StringComparison.OrdinalIgnoreCase) || !StaticNameRe().IsMatch(kv.Value.Trim()))
+                    throw new ParserException($"inout port \"{kv.Key}\" of {label} must be associated with a signal name (\"{kv.Value.Trim()}\" is not supported yet)", 0, 0);
+                inoutActuals[kv.Key] = kv.Value.Trim();
+            }
+            foreach (var kv in portMappings)
+                rename[FormalBase(kv.Key)] = inoutActuals.TryGetValue(kv.Key, out var actual) ? actual : aliasPrefix + FormalBase(kv.Key);
             foreach (var formal in unassociated)
                 rename[formal] = aliasPrefix + formal;
 
@@ -276,6 +306,7 @@ public sealed class SourceElaborator
             // Declaration order = association order (the flattened text must stay stable), then the defaults.
             foreach (var formal in portMappings.Select(kv => FormalBase(kv.Key)).Distinct(StringComparer.OrdinalIgnoreCase).Concat(unassociated))
             {
+                if (inoutActuals.ContainsKey(formal)) continue;
                 var aliasName = aliasPrefix + formal;
                 if (portInfo.TryGetValue(formal, out var info))
                 {
@@ -306,6 +337,7 @@ public sealed class SourceElaborator
             {
                 var aliasName = aliasPrefix + kv.Key;
                 var mapped = kv.Value;
+                if (inoutActuals.ContainsKey(kv.Key)) continue;
                 if (!portInfo.TryGetValue(FormalBase(kv.Key), out var info))
                 {
                     bodySb.AppendLine($"  {aliasName} <= {mapped};");
@@ -373,6 +405,8 @@ public sealed class SourceElaborator
     {
         public string TypeText { get; init; } = "STD_LOGIC";
         public bool   IsOutput { get; init; }
+        /// <summary>True for an <c>inout</c> port: renamed to its actual, which it reads and drives.</summary>
+        public bool   IsInout { get; init; }
         /// <summary>The port's default expression (<c>:= …</c>), or null.</summary>
         public string? Default { get; init; }
     }
@@ -415,6 +449,7 @@ public sealed class SourceElaborator
                 {
                     TypeText = type,
                     IsOutput = isOutput,
+                    IsInout = direction == "inout",
                     Default = @default,
                 };
             }
@@ -641,4 +676,37 @@ public sealed class SourceElaborator
         if (j < entityText.Length && entityText[j] == ';') j++;
         return entityText.Remove(open, j - open);
     }
+
+    /// <summary>
+    /// The associations of a binding's map (<c>entity formal =&gt; component name</c>) with
+    /// each component name replaced by what the instance associates with it, giving
+    /// <c>entity formal =&gt; actual</c>. A port the instance leaves out becomes
+    /// <c>open</c>; with <paramref name="substitute"/> (generic maps) names inside an
+    /// expression are replaced and others kept (the component's default).
+    /// </summary>
+    private static string ComposeMap(string bindingMap, string instanceMap, bool substitute = false)
+    {
+        var actuals = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var a in VhdlUnitText.SplitBalanced(instanceMap, ','))
+        {
+            int arrow = a.IndexOf("=>", StringComparison.Ordinal);
+            if (arrow > 0) actuals[a[..arrow].Trim()] = a[(arrow + 2)..].Trim();
+        }
+        var composed = new List<string>();
+        foreach (var a in VhdlUnitText.SplitBalanced(bindingMap, ','))
+        {
+            int arrow = a.IndexOf("=>", StringComparison.Ordinal);
+            if (arrow < 0) continue;
+            string formal = a[..arrow].Trim(), local = a[(arrow + 2)..].Trim();
+            string actual = substitute
+                ? (actuals.Count == 0 ? local : VhdlUnitText.RenameTokens(local, actuals))
+                : actuals.TryGetValue(local, out var mapped) ? mapped : "open";
+            composed.Add($"{formal} => {actual}");
+        }
+        return string.Join(", ", composed);
+    }
+
+    /// <summary>A signal name, optionally with one static index or range: the actuals an <c>inout</c> formal may take.</summary>
+    [System.Text.RegularExpressions.GeneratedRegex(@"^[A-Za-z]\w*(?:\.[A-Za-z]\w*)*(?:\s*\([^()]*\))?$")]
+    private static partial System.Text.RegularExpressions.Regex StaticNameRe();
 }

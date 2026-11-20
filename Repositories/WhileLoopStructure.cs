@@ -62,6 +62,9 @@ public class WhileLoopStructure : ILoopStructure
 {
     /// <summary>The variables in scope during condition and loop body evaluation.</summary>
     private readonly HashSet<Variable> _variables;
+    /// <summary>1-based source line of the statement (errors in its condition/selector report it).</summary>
+    private int _line;
+
     /// <summary>The token stream used for parsing the while loop structure.</summary>
     private readonly TokenStream _streamer;
     /// <summary>Reader of the loop body (null until <see cref="Syntetize"/> for a stand-alone loop).</summary>
@@ -142,6 +145,7 @@ public class WhileLoopStructure : ILoopStructure
     public void Syntetize()
     {
         Interpreter.Services.ParseTrace.Log($"WhileLoop @{(_streamer.Current?.Line ?? 0) + 1}");
+        _line = _streamer.Current?.SourceLine ?? 0;
         _streamer.Expect(KEYWORDS); // consume 'while'
 
         // Parse condition until 'loop'
@@ -155,7 +159,7 @@ public class WhileLoopStructure : ILoopStructure
         }
 
         ConditionString = conditionBuilder.ToString().Trim();
-        Condition = new Operation(ConditionString, _variables);
+        Condition = new Operation(ConditionString, _variables, _line);
 
         // Consume 'loop'
         if (_streamer.Current?.Value.ToLower() == "loop")

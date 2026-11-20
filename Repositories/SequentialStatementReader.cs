@@ -191,14 +191,12 @@ public sealed class SequentialStatementReader
         var st = SimpleStatement.Read(Stream, StatementRegion.Sequential);
         if (st.IsCall) return StandardProcedures.Resolve(st, Scope);
 
-        if (st.Operator == "<=" && st.HasTopLevelWhen)
+        if (st.Operator is "<=" or ":=" && st.HasTopLevelWhen)
         {
-            // VHDL-2008 conditional signal assignment inside a process.
+            // VHDL-2008 conditional signal or variable assignment inside a process.
             return ConditionalAssignment.TryParse(st.Text, Scope, line)
-                ?? throw new ParserException("malformed conditional signal assignment", first);
+                ?? throw new ParserException("malformed conditional assignment", first);
         }
-        if (st.Operator == ":=" && st.HasTopLevelWhen)
-            throw new ParserException("conditional variable assignments are not supported yet", first);
         return new Operation(st.Text, Scope, sourceLine: line, isAssignmentStatement: true);
     }
 

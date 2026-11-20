@@ -38,113 +38,72 @@ public static class StandardFunctions
     public static bool FallingEdge(Variable signal) => SignalAttributeHandler.Instance.IsFallingEdge(signal);
 
     /// <summary>
-    /// Converts an integer to std_logic_vector.
+    /// <c>to_integer</c>/<c>conv_integer</c> of <paramref name="arg"/>: a vector read by its
+    /// signedness (any width, wrapped to the 32-bit integer as GHDL does); a metavalue
+    /// gives 0 with the package's warning (numeric_std or the Synopsys one).
     /// </summary>
-    public static string ToStdLogicVector(int value, int width) => FieldCodec.IntegerBits(value, width);
+    public static int ToInteger(Variable arg, bool synopsys = false)
+    {
+        if (arg.Type != DATATYPES.STD_LOGIC_VECTOR)
+            return Operator.TryInteger(arg, out var n) ? LogicVector.ToInt32(n) : 0;
+        string bits = Bits(arg);
+        if (bits.Length == 0) return 0;
+        if (LogicVector.TryToInteger(bits, Operator.SignednessOf(arg), out var value)) return LogicVector.ToInt32(value);
+        if (synopsys)
+            ReportBus.Instance.Emit("[assert-warning] CONV_INTEGER: There is an 'U'|'X'|'W'|'Z'|'-' in an arithmetic operand, and it has been converted to 0.");
+        else
+            Operator.NumericStdWarning("TO_INTEGER: metavalue detected, returning 0");
+        return 0;
+    }
+
+    /// <summary>The bits of a vector operand (literal quotes removed).</summary>
+    private static string Bits(Variable v) => Operator.StripLiteralQuotes(v.Value);
+
+    /// <summary>The storage type of a standard function's result (the single table for every call path).</summary>
+    public static DATATYPES ResultType(string functionName, IReadOnlyList<object> args) => functionName.ToLowerInvariant() switch
+    {
+        "rising_edge" or "falling_edge" or "is_x" or "std_match" or "endfile" => DATATYPES.BOOLEAN,
+        "to_integer" or "conv_integer" or "clog2" => DATATYPES.INTEGER,
+        "to_x01" or "to_x01z" or "to_ux01" when args.Count > 0 && args[0] is Variable { Type: DATATYPES.STD_LOGIC } => DATATYPES.STD_LOGIC,
+        "to_stdulogic" => DATATYPES.STD_LOGIC,
+        "to_bit" => DATATYPES.BIT,
+        _ => DATATYPES.STD_LOGIC_VECTOR,
+    };
 
     /// <summary>
-    /// Converts std_logic_vector to integer.
-    /// v0.13.0: Enhanced with safety checks for uninitialized and invalid values.
+    /// The result of a standard function call as a value with its type: booleans and
+    /// integers keep their value (an integer is a number, never text that could be
+    /// misread as bits), anything else is its text; a vector carries its width and
+    /// type mark.
     /// </summary>
-    /// <param name="slv">The std_logic_vector string to convert (e.g., "1010", "U", "XXXX")</param>
-    /// <returns>Integer representation, or 0 for invalid/uninitialized values</returns>
-    /// <remarks>
-    /// VHDL std_logic can have meta-values like 'U' (uninitialized), 'X' (unknown), 'Z' (high-impedance).
-    /// These are treated as 0 for simulation purposes.
-    /// Supports both binary strings ("1010") and decimal strings ("10").
-    /// </remarks>
-    public static int ToInteger(string slv)
+    public static Variable Result(string functionName, object? result, IReadOnlyList<object> args)
     {
-        string cleaned = slv.Replace("\"", "").Replace("'", "").Trim();
-
-        // v0.13.0 Fix: Handle empty or uninitialized values safely
-        if (string.IsNullOrEmpty(cleaned))
-            return 0;
-
-        // A bit string: weak levels read as 0/1; a metavalue gives 0 with numeric_std's warning.
-        if (StdLogic.IsVector(cleaned) && !cleaned.All(char.IsDigit))
+        var type = ResultType(functionName, args);
+        object value = type == DATATYPES.BOOLEAN ? (result ?? false)
+            : type == DATATYPES.INTEGER && result is int or long ? result!
+            : (result?.ToString() ?? "false");
+        var v = new Variable($"Function-{functionName}", value, type)
         {
-            if (StdLogic.TryToUnsigned(cleaned, out long bits) && bits <= int.MaxValue) return (int)bits;
-            if (StdLogic.IsX(cleaned)) { Operator.NumericStdWarning("TO_INTEGER: metavalue detected, returning 0"); return 0; }
-        }
-
-        // v3.2 (#29) ordering fix:
-        //   Binary first when the string is multi-character and all 0s/1s.
-        //   The previous order tried decimal-parse first, which silently
-        //   converted "01010101" to 1,010,101 instead of 85 — every
-        //   STD_LOGIC_VECTOR-shaped value carrying real bit patterns
-        //   came out wrong by orders of magnitude.
-        //   Single-char "0"/"1" stays in either branch (binary == decimal == 0/1).
-        if (cleaned.Length > 1 && cleaned.All(c => c == '0' || c == '1'))
-        {
-            try { return Convert.ToInt32(cleaned, 2); }
-            catch { /* fall through to decimal */ }
-        }
-
-        // Decimal interpretation (integer literals, signed values, etc.).
-        if (int.TryParse(cleaned, out int decimalValue))
-            return decimalValue;
-
-        // Final fallback: treat as binary even at length 1, with a try-
-        // catch in case the string contains other characters.
-        try { return Convert.ToInt32(cleaned, 2); }
-        catch { return 0; }
+            PortType = PortType.OUT,
+            TypeMark = ResultTypeMark(functionName, args),
+        };
+        if (type == DATATYPES.STD_LOGIC_VECTOR && value is string bits && bits.Length > 0) v.Size = bits.Length;
+        return v;
     }
 
     /// <summary>
-    /// Resizes a std_logic_vector/unsigned/signed to new width.
+    /// The type mark of a standard function's result: the numeric_std/std_logic_arith
+    /// conversions name it; <c>resize</c>, the shifts and rotations keep their argument's.
     /// </summary>
-    public static string Resize(string value, int newWidth)
+    public static string? ResultTypeMark(string functionName, IReadOnlyList<object> args) => functionName.ToLowerInvariant() switch
     {
-        // Truncate on the left / zero-extend (unsigned resize).
-        return VectorIndexing.Fit(value.Replace("\"", "").Replace("'", ""), newWidth);
-    }
-
-    /// <summary>
-    /// Performs logical shift left on a vector.
-    /// </summary>
-    public static string ShiftLeft(string value, int amount)
-    {
-        string cleaned = value.Replace("\"", "").Replace("'", "");
-        if (amount >= cleaned.Length) return new string('0', cleaned.Length);
-
-        return cleaned.Substring(amount) + new string('0', amount);
-    }
-
-    /// <summary>
-    /// Performs logical shift right on a vector.
-    /// </summary>
-    public static string ShiftRight(string value, int amount)
-    {
-        string cleaned = value.Replace("\"", "").Replace("'", "");
-        if (amount >= cleaned.Length) return new string('0', cleaned.Length);
-
-        return new string('0', amount) + cleaned.Substring(0, cleaned.Length - amount);
-    }
-
-    /// <summary>
-    /// Rotates bits left.
-    /// </summary>
-    public static string RotateLeft(string value, int amount)
-    {
-        string cleaned = value.Replace("\"", "").Replace("'", "");
-        if (cleaned.Length == 0) return cleaned;
-
-        amount = amount % cleaned.Length;
-        return cleaned.Substring(amount) + cleaned.Substring(0, amount);
-    }
-
-    /// <summary>
-    /// Rotates bits right.
-    /// </summary>
-    public static string RotateRight(string value, int amount)
-    {
-        string cleaned = value.Replace("\"", "").Replace("'", "");
-        if (cleaned.Length == 0) return cleaned;
-
-        amount = amount % cleaned.Length;
-        return cleaned.Substring(cleaned.Length - amount) + cleaned.Substring(0, cleaned.Length - amount);
-    }
+        "unsigned" or "to_unsigned" or "conv_unsigned" => "unsigned",
+        "signed" or "to_signed" or "conv_signed" => "signed",
+        "std_logic_vector" or "conv_std_logic_vector" or "to_stdlogicvector" or "ext" or "sxt" => "std_logic_vector",
+        "resize" or "shift_left" or "shift_right" or "rotate_left" or "rotate_right" or "shl" or "shr"
+            when args.Count > 0 && args[0] is Variable v => v.TypeMark,
+        _ => null,
+    };
 
     /// <summary>
     /// Computes ceiling of log base 2 (number of bits needed to represent val).
@@ -171,7 +130,7 @@ public static class StandardFunctions
     {
         "to_x01", "to_x01z", "to_ux01", "to_01", "is_x", "std_match",
         "to_stdulogic", "to_stdlogicvector", "to_stdulogicvector", "to_bit", "to_bitvector",
-        "shl", "shr", "ext", "sxt", "conv_unsigned", "conv_signed",
+        "shl", "shr", "ext", "sxt", "conv_unsigned", "conv_signed", "endfile",
     };
 
     /// <summary>
@@ -241,88 +200,50 @@ public static class StandardFunctions
                 }
                 return false;
 
+            case "endfile":
+                return arguments.Length >= 1 && ArgVariable(arguments[0], variables) is { } file && TextioFiles.EndOfFile(file);
+
             case "to_integer":
             case "conv_integer":
-                if (arguments.Length >= 1)
-                {
-                    string val = GetStringValue(arguments[0], variables);
-                    return ToInteger(val);
-                }
-                return 0;
+                return arguments.Length >= 1
+                    ? ToInteger(ArgVariable(arguments[0], variables), functionName.Equals("conv_integer", StringComparison.OrdinalIgnoreCase))
+                    : 0;
 
             case "resize":
                 if (arguments.Length >= 2)
                 {
-                    string val = GetStringValue(arguments[0], variables);
-                    int width = GetIntValue(arguments[1], variables);
-                    return Resize(val, width);
+                    var v = ArgVariable(arguments[0], variables);
+                    return LogicVector.Resize(Bits(v), GetIntValue(arguments[1], variables), Operator.SignednessOf(v));
                 }
                 return "";
 
+            // numeric_std shifts and rotations (shift_right of a signed value keeps the sign).
             case "shift_left":
-                if (arguments.Length >= 2)
-                {
-                    string val = GetStringValue(arguments[0], variables);
-                    int amount = GetIntValue(arguments[1], variables);
-                    return ShiftLeft(val, amount);
-                }
-                return "";
-
             case "shift_right":
-                if (arguments.Length >= 2)
-                {
-                    string val = GetStringValue(arguments[0], variables);
-                    int amount = GetIntValue(arguments[1], variables);
-                    return ShiftRight(val, amount);
-                }
-                return "";
-
-            // numeric_std rotate functions — declared in the bundled stub
-            // but previously absent from the runtime evaluator, so any user
-            // code that called rotate_left/rotate_right would receive a
-            // null result and downstream "datatypes do not match" failures
-            // when the outer expression tried to consume that null.
             case "rotate_left":
-                if (arguments.Length >= 2)
-                {
-                    string val = GetStringValue(arguments[0], variables);
-                    int amount = GetIntValue(arguments[1], variables);
-                    return RotateLeft(val, amount);
-                }
-                return "";
-
             case "rotate_right":
                 if (arguments.Length >= 2)
                 {
-                    string val = GetStringValue(arguments[0], variables);
-                    int amount = GetIntValue(arguments[1], variables);
-                    return RotateRight(val, amount);
+                    var v = ArgVariable(arguments[0], variables);
+                    return LogicVector.Shift(Bits(v), functionName, GetIntValue(arguments[1], variables), Operator.SignednessOf(v));
                 }
                 return "";
 
             case "to_unsigned":
+            case "to_signed":
+            case "conv_unsigned":
+            case "conv_signed":
             case "unsigned":
+            case "signed":
             case "conv_std_logic_vector":
             case "std_logic_vector":
                 if (arguments.Length >= 2)
                 {
-                    int val = GetIntValue(arguments[0], variables);
+                    var v = ArgVariable(arguments[0], variables);
                     int width = GetIntValue(arguments[1], variables);
-                    return ToStdLogicVector(val, width);
-                }
-                else if (arguments.Length >= 1)
-                {
-                    return GetStringValue(arguments[0], variables);
-                }
-                return "";
-
-            case "to_signed":
-            case "signed":
-                if (arguments.Length >= 2)
-                {
-                    int val = GetIntValue(arguments[0], variables);
-                    int width = GetIntValue(arguments[1], variables);
-                    return ToStdLogicVector(val, width);
+                    return v.Type == DATATYPES.STD_LOGIC_VECTOR
+                        ? LogicVector.Resize(Bits(v), width, Operator.SignednessOf(v))
+                        : LogicVector.FromInteger(Operator.TryInteger(v, out var n) ? n : 0, width);
                 }
                 else if (arguments.Length >= 1)
                 {
@@ -342,41 +263,23 @@ public static class StandardFunctions
             // Previously registered by name only in the bundled stub, so
             // callers received null! and the caller-coerced "0" masqueraded
             // as valid data. All six delegate to existing helpers.
+            // std_logic_arith: shl/shr (shr keeps the sign of a signed argument),
+            // ext/sxt (zero/sign extension); conv_unsigned/conv_signed are with to_unsigned.
             case "shl":
-                if (arguments.Length >= 2)
-                    return ShiftLeft(GetStringValue(arguments[0], variables),
-                                     GetIntValue(arguments[1], variables));
-                return "";
-
             case "shr":
                 if (arguments.Length >= 2)
-                    return ShiftRight(GetStringValue(arguments[0], variables),
-                                      GetIntValue(arguments[1], variables));
+                {
+                    var v = ArgVariable(arguments[0], variables);
+                    return LogicVector.Shift(Bits(v), functionName.Equals("shl", StringComparison.OrdinalIgnoreCase) ? "shift_left" : "shift_right",
+                        GetIntValue(arguments[1], variables), Operator.SignednessOf(v));
+                }
                 return "";
 
-            case "ext": // zero-extend
+            case "ext":
+            case "sxt":
                 if (arguments.Length >= 2)
-                    return Resize(GetStringValue(arguments[0], variables),
-                                  GetIntValue(arguments[1], variables));
-                return "";
-
-            case "sxt": // sign-extend — same code path as Resize;
-                       // signed shape is tracked separately.
-                if (arguments.Length >= 2)
-                    return Resize(GetStringValue(arguments[0], variables),
-                                  GetIntValue(arguments[1], variables));
-                return "";
-
-            case "conv_unsigned":
-                if (arguments.Length >= 2)
-                    return ToStdLogicVector(GetIntValue(arguments[0], variables),
-                                            GetIntValue(arguments[1], variables));
-                return "";
-
-            case "conv_signed":
-                if (arguments.Length >= 2)
-                    return ToStdLogicVector(GetIntValue(arguments[0], variables),
-                                            GetIntValue(arguments[1], variables));
+                    return LogicVector.Resize(Bits(ArgVariable(arguments[0], variables)), GetIntValue(arguments[1], variables),
+                        functionName.Equals("sxt", StringComparison.OrdinalIgnoreCase) ? Signedness.Signed : Signedness.Unsigned);
                 return "";
 
             // Phase 5: math_real transcendentals. Constant-init contexts
@@ -532,74 +435,34 @@ public static class StandardFunctions
         return GetIntValue(arg, variables);
     }
 
+    /// <summary>
+    /// An argument as a value with its type: a variable, a deferred read or call
+    /// (evaluated now), a name in scope, an integer literal, or other literal text.
+    /// </summary>
+    private static Variable ArgVariable(object arg, HashSet<Variable> variables)
+    {
+        switch (arg)
+        {
+            case Variable v: return v;
+            case int i: return new Variable("__ArgInt", i, DATATYPES.INTEGER);
+            case string s:
+                if (variables.TryGetValue(new Variable { Name = s }, out var named)) return named;
+                return long.TryParse(s, out long n)
+                    ? new Variable("__ArgInt", n, DATATYPES.INTEGER)
+                    : new Variable("__ArgRaw", s.Replace("\"", ""), DATATYPES.STD_LOGIC_VECTOR);
+            default:
+                return Operation.ToArgVariablePublic(arg);
+        }
+    }
+
+    /// <summary>An integer argument (a width, a shift count…); a vector argument is read unsigned.</summary>
     private static int GetIntValue(object arg, HashSet<Variable> variables)
     {
-        // Bench bug #20: evaluate DeferredIndex slices live so callers like
-        // `to_integer(unsigned(addr(3 downto 0)))` see the right bits.
-        if (arg is Models.DeferredIndex di)
-        {
-            var ev = di.Evaluate();
-            string s2 = ev.Value?.ToString() ?? "";
-            if (s2.Length > 1 && s2.All(c => c == '0' || c == '1'))
-            {
-                try { return System.Convert.ToInt32(s2, 2); } catch { /* fall through */ }
-            }
-            if (int.TryParse(s2, out int dip)) return dip;
-            return 0;
-        }
-
-        // Sub-expression arg (see GetStringValue equivalent). Live-fold
-        // then interpret the folded string as int with the same binary-
-        // then-decimal precedence used for other vector reads.
-        if (arg is Models.DeferredExpression de)
-        {
-            var ev = de.Evaluate();
-            if (ev.IsInteger) return (int)FieldCodec.IntegerOf(ev.Value);
-            string sd = ev.Value?.ToString() ?? "";
-            if (sd.Length > 1 && sd.All(c => c == '0' || c == '1'))
-            {
-                try { return System.Convert.ToInt32(sd, 2); } catch { /* fall through */ }
-            }
-            if (int.TryParse(sd, out int dd)) return dd;
-            return 0;
-        }
-
-        if (arg is Variable v)
-        {
-            if (v.Value is int i)
-                return i;
-            if (int.TryParse(v.Value?.ToString(), out int parsed))
-                return parsed;
-            return 0;
-        }
-
-        if (arg is int intVal)
-            return intVal;
-
-        if (arg is string s)
-        {
-            var variable = variables.Where(x => !ReferenceEquals(x, null))
-                .FirstOrDefault(x => !string.IsNullOrEmpty(x.Name) && x.Name.Equals(s, StringComparison.OrdinalIgnoreCase));
-            if (!ReferenceEquals(variable, null))
-            {
-                if (variable.Value is int vi)
-                    return vi;
-                if (int.TryParse(variable.Value?.ToString(), out int vp))
-                    return vp;
-                return 0;
-            }
-            if (int.TryParse(s, out int sp))
-                return sp;
-            return 0;
-        }
-
-        try
-        {
-            return Convert.ToInt32(arg);
-        }
-        catch
-        {
-            return 0;
-        }
+        if (arg is int literal) return literal;
+        if (arg is Variable { Value: int known }) return known;
+        var v = ArgVariable(arg, variables);
+        if (v.Type == DATATYPES.STD_LOGIC_VECTOR && LogicVector.TryToInteger(Bits(v), Signedness.Unsigned, out var bits))
+            return LogicVector.ToInt32(bits);
+        return Operator.TryInteger(v, out var n) ? LogicVector.ToInt32(n) : 0;
     }
 }

@@ -160,7 +160,7 @@ public class SimulationRunner : IDisposable, ISimulationRunner
             // Apply stimuli at tick 0
             foreach (var stim in config.Stimuli.Where(s => s.Tick == 0))
             {
-                stim.Apply();
+                stim.Apply(_engine?.SignalScheduler);
             }
 
             // Phase B: expose the engine to subscribers (Editor's Replay tab
@@ -240,7 +240,7 @@ public class SimulationRunner : IDisposable, ISimulationRunner
                 {
                     foreach (var stim in events)
                     {
-                        stim.Apply();
+                        stim.Apply(_engine?.SignalScheduler);
                         directlyChanged.Add(stim.Signal);
                     }
                 }

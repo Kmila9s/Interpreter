@@ -37,6 +37,9 @@ namespace Interpreter.Repositories;
 public sealed class AssertStatement : ISControl
 {
     private readonly HashSet<Variable> _variables;
+    /// <summary>1-based source line of the statement (errors in its condition report it).</summary>
+    private int _line;
+
     private readonly TokenStream? _streamer;
 
     /// <summary>Raw source text of the condition expression, for evaluation.</summary>
@@ -62,6 +65,7 @@ public sealed class AssertStatement : ISControl
     {
         if (_streamer == null) return;
 
+        _line = _streamer.Current?.SourceLine ?? 0;
         _streamer.Expect(Constants.TYPE.KEYWORDS); // consume 'assert'
 
         // Condition: everything up to `report`, `severity`, or `;` (a string
@@ -119,7 +123,7 @@ public sealed class AssertStatement : ISControl
             }
             else
             {
-                var op = new Operation(ConditionString, _variables);
+                var op = new Operation(ConditionString, _variables, _line);
                 var result = op.Execute();
                 conditionHolds = Truth.Of(result);
             }
