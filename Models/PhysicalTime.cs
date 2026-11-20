@@ -13,10 +13,13 @@ public static class PhysicalTime
     /// <summary>The type mark of time values.</summary>
     public const string TypeMark = "time";
 
+    /// <summary>Femtoseconds in a nanosecond (the engine's tick resolution unit).</summary>
+    public const long FsPerNs = 1_000_000;
+
     /// <summary>Time units in femtoseconds.</summary>
     public static readonly IReadOnlyDictionary<string, long> UnitFs = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase)
     {
-        ["fs"] = 1, ["ps"] = 1_000, ["ns"] = 1_000_000, ["us"] = 1_000_000_000, ["ms"] = 1_000_000_000_000,
+        ["fs"] = 1, ["ps"] = 1_000, ["ns"] = FsPerNs, ["us"] = 1_000_000_000, ["ms"] = 1_000_000_000_000,
         ["sec"] = 1_000_000_000_000_000, ["min"] = 60_000_000_000_000_000, ["hr"] = 3_600_000_000_000_000_000,
     };
 

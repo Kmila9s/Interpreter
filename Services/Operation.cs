@@ -128,12 +128,11 @@ public class Operation : IOperation, IConcurrentStatement {
     public IReadOnlyList<WaveformElement> WaveformValues(object first)
     {
         if (Waveform is not { } w) return [new WaveformElement(first, 0)];
-        var result = new List<WaveformElement>(w.Elements.Count)
-        {
-            new(first, Models.Waveform.DelayNs(w.Elements[0].After, Variables, SourceLine)),
-        };
-        for (int i = 1; i < w.Elements.Count; i++)
-            result.Add(new(_laterElements![i - 1].Evaluate(), Models.Waveform.DelayNs(w.Elements[i].After, Variables, SourceLine)));
+        if (w.IsPlain) return [new WaveformElement(first, 0)];
+        var result = new WaveformElement[w.Elements.Count];
+        result[0] = new(first, w.ElementDelayNs(0, Variables, SourceLine));
+        for (int i = 1; i < result.Length; i++)
+            result[i] = new(_laterElements![i - 1].Evaluate(), w.ElementDelayNs(i, Variables, SourceLine));
         return result;
     }
 
@@ -903,7 +902,7 @@ public class Operation : IOperation, IConcurrentStatement {
         long ns;
         if (bodyLen == 2 && PhysicalTime.TryLiteral(_data[nextIdx + 1], _data[nextIdx + 2], out long fs))
         {
-            ns = fs / PhysicalTime.UnitFs["ns"];
+            ns = fs / PhysicalTime.FsPerNs;
         }
         else if (bodyLen == 1 && long.TryParse(_data[nextIdx + 1], out var raw))
         {
@@ -976,9 +975,7 @@ public class Operation : IOperation, IConcurrentStatement {
             }
         }
 
-        if (Models.DeferredFunction.ShouldDefer(functionName))
-            return (true, new Models.DeferredFunction(functionName, args.ToArray(), StandardFunctions.ResultType(functionName, args), Variables));
-        return (true, StandardFunctions.Result(functionName, StandardFunctions.EvaluateFunction(functionName, args.ToArray(), Variables), args));
+        return (true, StandardCall(functionName, args));
     }
 
     /// <summary>
@@ -1143,10 +1140,17 @@ public class Operation : IOperation, IConcurrentStatement {
         FlushArg();
 
         // v0.17.0: functions read while simulating (edges, conversions of live values) are deferred.
-        if (Models.DeferredFunction.ShouldDefer(functionName))
-            return (true, new Models.DeferredFunction(functionName, args.ToArray(), StandardFunctions.ResultType(functionName, args), Variables));
-        return (true, StandardFunctions.Result(functionName, StandardFunctions.EvaluateFunction(functionName, args.ToArray(), Variables), args));
+        return (true, StandardCall(functionName, args));
     }
+
+    /// <summary>
+    /// A standard-function call: deferred (evaluated while simulating) when its value
+    /// depends on live state, else its value now — the single place both parse paths build one.
+    /// </summary>
+    private object StandardCall(string functionName, List<object> args) =>
+        Models.DeferredFunction.ShouldDefer(functionName)
+            ? new Models.DeferredFunction(functionName, args.ToArray(), StandardFunctions.ResultType(functionName, args), Variables)
+            : StandardFunctions.Result(functionName, StandardFunctions.EvaluateFunction(functionName, args.ToArray(), Variables), args);
 
     // Reduce a buffered function-call argument (mix of Variables,
     // DeferredFunctions, DeferredIndex, ints, and Operators) into a single
@@ -1216,38 +1220,24 @@ public class Operation : IOperation, IConcurrentStatement {
         return v;
     }
 
-    /// <summary>
-    /// Parse a user-defined function call and return either a
-    /// <see cref="Models.DeferredUserFunction"/> wrapper (when the function
-    /// body is registered — Evaluate each fire) or a static stub
-    /// <see cref="Variable"/> (unknown / IEEE-stub — pre-existing legacy path).
-    /// </summary>
-    /// <remarks>
-    /// 2026-07-20 — pre-fix, this method evaluated argument expressions
-    /// eagerly and baked the function result into a <see cref="Variable"/>
-    /// pushed onto the operation's <c>Items</c>. On re-fire of the
-    /// enclosing <see cref="Operation"/> the frozen variable just
-    /// re-pushed its stale value — an LFSR routed through a user
-    /// <c>function</c> would transition once then freeze. Now the wrapper
-    /// carries the argument <b>expressions</b> and re-evaluates them
-    /// against the live scope on every <see cref="Models.DeferredUserFunction.Evaluate"/>
-    /// call. Returned as <c>object</c> so the caller pushes it as-is onto
-    /// <c>Items</c> — <see cref="Execute()"/> switches on the type and
-    /// invokes <c>Evaluate</c> per fire.
-    /// </remarks>
     /// <inheritdoc/>
-    public IEnumerable<string> ReadTexts => [TargetSelectors(_rawData), RawRhs];
+    public IEnumerable<string> ReadTexts => [TargetSelectors(AssignmentSides(_rawData).Lhs), RawRhs];
 
-    /// <summary>
-    /// The selectors of an assignment's target (<c>(addr)</c> of <c>mem(addr) &lt;= d</c>):
-    /// read by the statement, unlike the target's name. Empty for an aggregate target.
-    /// </summary>
-    internal static string TargetSelectors(string statement)
+    /// <summary>The text before and after the assignment operator (<c>&lt;=</c>, else <c>:=</c>); empty sides when there is none.</summary>
+    private static (string Lhs, string Rhs) AssignmentSides(string statement)
     {
         int opIdx = statement.IndexOf("<=", StringComparison.Ordinal);
         if (opIdx < 0) opIdx = statement.IndexOf(":=", StringComparison.Ordinal);
-        if (opIdx < 0) return string.Empty;
-        string lhs = statement[..opIdx].Trim();
+        return opIdx < 0 ? (string.Empty, string.Empty) : (statement[..opIdx].Trim(), statement[(opIdx + 2)..].Trim());
+    }
+
+    /// <summary>
+    /// The selectors of an assignment target <paramref name="lhs"/> (<c>(addr)</c> of
+    /// <c>mem(addr)</c>): read by the statement, unlike the target's name. Empty for an aggregate target.
+    /// </summary>
+    internal static string TargetSelectors(string lhs)
+    {
+        lhs = lhs.Trim();
         if (lhs.StartsWith('(')) return string.Empty;
         int end = 0;
         while (end < lhs.Length && (char.IsLetterOrDigit(lhs[end]) || lhs[end] == '_')) end++;
@@ -1255,15 +1245,7 @@ public class Operation : IOperation, IConcurrentStatement {
     }
 
     /// <summary>The assignment's right-hand side as written (empty when there is no <c>&lt;=</c>/<c>:=</c>).</summary>
-    private string RawRhs
-    {
-        get
-        {
-            int opIdx = _rawData.IndexOf("<=", StringComparison.Ordinal);
-            if (opIdx < 0) opIdx = _rawData.IndexOf(":=", StringComparison.Ordinal);
-            return opIdx >= 0 ? _rawData[(opIdx + 2)..].Trim() : string.Empty;
-        }
-    }
+    private string RawRhs => AssignmentSides(_rawData).Rhs;
 
     /// <summary>
     /// A qualified expression <c>T'(e)</c> has the value of <c>(e)</c>: the
@@ -1488,6 +1470,25 @@ public class Operation : IOperation, IConcurrentStatement {
         return mv;
     }
 
+    /// <summary>
+    /// Parse a user-defined function call and return either a
+    /// <see cref="Models.DeferredUserFunction"/> wrapper (when the function
+    /// body is registered — Evaluate each fire) or a static stub
+    /// <see cref="Variable"/> (unknown / IEEE-stub — pre-existing legacy path).
+    /// </summary>
+    /// <remarks>
+    /// 2026-07-20 — pre-fix, this method evaluated argument expressions
+    /// eagerly and baked the function result into a <see cref="Variable"/>
+    /// pushed onto the operation's <c>Items</c>. On re-fire of the
+    /// enclosing <see cref="Operation"/> the frozen variable just
+    /// re-pushed its stale value — an LFSR routed through a user
+    /// <c>function</c> would transition once then freeze. Now the wrapper
+    /// carries the argument <b>expressions</b> and re-evaluates them
+    /// against the live scope on every <see cref="Models.DeferredUserFunction.Evaluate"/>
+    /// call. Returned as <c>object</c> so the caller pushes it as-is onto
+    /// <c>Items</c> — <see cref="Execute()"/> switches on the type and
+    /// invokes <c>Evaluate</c> per fire.
+    /// </remarks>
     private (bool success, object item) ParseUserDefinedFunctionCall(string functionName)
     {
         // Skip the function name (already processed), move to "("

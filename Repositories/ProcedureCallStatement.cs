@@ -26,6 +26,9 @@ namespace Interpreter.Repositories;
 /// </remarks>
 public class ProcedureCallStatement : ISControl
 {
+    /// <summary>The tokens of each procedure body, lexed once (the body text never changes after analysis).</summary>
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<FunctionDefinition, string[]> BodyTokens = new();
+
     /// <summary>The variables in scope during procedure argument evaluation.</summary>
     private readonly HashSet<Variable> _variables;
     /// <summary>The token stream used for parsing the procedure call, or null if constructed explicitly.</summary>
@@ -118,7 +121,7 @@ public class ProcedureCallStatement : ISControl
 
         // Re-tokenized (not split on blanks): a string literal stays one token, so a
         // `report` prints its text exactly (G80; was "say:  row" for "say: ").
-        var tokens = TokenStream.FromLines(def.BodyRaw.Split('\n')).Slice(0, int.MaxValue).Select(t => t.Value).ToArray();
+        var tokens = BodyTokens.GetValue(def, d => [.. TokenStream.FromLines(d.BodyRaw.Split('\n')).Slice(0, int.MaxValue).Select(t => t.Value)]);
         for (int i = 0; i < tokens.Length; i++)
         {
             if (tokens[i].Equals("report", StringComparison.OrdinalIgnoreCase))

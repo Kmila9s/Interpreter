@@ -66,7 +66,7 @@ public class SignalAttributeHandler
     public long NowFs { get; private set; }
 
     /// <summary>Enters time step <paramref name="tick"/> (<see cref="NowFs"/> = tick × resolution).</summary>
-    public void EnterTime(ulong tick) => NowFs = (long)tick * _tickResolutionNs * PhysicalTime.UnitFs["ns"];
+    public void EnterTime(ulong tick) => NowFs = (long)tick * _tickResolutionNs * PhysicalTime.FsPerNs;
 
     private static SignalAttributeHandler? _instance;
     /// <summary>Lazily-created process-wide singleton instance.</summary>

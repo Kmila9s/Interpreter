@@ -37,7 +37,7 @@ namespace Interpreter.Repositories;
 public sealed class AssertStatement : ISControl
 {
     private readonly HashSet<Variable> _variables;
-    /// <summary>1-based source line of the statement (errors in its condition/selector report it).</summary>
+    /// <summary>1-based source line of the statement (errors in its condition report it).</summary>
     private int _line;
 
     private readonly TokenStream? _streamer;

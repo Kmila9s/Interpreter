@@ -38,11 +38,6 @@ public static class StandardFunctions
     public static bool FallingEdge(Variable signal) => SignalAttributeHandler.Instance.IsFallingEdge(signal);
 
     /// <summary>
-    /// Converts an integer to std_logic_vector.
-    /// </summary>
-    public static string ToStdLogicVector(int value, int width) => FieldCodec.IntegerBits(value, width);
-
-    /// <summary>
     /// <c>to_integer</c>/<c>conv_integer</c> of <paramref name="arg"/>: a vector read by its
     /// signedness (any width, wrapped to the 32-bit integer as GHDL does); a metavalue
     /// gives 0 with the package's warning (numeric_std or the Synopsys one).
@@ -62,7 +57,7 @@ public static class StandardFunctions
     }
 
     /// <summary>The bits of a vector operand (literal quotes removed).</summary>
-    private static string Bits(Variable v) => (v.Value?.ToString() ?? string.Empty).Replace("\"", "").Replace("'", "");
+    private static string Bits(Variable v) => Operator.StripLiteralQuotes(v.Value);
 
     /// <summary>The storage type of a standard function's result (the single table for every call path).</summary>
     public static DATATYPES ResultType(string functionName, IReadOnlyList<object> args) => functionName.ToLowerInvariant() switch
@@ -236,6 +231,8 @@ public static class StandardFunctions
 
             case "to_unsigned":
             case "to_signed":
+            case "conv_unsigned":
+            case "conv_signed":
             case "unsigned":
             case "signed":
             case "conv_std_logic_vector":
@@ -267,7 +264,7 @@ public static class StandardFunctions
             // callers received null! and the caller-coerced "0" masqueraded
             // as valid data. All six delegate to existing helpers.
             // std_logic_arith: shl/shr (shr keeps the sign of a signed argument),
-            // ext/sxt (zero/sign extension), conv_unsigned/conv_signed.
+            // ext/sxt (zero/sign extension); conv_unsigned/conv_signed are with to_unsigned.
             case "shl":
             case "shr":
                 if (arguments.Length >= 2)
@@ -283,18 +280,6 @@ public static class StandardFunctions
                 if (arguments.Length >= 2)
                     return LogicVector.Resize(Bits(ArgVariable(arguments[0], variables)), GetIntValue(arguments[1], variables),
                         functionName.Equals("sxt", StringComparison.OrdinalIgnoreCase) ? Signedness.Signed : Signedness.Unsigned);
-                return "";
-
-            case "conv_unsigned":
-            case "conv_signed":
-                if (arguments.Length >= 2)
-                {
-                    var v = ArgVariable(arguments[0], variables);
-                    int width = GetIntValue(arguments[1], variables);
-                    return v.Type == DATATYPES.STD_LOGIC_VECTOR
-                        ? LogicVector.Resize(Bits(v), width, Operator.SignednessOf(v))
-                        : LogicVector.FromInteger(Operator.TryInteger(v, out var n) ? n : 0, width);
-                }
                 return "";
 
             // Phase 5: math_real transcendentals. Constant-init contexts
@@ -461,8 +446,7 @@ public static class StandardFunctions
             case Variable v: return v;
             case int i: return new Variable("__ArgInt", i, DATATYPES.INTEGER);
             case string s:
-                var named = variables.FirstOrDefault(x => x is not null && !string.IsNullOrEmpty(x.Name) && x.Name.Equals(s, StringComparison.OrdinalIgnoreCase));
-                if (named is not null) return named;
+                if (variables.TryGetValue(new Variable { Name = s }, out var named)) return named;
                 return long.TryParse(s, out long n)
                     ? new Variable("__ArgInt", n, DATATYPES.INTEGER)
                     : new Variable("__ArgRaw", s.Replace("\"", ""), DATATYPES.STD_LOGIC_VECTOR);
@@ -474,6 +458,8 @@ public static class StandardFunctions
     /// <summary>An integer argument (a width, a shift count…); a vector argument is read unsigned.</summary>
     private static int GetIntValue(object arg, HashSet<Variable> variables)
     {
+        if (arg is int literal) return literal;
+        if (arg is Variable { Value: int known }) return known;
         var v = ArgVariable(arg, variables);
         if (v.Type == DATATYPES.STD_LOGIC_VECTOR && LogicVector.TryToInteger(Bits(v), Signedness.Unsigned, out var bits))
             return LogicVector.ToInt32(bits);

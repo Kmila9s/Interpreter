@@ -41,12 +41,14 @@ public class DeferredExpression
 {
     private readonly List<object> _items;
     private readonly List<object> _postfix;
+    private readonly string _text;
 
     /// <summary>Creates a deferred expression over the buffered infix items of a function argument.</summary>
     /// <param name="items">Operands (variables, deferred reads/calls, literals) and operators, in infix order.</param>
     public DeferredExpression(List<object> items)
     {
         _items = items;
+        _text = string.Join(" ", items);
         _postfix = new Repositories.ShuntingYard(Services.Operation.WithUnarySigns(
             [.. items.Select(i => i is Services.Operator ? i : Operand(i))])).Result;
     }
@@ -64,7 +66,7 @@ public class DeferredExpression
     public Variable Evaluate() =>
         _items.Count == 0 ? new Variable("__DExprEmpty", "", DATATYPES.STD_LOGIC_VECTOR)
         : _items.Count == 1 ? Services.Operation.ToArgVariablePublic(_items[0])
-        : Services.Operation.EvaluateRpn(_postfix, string.Join(" ", _items));
+        : Services.Operation.EvaluateRpn(_postfix, _text);
 
     /// <summary>An operand the evaluator understands: literals and bare tokens become constants.</summary>
     private static object Operand(object item) => item switch

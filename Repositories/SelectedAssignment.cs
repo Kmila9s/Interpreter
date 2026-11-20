@@ -89,7 +89,7 @@ public class SelectedAssignment : ISControl, IConcurrentStatement
 
     /// <inheritdoc/>
     public IEnumerable<string> ReadTexts =>
-        [Operation.TargetSelectors(_target.Text + " <="), SelectorExpression, .. Choices.Select(c => c.ValueExpression)];
+        [Operation.TargetSelectors(_target.Text), SelectorExpression, .. Choices.Select(c => c.ValueExpression)];
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SelectedAssignment"/> class.

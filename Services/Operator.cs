@@ -630,28 +630,20 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
         // Reals (`2.5`) share the NATURAL classification; two integral operands stay integer (`7/2 = 3`).
         if (!IsIntegral(leftVariable) || !IsIntegral(rightVariable))
             return SolveRealOperation(GetDouble(leftVariable), GetDouble(rightVariable));
+        // Two 32-bit integers: + - * / mod rem in long (cannot overflow); else any width.
+        if (leftVariable.Value is int li && rightVariable.Value is int ri && op is "+" or "-" or "*" or "/" or "mod" or "rem")
+            return LogicVector.ToInt32(IntegerArithmetic.Apply(op, li, ri));
         TryInteger(leftVariable, out var x);
         TryInteger(rightVariable, out var y);
         var result = LogicVector.Apply(op, x, y);
         // Physical time values (fs) are 64-bit; integer wraps at 32 bits as in GHDL.
-        return IsTime(leftVariable) || IsTime(rightVariable) ? (object)(long)result : LogicVector.ToInt32(result);
+        return PhysicalTime.IsTime(leftVariable) || PhysicalTime.IsTime(rightVariable) ? (object)(long)result : LogicVector.ToInt32(result);
     }
-
-    private static bool IsTime(Variable v) => string.Equals(v.TypeMark, "time", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsIntegral(Variable v) => v.Value is int or long or System.Numerics.BigInteger || !(v.Value?.ToString() ?? "").Contains('.');
 
     private static double GetDouble(Variable v) =>
         double.TryParse(v.Value?.ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double d) ? d : 0.0;
-
-    /// <summary>
-    /// Solves an integer operation.
-    /// </summary>
-    /// <param name="leftVariable">The left variable.</param>
-    /// <param name="rightVariable">The right variable.</param>
-    /// <returns>The result of the integer operation.</returns>
-    public int SolveIntOperation(int leftVariable, int rightVariable) =>
-        (int)IntegerArithmetic.Apply(OperatorName, leftVariable, rightVariable);
 
     /// <summary>
     /// Solves a real operation.
@@ -760,7 +752,7 @@ public class Operator : IOperation, ILogicOperation, IArithOperation{
             : new string('U', size1);
     }
 
-    private static string StripLiteralQuotes(object? value)
+    internal static string StripLiteralQuotes(object? value)
     {
         var s = value?.ToString() ?? string.Empty;
         if (s.Length >= 2 && s[0] == '"' && s[^1] == '"') return s.Substring(1, s.Length - 2);

@@ -83,7 +83,7 @@ public class ConditionalAssignment : ISControl, IConcurrentStatement
 
     /// <inheritdoc/>
     public IEnumerable<string> ReadTexts =>
-        [Operation.TargetSelectors(_target.Text + " <="), .. Branches.Select(b => b.ValueExpression), .. Branches.Select(b => b.ConditionExpression ?? string.Empty)];
+        [Operation.TargetSelectors(_target.Text), .. Branches.Select(b => b.ValueExpression), .. Branches.Select(b => b.ConditionExpression ?? string.Empty)];
 
     /// <summary>
     /// Initializes a new instance of the <see cref="ConditionalAssignment"/> class.

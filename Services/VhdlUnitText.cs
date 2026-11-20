@@ -16,6 +16,8 @@ internal static class VhdlUnitText
     // clause; the matching `)` is found by counting parens (ExtractParenBlockAfter).
     internal static readonly Regex PortStartRe = new(@"\bport\s*\(", RegexOptions.IgnoreCase | RegexOptions.Singleline);
     internal static readonly Regex GenericStartRe = new(@"\bgeneric\s*\(", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    internal static readonly Regex PortMapStartRe = new(@"\bport\s+map\s*\(", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    internal static readonly Regex GenericMapStartRe = new(@"\bgeneric\s+map\s*\(", RegexOptions.IgnoreCase | RegexOptions.Singleline);
 
     // Match a signal/constant declaration at line start OR after a `;`, so
     // several on one line (`signal s1 : ...; signal c1 : ...; signal c2 : ...;`)

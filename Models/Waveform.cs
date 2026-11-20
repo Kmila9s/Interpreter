@@ -22,6 +22,9 @@ public sealed partial class Waveform
     /// <summary>Each element's value expression and delay expression (null = no <c>after</c>).</summary>
     public IReadOnlyList<(string Value, string? After)> Elements { get; private init; } = [];
 
+    /// <summary>Each element's delay in ns when it is a literal (<c>after 5 ns</c>), folded once; null when it reads objects.</summary>
+    private long?[] _folded = [];
+
     /// <summary>The value expression of the first element (what the assignment's operation evaluates).</summary>
     public string FirstValue => Elements[0].Value;
 
@@ -41,13 +44,17 @@ public sealed partial class Waveform
             else if (head.Groups["reject"].Success) reject = head.Groups["reject"].Value.Trim();
             text = text[head.Length..];
         }
-        var elements = new List<(string, string?)>();
+        var elements = new List<(string Value, string? After)>();
         foreach (string part in VhdlText.TopLevelSplit(text, ","))
         {
             int after = TopLevelAfter(part);
             elements.Add(after < 0 ? (part.Trim(), null) : (part[..after].Trim(), part[(after + 5)..].Trim()));
         }
-        return new Waveform { Mechanism = mechanism, Reject = reject, Elements = elements };
+        return new Waveform
+        {
+            Mechanism = mechanism, Reject = reject, Elements = elements,
+            _folded = [.. elements.Select(e => e.After is null ? 0L : TimeValue.TryEvaluateNs(e.After, null, out double ns) ? (long?)Math.Round(ns) : null)],
+        };
     }
 
     /// <summary>
@@ -76,6 +83,10 @@ public sealed partial class Waveform
     }
 
     private static bool IsWordChar(char c) => char.IsLetterOrDigit(c) || c == '_';
+
+    /// <summary>The delay in ns of element <paramref name="index"/>: folded when literal, else evaluated now against <paramref name="scope"/>.</summary>
+    public long ElementDelayNs(int index, HashSet<Variable> scope, int line) =>
+        _folded[index] ?? DelayNs(Elements[index].After, scope, line);
 
     /// <summary>
     /// The delay in nanoseconds of the time expression <paramref name="after"/>

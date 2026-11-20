@@ -58,17 +58,7 @@ public static class HdlLiteral
         if (text.Length >= 3 && text[1] == '"' && text[^1] == '"' && text[0] is 'x' or 'X' or 'o' or 'O' or 'b' or 'B')
         {
             int radix = char.ToLowerInvariant(text[0]) switch { 'x' => 16, 'o' => 8, _ => 2 };
-            int width = radix switch { 16 => 4, 8 => 3, _ => 1 };
-            var sb = new System.Text.StringBuilder();
-            foreach (char c in text[2..^1])
-            {
-                if (c == '_') continue;
-                int d = Uri.IsHexDigit(c) ? Convert.ToInt32(c.ToString(), 16) : -1;
-                if (d < 0 || d >= radix) return false;
-                sb.Append(Convert.ToString(d, 2).PadLeft(width, '0'));
-            }
-            bits = sb.ToString();
-            return true;
+            return TryRadixBits(text[2..^1], radix, out bits);
         }
         if (text.Length >= 2 && text[0] == '"' && text[^1] == '"') { bits = text[1..^1]; return true; }
         if (text.Length == 3 && text[0] == '\'' && text[2] == '\'') { bits = text[1].ToString(); return true; }
@@ -77,6 +67,22 @@ public static class HdlLiteral
 
     /// <summary>Binary text of hex digits (<c>"0F"</c> → <c>"00001111"</c>); underscores are ignored.</summary>
     public static string HexBits(string hexDigits) =>
-        string.Concat(hexDigits.Where(c => c != '_')
-            .Select(c => Convert.ToString(Convert.ToInt32(c.ToString(), 16), 2).PadLeft(4, '0')));
+        TryRadixBits(hexDigits, 16, out string bits) ? bits : throw new FormatException($"not hex digits: {hexDigits}");
+
+    /// <summary>The bits of <paramref name="digits"/> in base 2, 8 or 16 (each digit 1, 3 or 4 bits; <c>_</c> ignored).</summary>
+    private static bool TryRadixBits(string digits, int radix, out string bits)
+    {
+        bits = string.Empty;
+        int width = radix switch { 16 => 4, 8 => 3, _ => 1 };
+        var sb = new System.Text.StringBuilder(digits.Length * width);
+        foreach (char c in digits)
+        {
+            if (c == '_') continue;
+            int d = Uri.IsHexDigit(c) ? Convert.ToInt32(c.ToString(), 16) : -1;
+            if (d < 0 || d >= radix) return false;
+            sb.Append(Convert.ToString(d, 2).PadLeft(width, '0'));
+        }
+        bits = sb.ToString();
+        return true;
+    }
 }

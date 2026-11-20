@@ -43,6 +43,9 @@ namespace Interpreter.Models;
 /// </remarks>
 public class DeferredUserFunction
 {
+    /// <summary>The declared return type mark, looked up on first evaluation (empty when unknown).</summary>
+    private string? _returnTypeMark;
+
     /// <summary>Registered VHDL function name (case-normalised at
     /// registration; consumers match by ordinal case-insensitive).</summary>
     public string FunctionName { get; }
@@ -121,8 +124,9 @@ public class DeferredUserFunction
             resultType);
         if (ReturnTypeSize > 0) resultVar.Size = ReturnTypeSize;
         resultVar.PortType = PortType.OUT;
-        resultVar.TypeMark = (Services.FunctionRegistry.Instance.Get(FunctionName)
-            ?? Services.PackageRegistry.Instance.GetFunction(FunctionName))?.ReturnTypeMark;
+        resultVar.TypeMark = _returnTypeMark ??= (Services.FunctionRegistry.Instance.Get(FunctionName)
+            ?? Services.PackageRegistry.Instance.GetFunction(FunctionName))?.ReturnTypeMark ?? string.Empty;
+        if (resultVar.TypeMark.Length == 0) resultVar.TypeMark = null;
         return resultVar;
     }
 }

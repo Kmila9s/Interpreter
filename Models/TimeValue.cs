@@ -14,7 +14,7 @@ namespace Interpreter.Models;
 public static partial class TimeValue
 {
     /// <summary>Nanoseconds per femtosecond (time values are femtoseconds, <see cref="PhysicalTime"/>).</summary>
-    private const double NsPerFs = 1e-6;
+    private const double NsPerFs = 1.0 / PhysicalTime.FsPerNs;
 
     [GeneratedRegex(@"\d[\d_]*(?:\.[\d_]+)?(?:[eE][+-]?\d+)?|[A-Za-z_]\w*|[()*/+-]")]
     private static partial Regex Lexeme();
@@ -95,7 +95,7 @@ public static partial class TimeValue
             {
                 value = SignalAttributeHandler.Instance.NowFs * NsPerFs; isTime = true; return true;
             }
-            var obj = scope?.FirstOrDefault(v => v is not null && v.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+            var obj = (scope is not null && scope.TryGetValue(new Variable { Name = name }, out var found) ? found : null)
                 ?? PackageRegistry.Instance.GetConstant(name);
             // A time object holds femtoseconds; anything else is re-read from its value text.
             if (obj is not null && PhysicalTime.IsTime(obj) && PhysicalTime.TryFs(obj.Value, out long fs))

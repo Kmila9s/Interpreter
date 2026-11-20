@@ -23,7 +23,7 @@ public static partial class ImplicitSensitivity
     {
         foreach (var text in texts)
         {
-            string code = CharLiteral().Replace(StringLiteral().Replace(text, " "), " ");
+            string code = CharLiteral().Replace(VhdlText.MaskStringLiterals(text), " ");
             foreach (Match m in Name().Matches(code))
             {
                 if (m.Index > 0 && code[m.Index - 1] == '.') continue;   // a record field, not a name
@@ -70,9 +70,6 @@ public static partial class ImplicitSensitivity
 
     [GeneratedRegex(@"[A-Za-z]\w*")]
     private static partial Regex Name();
-
-    [GeneratedRegex("\"[^\"]*\"")]
-    private static partial Regex StringLiteral();
 
     /// <summary>A character literal (<c>'Z'</c>), not an attribute tick (<c>clk'event</c>).</summary>
     [GeneratedRegex(@"(?<![\w)])'.'")]

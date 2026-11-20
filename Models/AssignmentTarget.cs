@@ -121,7 +121,7 @@ public sealed partial class AssignmentTarget
     private void CheckBounds(object value)
     {
         var b = Base;
-        if (b.ScalarRange is { } range && Operator.TryInteger(new Variable { Value = value }, out var n)
+        if (b.ScalarRange is { } range && value switch { int i => i, long l => l, _ => (long?)null } is long n
             && (n < range.Low || n > range.High))
             throw new SimulationRuntimeException("bound check failure");
         if (b.Type == Constants.DATATYPES.STD_LOGIC_VECTOR && b.Size > 0 && b.Layout is null && b.ElementSize == 0

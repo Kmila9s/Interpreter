@@ -121,13 +121,8 @@ public class SignalScheduler
     /// <param name="newValue">The value (for a part, its characters).</param>
     /// <param name="sourceLine">1-based source line of the statement (0 = unknown).</param>
     /// <param name="span">The part written (start and width in the value string), or null for the whole signal.</param>
-    /// <param name="wholeDriver">True when the part is selected by a dynamic index: the driver then covers the whole signal.</param>
-    public void Schedule(Variable target, object newValue, int sourceLine = 0, (int Start, int Width)? span = null, bool wholeDriver = false) =>
-        ScheduleWaveform(target, [new WaveformElement(newValue, 0)], sourceLine, span, wholeDriver, DelayMechanism.Inertial, -1);
-
-    /// <summary>Schedules <paramref name="newValue"/> <paramref name="delayNs"/> ns from now (inertial).</summary>
-    public void ScheduleAfterNs(Variable target, object newValue, long delayNs, int sourceLine = 0, (int Start, int Width)? span = null, bool wholeDriver = false) =>
-        ScheduleWaveform(target, [new WaveformElement(newValue, delayNs)], sourceLine, span, wholeDriver, DelayMechanism.Inertial, -1);
+    public void Schedule(Variable target, object newValue, int sourceLine = 0, (int Start, int Width)? span = null) =>
+        ScheduleWaveform(target, [new WaveformElement(newValue, 0)], sourceLine, span, wholeDriver: false, DelayMechanism.Inertial, -1);
 
     /// <summary>
     /// Schedules a waveform (<c>v1 after t1, v2 after t2, …</c>) on the
@@ -193,11 +188,11 @@ public class SignalScheduler
         }
     }
 
-    /// <summary>Delay in ticks (rounded up, at least one tick) of <paramref name="delayNs"/>.</summary>
-    private ulong DelayTicks(long delayNs)
+    /// <summary>Delay in ticks of <paramref name="delayNs"/>, rounded up and at least <paramref name="min"/>.</summary>
+    private ulong DelayTicks(long delayNs, long min = 1)
     {
         int res = Math.Max(1, _tickResolutionNs);
-        return (ulong)Math.Max(1, (delayNs + res - 1) / res);
+        return (ulong)Math.Max(min, (delayNs + res - 1) / res);
     }
 
     private SignalDrivers SignalOf(Variable target)
@@ -229,7 +224,10 @@ public class SignalScheduler
         if (driver.Covers is { } covers)
         {
             if (span is { } s && !wholeDriver)
+            {
                 for (int i = s.Start; i < s.Start + s.Width && i < covers.Length; i++) covers[i] = true;
+                if (Array.TrueForAll(covers, c => c)) driver.Covers = null;   // every element: the fast path
+            }
             else driver.Covers = null;
         }
         return driver;
@@ -247,9 +245,16 @@ public class SignalScheduler
     private void Preempt(Driver driver, Transaction t, DelayMechanism mechanism, long rejectNs)
     {
         var w = driver.Waveform;
-        w.RemoveAll(o => !Before(o, t) && Within(o.Span, t.Span) && CountRemoved(o));
+        if (w.Count == 0) return;
+        for (int i = w.Count - 1; i >= 0; i--)
+        {
+            var o = w[i];
+            if (Before(o, t) || !Within(o.Span, t.Span)) continue;
+            if (o.Now) _pendingNow--;   // a due transaction replaced in the same delta
+            w.RemoveAt(i);
+        }
         if (mechanism != DelayMechanism.Inertial || t.Now) return;
-        ulong windowStart = rejectNs <= 0 ? t.Tick : t.Tick - Math.Min(t.Tick, DelayTicksOrZero(rejectNs));
+        ulong windowStart = rejectNs <= 0 ? t.Tick : t.Tick - Math.Min(t.Tick, DelayTicks(rejectNs, min: 0));
         bool keep = true;
         for (int i = w.Count - 1; i >= 0; i--)
         {
@@ -259,19 +264,6 @@ public class SignalScheduler
             keep = false;
             w.RemoveAt(i);
         }
-    }
-
-    private ulong DelayTicksOrZero(long ns)
-    {
-        int res = Math.Max(1, _tickResolutionNs);
-        return (ulong)Math.Max(0, (ns + res - 1) / res);
-    }
-
-    /// <summary>Keeps <see cref="_pendingNow"/> in step when a due transaction is deleted.</summary>
-    private bool CountRemoved(Transaction o)
-    {
-        if (o.Now) _pendingNow--;
-        return true;
     }
 
     /// <summary>True when <paramref name="o"/> happens strictly before <paramref name="t"/>.</summary>
@@ -287,13 +279,9 @@ public class SignalScheduler
     {
         var w = driver.Waveform;
         int at = w.Count;
-        while (at > 0 && After(w[at - 1], t)) at--;
+        while (at > 0 && Before(t, w[at - 1])) at--;
         w.Insert(at, t);
     }
-
-    /// <summary>True when <paramref name="o"/> happens strictly after <paramref name="t"/>.</summary>
-    private static bool After(Transaction o, Transaction t) =>
-        !o.Now && (t.Now || o.Tick > t.Tick);
 
     private void Activate(SignalDrivers signal)
     {

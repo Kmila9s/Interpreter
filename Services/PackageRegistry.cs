@@ -102,8 +102,15 @@ public class PackageRegistry
     }
 
     /// <summary>Records the vector arithmetic of the unit inlined under <paramref name="prefix"/> (its context clause <paramref name="context"/>).</summary>
-    public void RegisterUnitArithmetic(string prefix, string context) =>
+    public void RegisterUnitArithmetic(string prefix, string context)
+    {
         _unitArithmetic[prefix] = ArithmeticOf(context) ?? Signedness.Unsigned;
+        var distinct = _unitArithmetic.Values.Distinct().ToList();
+        _uniformArithmetic = distinct.Count == 1 ? distinct[0] : null;
+    }
+
+    /// <summary>The vector arithmetic of every registered unit when they all agree (the usual case), else null.</summary>
+    private Signedness? _uniformArithmetic;
 
     /// <summary>
     /// How a std_logic_vector object named <paramref name="name"/> reads as a number:
@@ -111,6 +118,9 @@ public class PackageRegistry
     /// </summary>
     public Signedness ArithmeticFor(string? name)
     {
+        // Usual designs use one package everywhere: no prefix walk.
+        if (_unitArithmetic.Count == 0) return VectorArithmetic;
+        if (_uniformArithmetic is { } uniform) return uniform;
         string best = string.Empty;
         Signedness? found = null;
         foreach (var (prefix, s) in _unitArithmetic)
@@ -368,6 +378,7 @@ public class PackageRegistry
         _declaredNames.Clear();
         VectorArithmetic = Signedness.Unsigned;
         _unitArithmetic.Clear();
+        _uniformArithmetic = null;
         _designTypes.Clear();
     }
 

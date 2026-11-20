@@ -336,19 +336,11 @@ internal sealed class DesignLibrary
         else throw new ParserException($"binding indication \"use {text}\" is not supported yet", line, 0);
         if (string.IsNullOrWhiteSpace(rest)) return binding;
         // `generic map (…)` and `port map (…)` of the binding (G80).
-        string? gmap = MapBody(rest, "generic"), pmap = MapBody(rest, "port");
+        string? gmap = VhdlUnitText.ExtractParenBlockAfter(rest, VhdlUnitText.GenericMapStartRe);
+        string? pmap = VhdlUnitText.ExtractParenBlockAfter(rest, VhdlUnitText.PortMapStartRe);
         if (gmap is null && pmap is null)
             throw new ParserException($"binding indication \"use {text}\" is not supported yet", line, 0);
         return binding with { GenericMap = gmap, PortMap = pmap };
-    }
-
-    /// <summary>The associations inside <c>&lt;kind&gt; map ( … )</c> of <paramref name="text"/>, or null.</summary>
-    private static string? MapBody(string text, string kind)
-    {
-        var m = Regex.Match(text, $@"\b{kind}\s+map\s*\(", RegexOptions.IgnoreCase);
-        if (!m.Success) return null;
-        int open = m.Index + m.Length - 1, close = VhdlText.MatchingParen(text, open);
-        return close < 0 ? null : text[(open + 1)..close];
     }
 
     // ---------- Configuration declarations ----------

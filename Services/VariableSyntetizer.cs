@@ -1142,6 +1142,66 @@ public class VariableSyntetizer : ISControl
     }
 
     /// <summary>
+    /// The declarative part of a subprogram, up to its <c>begin</c>, one declaration at a
+    /// time with the shared declaration parser. A declaration whose range or initial
+    /// value depends on the parameters (<c>integer range 0 to s'length</c>,
+    /// <c>:= 2 ** (bits - 1)</c>) is elaborated at each call in VHDL; it is kept typed
+    /// by its type mark only, so valid code is never rejected. A nested subprogram
+    /// makes the whole part go through the parser at once.
+    /// </summary>
+    private List<Variable> ParseSubprogramLocals(HashSet<Variable> scope, TypeRegistry types)
+    {
+        var locals = new List<Variable>();
+        if (string.Equals(_streamer.Current?.Value, "begin", StringComparison.OrdinalIgnoreCase)) return locals;
+        int regionStart = _streamer.Position, regionEnd = regionStart, depth = 0;
+        bool nestedSubprogram = false;
+        for (var t = _streamer.Slice(regionStart, int.MaxValue); regionEnd - regionStart < t.Count; regionEnd++)
+        {
+            string v = t[regionEnd - regionStart].Value.ToLowerInvariant();
+            if (v is "function" or "procedure") nestedSubprogram = true;
+            if (v == "(") depth++; else if (v == ")") depth--;
+            else if (v == "begin" && depth == 0 && !nestedSubprogram) break;
+        }
+        if (nestedSubprogram)
+        {
+            var whole = new VariableSyntetizer(_streamer, scope, TypeRegistry: types);
+            whole.Syntetize(_currentCt);
+            return [.. whole.Variables];
+        }
+        var region = _streamer.Slice(regionStart, regionEnd);
+        int start = 0;
+        depth = 0;
+        for (int i = 0; i < region.Count; i++)
+        {
+            if (region[i].Value == "(") depth++;
+            else if (region[i].Value == ")") depth--;
+            if (region[i].Value != ";" || depth != 0) continue;
+            var decl = region.Skip(start).Take(i - start + 1).ToList();
+            start = i + 1;
+            var stream = new TokenStream([.. decl, new Token("begin", KEYWORDS)]);
+            try
+            {
+                var parser = new VariableSyntetizer(stream, [.. scope, .. locals], TypeRegistry: types);
+                parser.Syntetize(_currentCt);
+                locals.AddRange(parser.Variables);
+                foreach (var t in parser.ParsedTypes.Types.Values) types.TryRegister(t);
+            }
+            catch (Exception e) when (e is ParserException or TokenStream.StreamerException)
+            {
+                // Not static here (it depends on the parameters): an object keeps its type
+                // mark; another declaration (an attribute specification…) declares no object.
+                int colon = decl.FindIndex(t => t.Value == ":");
+                if (decl[0].Value.ToLowerInvariant() is not ("variable" or "constant") || colon < 0 || colon + 1 >= decl.Count) continue;
+                string mark = decl[colon + 1].Value;
+                foreach (var name in decl.Skip(1).Take(colon - 1).Where(t => t.Type == IDENTIFIERS))
+                    locals.Add(new Variable(name.Value, string.Empty, Variable.GetDatatype(mark)) { TypeMark = mark.ToLowerInvariant() });
+            }
+        }
+        while (_streamer.Position < regionEnd) _streamer.MoveNext();
+        return locals;
+    }
+
+    /// <summary>
     /// A file declaration: <c>file f : text open read_mode is "name";</c> (or the
     /// VHDL-87 <c>is in "name"</c>). Read mode opens the file for <c>readline</c>;
     /// writing to a file is not supported yet (an error, never a silent no-op).
@@ -1161,9 +1221,9 @@ public class VariableSyntetizer : ISControl
         while (_streamer.Current is { } t && t.Value != ";") { words.Add(t); _streamer.MoveNext(); }
         if (_streamer.Current?.Value == ";") _streamer.MoveNext();
         string? path = words.FirstOrDefault(w => w.IsStringLiteral)?.Value.Trim('"');
-        string mode = words.Any(w => w.Value.Equals("write_mode", StringComparison.OrdinalIgnoreCase) || w.Value.Equals("append_mode", StringComparison.OrdinalIgnoreCase)
-            || w.Value.Equals("out", StringComparison.OrdinalIgnoreCase)) ? "write" : "read";
-        if (mode == "write")
+        bool writes = words.Any(w => w.Value.Equals("write_mode", StringComparison.OrdinalIgnoreCase) || w.Value.Equals("append_mode", StringComparison.OrdinalIgnoreCase)
+            || w.Value.Equals("out", StringComparison.OrdinalIgnoreCase));
+        if (writes)
             throw new ParserException("files opened for writing are not supported yet (use writeline(output, …))", start);
         foreach (var name in names)
         {
@@ -1189,9 +1249,10 @@ public class VariableSyntetizer : ISControl
             _streamer.MoveNext();
         }
         string text = string.Join(" ", tokens);
-        if (!TimeValue.TryEvaluateNs(text, Variables, out double ns))
-            throw new ParserException($"cannot evaluate the time expression \"{text}\"", _streamer.Current ?? _streamer.Previous);
-        return (long)Math.Round(ns * PhysicalTime.UnitFs["ns"]);
+        // Generics (`PERIOD`) and the objects declared so far; an expression over
+        // signals is kept as text and evaluated where it is used (`wait for`, `after`).
+        if (!TimeValue.TryEvaluateNs(text, [.. _comparator, .. Variables], out double ns)) return text;
+        return (long)Math.Round(ns * PhysicalTime.FsPerNs);
     }
 
     /// <summary>
@@ -1970,9 +2031,7 @@ public class VariableSyntetizer : ISControl
         foreach (var p in parameters) localScope.Add(p.CreateVariable());
         var localTypes = new TypeRegistry();
         foreach (var t in (_typeRegistry?.Types.Values ?? []).Concat(ParsedTypes.Types.Values)) localTypes.TryRegister(t);
-        var localParser = new VariableSyntetizer(_streamer, localScope, TypeRegistry: localTypes);
-        if (_streamer.Current?.Value?.ToLower() != "begin") localParser.Syntetize(_currentCt);
-        var localVariables = localParser.Variables.ToList();
+        var localVariables = ParseSubprogramLocals(localScope, localTypes);
         if (_streamer.Current?.Value?.ToLower() == "begin")
         {
             _streamer.MoveNext(); // consume 'begin'

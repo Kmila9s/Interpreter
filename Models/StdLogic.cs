@@ -167,23 +167,6 @@ public static class StdLogic
         return acc;
     }
 
-    /// <summary>
-    /// Unsigned value of a bit string whose elements are all levels (<c>0 1 L H</c>, weak levels
-    /// read as 0/1); false when an element is a metavalue or the string is empty or wider than 63 bits.
-    /// </summary>
-    public static bool TryToUnsigned(string bits, out long value)
-    {
-        value = 0;
-        if (bits.Length is 0 or > 63) return false;
-        foreach (char c in bits)
-        {
-            char l = ToX01(c);
-            if (l == 'X') return false;
-            value = (value << 1) | (uint)(l - '0');
-        }
-        return true;
-    }
-
     /// <summary>numeric_std <c>To_01</c>: levels to 0/1; any metavalue makes the whole result 0.</summary>
     public static string To01(string bits) =>
         IsX(bits) ? new string('0', bits.Length) : string.Create(bits.Length, bits, static (r, src) =>

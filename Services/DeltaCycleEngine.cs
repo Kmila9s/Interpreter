@@ -52,7 +52,6 @@ public partial class DeltaCycleEngine : IDisposable
     /// </summary>
     private readonly Dictionary<Operation, ScheduledOperation> _scheduledOpCache = new();
 
-
     /// <summary>
     /// Phase H.3: signals that committed new values in the most recent
     /// delta cycle. Drives the concurrent-task gating: a clean task whose
@@ -67,17 +66,17 @@ public partial class DeltaCycleEngine : IDisposable
     /// <see cref="Initialize"/> from <see cref="SensitivityOf"/>. Keyed by
     /// <see cref="Variable"/> name equality (one object per elaborated signal).
     /// </summary>
-    private readonly Dictionary<Variable, List<object>> _signalToOps = new();
+    private readonly Dictionary<Variable, List<object>> _signalToStatements = new();
 
     /// <summary>
     /// Concurrent statements whose value can change without an event on a signal
     /// they name (<c>'stable(T)</c>, <c>'quiet</c>, <c>'delayed</c>, <c>now</c>):
     /// enqueued on every delta.
     /// </summary>
-    private readonly List<object> _alwaysRunOps = new();
+    private readonly List<object> _alwaysRunStatements = new();
 
     /// <summary>Per-delta scratch set of the sensitive statements to execute (reference identity).</summary>
-    private readonly HashSet<object> _pendingOpsScratch = new(ReferenceEqualityComparer.Instance);
+    private readonly HashSet<object> _pendingStatementsScratch = new(ReferenceEqualityComparer.Instance);
 
     /// <summary>
     /// F-G-13 MVP (2026-07-18): time-scheduled process wakes. Populated at
@@ -172,6 +171,23 @@ public partial class DeltaCycleEngine : IDisposable
     }
 
     /// <summary>
+    /// The process resumes: whatever it still waits for is dropped — the condition
+    /// of <c>wait until … for</c> when the timeout fired first, the pending timeout
+    /// when the condition did (and the condition of a plain <c>wait on/until</c>).
+    /// </summary>
+    private void CancelPendingWait(Process process)
+    {
+        if (process.ConditionWait is { } pending) UnregisterConditionBlocked(process, pending);
+        if (process.TimeoutTick is { } timeout && timeout > _currentTick && _pendingProcessWakes.TryGetValue(timeout, out var timed))
+        {
+            timed.Remove(process);
+            if (timed.Count == 0) _pendingProcessWakes.Remove(timeout);
+        }
+        process.ConditionWait = null;
+        process.TimeoutTick = null;
+    }
+
+    /// <summary>
     /// F-G-13b: re-evaluate every condition-blocked process whose
     /// sensitivity set intersects <paramref name="changedSignals"/>. Any
     /// process whose condition now holds is dequeued from
@@ -199,15 +215,7 @@ public partial class DeltaCycleEngine : IDisposable
         if (toWake == null) return false;
         foreach (var (p, w) in toWake)
         {
-            UnregisterConditionBlocked(p, w);
-            p.ConditionWait = null;
-            // The condition came first: cancel the timeout of `wait until … for`.
-            if (p.TimeoutTick is { } timeout && _pendingProcessWakes.TryGetValue(timeout, out var timed))
-            {
-                timed.Remove(p);
-                if (timed.Count == 0) _pendingProcessWakes.Remove(timeout);
-            }
-            p.TimeoutTick = null;
+            CancelPendingWait(p);
             ScheduleProcessWake(p, _currentTick);
         }
         return true;
@@ -235,9 +243,9 @@ public partial class DeltaCycleEngine : IDisposable
     public ulong FirstCapHitTick { get; private set; } = 0;
     /// <summary>F-G-08 pass 3 diag: elaboration-time size of <see cref="_concurrentTasks"/>.</summary>
     public int InitialConcurrentTaskCount { get; private set; } = 0;
-    /// <summary>F-G-08 pass 3 diag: elaboration-time size of <see cref="_alwaysRunOps"/>.</summary>
+    /// <summary>F-G-08 pass 3 diag: elaboration-time size of <see cref="_alwaysRunStatements"/>.</summary>
     public int InitialAlwaysRunOpsCount { get; private set; } = 0;
-    /// <summary>F-G-08 pass 3 diag: elaboration-time count of unique Variable keys in <see cref="_signalToOps"/>.</summary>
+    /// <summary>F-G-08 pass 3 diag: elaboration-time count of unique Variable keys in <see cref="_signalToStatements"/>.</summary>
     public int InitialSignalToOpsKeys { get; private set; } = 0;
     /// <summary>F-G-08 pass 3 diag: elaboration-time signal count (from <see cref="_allSignals"/>).</summary>
     public int InitialSignalCount { get; private set; } = 0;
@@ -522,30 +530,30 @@ public partial class DeltaCycleEngine : IDisposable
         // so RunDeltaCycleAsync can walk from the delta's changed set to the
         // dependent Operations directly, instead of intersecting the changed
         // set against every task's inputs. Also warms _operationInputs.
-        _signalToOps.Clear();
-        _alwaysRunOps.Clear();
+        _signalToStatements.Clear();
+        _alwaysRunStatements.Clear();
         foreach (var task in tasks)
         {
             if (task is not IConcurrentStatement statement) continue;
             var inputs = SensitivityOf(statement, signals);
             if (inputs == null)
             {
-                _alwaysRunOps.Add(task);
+                _alwaysRunStatements.Add(task);
                 continue;
             }
             // A statement reading no signal runs only at initialisation (first delta).
             foreach (var v in inputs)
             {
-                if (!_signalToOps.TryGetValue(v, out var list))
-                    _signalToOps[v] = list = new List<object>();
+                if (!_signalToStatements.TryGetValue(v, out var list))
+                    _signalToStatements[v] = list = new List<object>();
                 list.Add(task);
             }
         }
 
         // F-G-08 pass 3 diag: snapshot elaboration-time stats for the response log.
         InitialConcurrentTaskCount = tasks.Count;
-        InitialAlwaysRunOpsCount   = _alwaysRunOps.Count;
-        InitialSignalToOpsKeys     = _signalToOps.Count;
+        InitialAlwaysRunOpsCount   = _alwaysRunStatements.Count;
+        InitialSignalToOpsKeys     = _signalToStatements.Count;
         InitialSignalCount         = signals.Count;
 
         _isInitialized = true;
@@ -777,15 +785,15 @@ public partial class DeltaCycleEngine : IDisposable
         else
         {
             // Gated path: build the pending set from the reverse index.
-            _pendingOpsScratch.Clear();
+            _pendingStatementsScratch.Clear();
             foreach (var v in _lastDeltaChangedSignals)
             {
-                if (_signalToOps.TryGetValue(v, out var ops))
+                if (_signalToStatements.TryGetValue(v, out var ops))
                 {
-                    for (int i = 0; i < ops.Count; i++) _pendingOpsScratch.Add(ops[i]);
+                    for (int i = 0; i < ops.Count; i++) _pendingStatementsScratch.Add(ops[i]);
                 }
             }
-            for (int i = 0; i < _alwaysRunOps.Count; i++) _pendingOpsScratch.Add(_alwaysRunOps[i]);
+            for (int i = 0; i < _alwaysRunStatements.Count; i++) _pendingStatementsScratch.Add(_alwaysRunStatements[i]);
 
             foreach (var task in _concurrentTasks)
             {
@@ -797,7 +805,7 @@ public partial class DeltaCycleEngine : IDisposable
                 if (_cts.IsCancellationRequested)
                     break;
 
-                if (task is IConcurrentStatement && !_pendingOpsScratch.Contains(task)) continue;
+                if (task is IConcurrentStatement && !_pendingStatementsScratch.Contains(task)) continue;
                 using var owner = _signalScheduler.OwnedBy(task);
                 if (task is Operation operation)
                 {
@@ -1533,10 +1541,7 @@ public partial class DeltaCycleEngine : IDisposable
             foreach (var process in list)
             {
                 if (process.IsTerminated) continue;
-                // The timeout came first: the condition of `wait until … for` no longer waits.
-                if (process.ConditionWait is { } pending) UnregisterConditionBlocked(process, pending);
-                process.ConditionWait = null;
-                process.TimeoutTick = null;
+                CancelPendingWait(process);
                 await ExecuteProcessSegmentAsync(process);
             }
         }

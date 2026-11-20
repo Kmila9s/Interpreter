@@ -221,17 +221,6 @@ public static class ParseTrace
     }
 
     /// <summary>
-    /// F-G-15 (2026-07-18): tries to match and evaluate a
-    /// <c>to_string(&lt;name&gt;)</c> or
-    /// <c>to_string(&lt;name&gt;(&lt;hi&gt; downto|to &lt;lo&gt;))</c>
-    /// pattern starting at <paramref name="startIdx"/> in
-    /// <paramref name="tokens"/>. On success sets
-    /// <paramref name="result"/> to the rendered bit string and
-    /// <paramref name="consumed"/> to the number of tokens matched
-    /// (including <c>to_string</c> itself) and returns true. On failure
-    /// returns false so the caller falls back to source-text rendering.
-    /// </summary>
-    /// <summary>
     /// <c>T'image(e)</c> at <paramref name="start"/>: <c>e</c> evaluated now and written as
     /// GHDL does — an integer in decimal, a character/std_logic/bit between quotes,
     /// a boolean as <c>true</c>/<c>false</c>, a time in fs; a following <c>(n)</c>
@@ -276,6 +265,17 @@ public static class ParseTrace
         return -1;
     }
 
+    /// <summary>
+    /// F-G-15 (2026-07-18): tries to match and evaluate a
+    /// <c>to_string(&lt;name&gt;)</c> or
+    /// <c>to_string(&lt;name&gt;(&lt;hi&gt; downto|to &lt;lo&gt;))</c>
+    /// pattern starting at <paramref name="startIdx"/> in
+    /// <paramref name="tokens"/>. On success sets
+    /// <paramref name="result"/> to the rendered bit string and
+    /// <paramref name="consumed"/> to the number of tokens matched
+    /// (including <c>to_string</c> itself) and returns true. On failure
+    /// returns false so the caller falls back to source-text rendering.
+    /// </summary>
     private static bool TryEvalTypedString(List<string> tokens, int startIdx,
                                            HashSet<Variable> variables,
                                            string caller,

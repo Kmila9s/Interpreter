@@ -21,6 +21,20 @@ public static class LogicVector
     {
         value = BigInteger.Zero;
         if (bits.Length == 0) return false;
+        if (bits.Length <= 62)
+        {
+            // Common widths: accumulate in a long (no BigInteger arithmetic per bit).
+            long acc = 0;
+            foreach (char c in bits)
+            {
+                char b = StdLogic.ToX01(c);
+                if (b == 'X') return false;
+                acc = (acc << 1) | (b == '1' ? 1L : 0L);
+            }
+            if (signedness == Signedness.Signed && StdLogic.ToX01(bits[0]) == '1') acc -= 1L << bits.Length;
+            value = acc;
+            return true;
+        }
         foreach (char c in bits)
         {
             char b = StdLogic.ToX01(c);
@@ -36,6 +50,7 @@ public static class LogicVector
     public static string FromInteger(BigInteger value, int width)
     {
         if (width <= 0) return string.Empty;
+        if (width <= 64 && value >= long.MinValue && value <= long.MaxValue) return FromInteger((long)value, width);
         var modulus = BigInteger.One << width;
         var v = BigInteger.Remainder(value, modulus);
         if (v.Sign < 0) v += modulus;
@@ -44,6 +59,14 @@ public static class LogicVector
             sb.Append(((v >> i) & BigInteger.One).IsZero ? '0' : '1');
         return sb.ToString();
     }
+
+    /// <summary><paramref name="value"/> as <paramref name="width"/> bits (two's complement, wrapped): the common, allocation-light case.</summary>
+    public static string FromInteger(long value, int width) =>
+        width <= 0 ? string.Empty
+        : string.Create(width, value, static (chars, v) =>
+        {
+            for (int i = chars.Length - 1; i >= 0; i--, v >>= 1) chars[i] = (v & 1) == 1 ? '1' : '0';
+        });
 
     /// <summary>
     /// <paramref name="bits"/> resized to <paramref name="width"/> as numeric_std
