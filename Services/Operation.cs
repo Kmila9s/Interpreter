@@ -901,20 +901,9 @@ public class Operation : IOperation, IConcurrentStatement {
         // single integer token. Anything else — abort and don't consume.
         int bodyLen = close - nextIdx - 1;
         long ns;
-        if (bodyLen == 2 &&
-            long.TryParse(_data[nextIdx + 1], out var qty))
+        if (bodyLen == 2 && PhysicalTime.TryLiteral(_data[nextIdx + 1], _data[nextIdx + 2], out long fs))
         {
-            string unit = _data[nextIdx + 2].ToLower();
-            ns = unit switch
-            {
-                "fs"  => qty / 1_000_000,
-                "ps"  => qty / 1_000,
-                "ns"  => qty,
-                "us"  => qty * 1_000,
-                "ms"  => qty * 1_000_000,
-                "sec" => qty * 1_000_000_000,
-                _     => qty
-            };
+            ns = fs / PhysicalTime.UnitFs["ns"];
         }
         else if (bodyLen == 1 && long.TryParse(_data[nextIdx + 1], out var raw))
         {
@@ -1587,17 +1576,6 @@ public class Operation : IOperation, IConcurrentStatement {
         resultVar.HasPlaceholderType = true; // black-box result: the real type is unknown
 
         return (true, resultVar);
-    }
-
-    /// <summary>
-    /// Checks if a token is a VHDL time unit.
-    /// </summary>
-    /// <param name="token">The token to check.</param>
-    /// <returns>True if the token is a time unit.</returns>
-    private static bool IsTimeUnit(string token)
-    {
-        string[] timeUnits = { "fs", "ps", "ns", "us", "ms", "sec", "min", "hr" };
-        return timeUnits.Contains(token.ToLower());
     }
 
     /// <summary>
