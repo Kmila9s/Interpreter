@@ -638,6 +638,15 @@ public class DeltaCycleEngine : IDisposable
 
         _currentDelta = 0;
 
+        // Transactions maturing at this time update their signals before any
+        // process resumes (LRM §14.7.5.3): a process woken now reads them. The
+        // changes count as this time's external events below.
+        if (_currentTick > 0 && _signalScheduler.HasPendingUpdates)
+        {
+            CommitDelta();
+            _currentDelta++;
+        }
+
         // F-G-13 MVP (2026-07-18): drain any wait-driven processes ready
         // to wake at this tick. Their signal writes enter SignalScheduler
         // and propagate through the delta cycles below just like any
@@ -812,6 +821,7 @@ public class DeltaCycleEngine : IDisposable
                 if (_cts.IsCancellationRequested)
                     break;
 
+                using var owner = _signalScheduler.OwnedBy(task);
                 if (task is Operation operation)
                 {
                     var scheduledOp = GetScheduledOperation(operation);
@@ -846,6 +856,7 @@ public class DeltaCycleEngine : IDisposable
                 if (_cts.IsCancellationRequested)
                     break;
 
+                using var owner = _signalScheduler.OwnedBy(task);
                 if (task is Operation operation)
                 {
                     if (!_pendingOpsScratch.Contains(operation)) continue;
@@ -859,6 +870,54 @@ public class DeltaCycleEngine : IDisposable
             }
         }
 
+        // 4–7. Commit the delta (drivers, resolution, history, attributes, events).
+        var changedSignals = CommitDelta();
+
+        // 8. Notify process scheduler of changed signals
+        if (changedSignals.Count > 0)
+        {
+            _processScheduler.NotifySignalChanges(changedSignals);
+        }
+
+        // 8b. F-G-13b (Session 23, 2026-07-18): wake any wait-until process
+        // whose sensitivity set intersects the changed signals AND whose
+        // stored condition now evaluates true. Newly-woken processes are
+        // queued at _currentTick; drain them now so their signal writes
+        // enter SignalScheduler and get applied on the NEXT delta cycle
+        // (same tick). Runs AFTER the sensitivity-driven notify so
+        // combinational fanout is already visible; if the condition holds
+        // the process executes its next segment before the tick advances.
+        WakeConditionBlockedProcesses(changedSignals);
+        await DrainReadyProcessWakesAsync();
+
+        // Phase H.3: snapshot the changed-signal set so the NEXT delta
+        // cycle can gate concurrent tasks on it.
+        _lastDeltaChangedSignals = changedSignals;
+
+        // Return true if there's more work to do.
+        //
+        // Including `changedSignals.Count > 0` is load-bearing: concurrent
+        // signal assignments (the items in `_concurrentTasks`) re-evaluate
+        // unconditionally each delta cycle, but the previous exit condition
+        // only checked pending processes/schedule. That meant `cout <= cnt`
+        // computed against the OLD cnt at delta 0 and never got a chance to
+        // re-fire with the new cnt within the same tick — Kmila ended up
+        // emitting the cout update one whole tick later than GHDL.
+        // Counter case 003 exposed this; MAX_DELTA_CYCLES still caps
+        // combinational-loop runaways.
+        // Bench Phase E bug #7 fix (2026-06-02).
+        return _processScheduler.HasPendingProcesses
+            || _signalScheduler.HasPendingUpdates
+            || changedSignals.Count > 0;
+    }
+
+    /// <summary>
+    /// Commits the transactions due now: drivers apply them, signals take their
+    /// resolved value, and the changes are recorded (history with source lines,
+    /// signal attributes, change and frame events). Returns the signals that changed.
+    /// </summary>
+    private HashSet<Variable> CommitDelta()
+    {
         // 4. Apply all scheduled updates. Phase B+ Deep AST: use the
         //    line-aware variant so each change carries the 1-based source
         //    line of the operation that drove it (0 = unknown).
@@ -907,42 +966,7 @@ public class DeltaCycleEngine : IDisposable
             OnFrameEmitted.Invoke(new FrameEmittedArgs(_currentTick, _currentDelta, snapshot, linesCopy));
         }
 
-        // 8. Notify process scheduler of changed signals
-        if (changedSignals.Count > 0)
-        {
-            _processScheduler.NotifySignalChanges(changedSignals);
-        }
-
-        // 8b. F-G-13b (Session 23, 2026-07-18): wake any wait-until process
-        // whose sensitivity set intersects the changed signals AND whose
-        // stored condition now evaluates true. Newly-woken processes are
-        // queued at _currentTick; drain them now so their signal writes
-        // enter SignalScheduler and get applied on the NEXT delta cycle
-        // (same tick). Runs AFTER the sensitivity-driven notify so
-        // combinational fanout is already visible; if the condition holds
-        // the process executes its next segment before the tick advances.
-        WakeConditionBlockedProcesses(changedSignals);
-        await DrainReadyProcessWakesAsync();
-
-        // Phase H.3: snapshot the changed-signal set so the NEXT delta
-        // cycle can gate concurrent tasks on it.
-        _lastDeltaChangedSignals = changedSignals;
-
-        // Return true if there's more work to do.
-        //
-        // Including `changedSignals.Count > 0` is load-bearing: concurrent
-        // signal assignments (the items in `_concurrentTasks`) re-evaluate
-        // unconditionally each delta cycle, but the previous exit condition
-        // only checked pending processes/schedule. That meant `cout <= cnt`
-        // computed against the OLD cnt at delta 0 and never got a chance to
-        // re-fire with the new cnt within the same tick — Kmila ended up
-        // emitting the cout update one whole tick later than GHDL.
-        // Counter case 003 exposed this; MAX_DELTA_CYCLES still caps
-        // combinational-loop runaways.
-        // Bench Phase E bug #7 fix (2026-06-02).
-        return _processScheduler.HasPendingProcesses
-            || _signalScheduler.HasPendingUpdates
-            || changedSignals.Count > 0;
+        return changedSignals;
     }
 
     /// <summary>
@@ -950,6 +974,7 @@ public class DeltaCycleEngine : IDisposable
     /// </summary>
     private async Task ExecuteProcessWithSchedulingAsync(Process process)
     {
+        using var owner = _signalScheduler.OwnedBy(process);
         // Execute process tasks with scheduling
         foreach (var task in process.Tasks)
         {
@@ -982,6 +1007,7 @@ public class DeltaCycleEngine : IDisposable
     /// </summary>
     private async Task ExecuteProcessSegmentAsync(Process process)
     {
+        using var owner = _signalScheduler.OwnedBy(process);
         // F-G-13c (Session 23, 2026-07-18): resume any suspended loop
         // frames first. If the process paused mid-loop on a wait, the
         // stack still holds its iteration state; drain it deepest-first

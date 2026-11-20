@@ -43,6 +43,9 @@ public sealed class ValuePath
     /// <summary>True when no selector depends on run-time values: the span is resolved once.</summary>
     private readonly bool _isStatic;
 
+    /// <summary>True when every index is constant (the part written is known before simulation).</summary>
+    public bool IsStatic => _isStatic;
+
     private Span? _staticSpan;
 
     /// <summary>True when some selector is a record field.</summary>

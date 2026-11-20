@@ -491,7 +491,7 @@ public class Resources
             {
                 // The assigned signal(s): the target, or each element of an aggregate target.
                 foreach (var written in op.WrittenObjects)
-                    if (written.PortType == Constants.PortType.OUT) signals.Add(written);
+                    if (written.PortType is Constants.PortType.OUT or Constants.PortType.INOUT or Constants.PortType.BUFFER) signals.Add(written);
             }
             else if (task is IfStructure ifStruct)
             {

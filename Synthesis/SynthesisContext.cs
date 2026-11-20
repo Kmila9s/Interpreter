@@ -149,7 +149,7 @@ internal sealed class SynthesisContext
     {
         var origin = port.PortType switch {
             PortType.IN => NetOrigin.PortIn,
-            PortType.OUT => NetOrigin.PortOut,
+            PortType.OUT or PortType.BUFFER => NetOrigin.PortOut,
             PortType.INOUT => NetOrigin.PortInOut,
             _ => NetOrigin.PortIn,
         };
@@ -160,7 +160,7 @@ internal sealed class SynthesisContext
             port.Name,
             port.PortType switch {
                 PortType.IN => PortDir.In,
-                PortType.OUT => PortDir.Out,
+                PortType.OUT or PortType.BUFFER => PortDir.Out,
                 PortType.INOUT => PortDir.InOut,
                 _ => PortDir.In,
             },

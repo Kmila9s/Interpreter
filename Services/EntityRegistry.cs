@@ -340,7 +340,11 @@ public class EntityRegistry
             }
             else if (valLower == "inout")
             {
-                portType = Constants.PortType.OUT; // treat as out for now
+                portType = Constants.PortType.INOUT;
+            }
+            else if (valLower == "buffer")
+            {
+                portType = Constants.PortType.BUFFER;
             }
             else if (expectingType)
             {

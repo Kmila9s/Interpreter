@@ -111,12 +111,34 @@ public class Operation : IOperation {
     public AssignmentTarget? Target { get; private set; }
 
     /// <summary>
-    /// Nanosecond inertial-delay captured from `after N &lt;unit&gt;` clauses on
-    /// the RHS of a signal assignment. 0 means "no delay" (the default).
-    /// `ScheduledOperation.Execute` routes through
-    /// `SignalScheduler.ScheduleAfter` when this is set. Bench bug #8.
+    /// The delay mechanism and waveform of a signal assignment
+    /// (<c>y &lt;= transport a after 2 ns, b after 5 ns</c>); null for variable
+    /// assignments and conditions. This operation evaluates the first element's
+    /// value; <see cref="WaveformValues"/> evaluates the others and the delays.
     /// </summary>
-    public long AfterDelayNs { get; set; }
+    public Waveform? Waveform { get; private set; }
+
+    /// <summary>The value expressions of the waveform elements after the first.</summary>
+    private List<Operation>? _laterElements;
+
+    /// <summary>
+    /// The waveform to schedule, given the first element's value
+    /// <paramref name="first"/>: every element with its delay evaluated now.
+    /// </summary>
+    public IReadOnlyList<WaveformElement> WaveformValues(object first)
+    {
+        if (Waveform is not { } w) return [new WaveformElement(first, 0)];
+        var result = new List<WaveformElement>(w.Elements.Count)
+        {
+            new(first, Models.Waveform.DelayNs(w.Elements[0].After, Variables, SourceLine)),
+        };
+        for (int i = 1; i < w.Elements.Count; i++)
+            result.Add(new(_laterElements![i - 1].Evaluate(), Models.Waveform.DelayNs(w.Elements[i].After, Variables, SourceLine)));
+        return result;
+    }
+
+    /// <summary>The pulse-rejection limit in ns (negative = the first delay).</summary>
+    public long RejectNs => Waveform?.Reject is { } r ? Models.Waveform.DelayNs(r, Variables, SourceLine) : -1;
 
     /// <summary>
     /// True for variable assignments (<c>:=</c>) inside a process body.
@@ -188,6 +210,13 @@ public class Operation : IOperation {
                 {
                     Result = foundVar;
                     RawData = splitted[1].Trim();
+                    if (isSignalAssignment)
+                    {
+                        Waveform = Models.Waveform.Parse(RawData);
+                        RawData = Waveform.FirstValue;
+                        if (Waveform.Elements.Count > 1)
+                            _laterElements = [.. Waveform.Elements.Skip(1).Select(e => new Operation(e.Value, this.Variables, SourceLine))];
+                    }
                 }
             }
             else
@@ -400,8 +429,8 @@ public class Operation : IOperation {
     {
         EnsureWritable();
         var value = Evaluate();
-        if (AggregateTarget is { } aggregate) aggregate.Assign(null, value, SourceLine, 0, immediate: true);
-        else if (Target is { IsPartial: true } part) part.Assign(null, value, SourceLine, 0, immediate: true);
+        if (AggregateTarget is { } aggregate) aggregate.Assign(null, value, SourceLine, immediate: true);
+        else if (Target is { IsPartial: true } part) part.Assign(null, value, SourceLine, immediate: true);
         else Result.Value = value;
         return Result;
     }
@@ -439,42 +468,6 @@ public class Operation : IOperation {
             if (currentItem == ";")
             {
                 _currentSyntetizeIndex++;
-                continue;
-            }
-
-            // `after N <unit>` inertial delay. Capture the delay (in ns)
-            // onto the Operation so `ScheduledOperation.Execute` can route
-            // through `SignalScheduler.ScheduleAfter`. The RHS expression
-            // before the `after` keyword is what we'll evaluate at apply
-            // time; everything from `after` onward is metadata.
-            // Bench Phase E bug #8 fix (2026-06-03).
-            if (currentItem.ToLower() == "after")
-            {
-                _currentSyntetizeIndex++; // skip 'after'
-                if (_currentSyntetizeIndex < _data.Length &&
-                    long.TryParse(_data[_currentSyntetizeIndex], out long value))
-                {
-                    _currentSyntetizeIndex++;
-                    if (_currentSyntetizeIndex < _data.Length && IsTimeUnit(_data[_currentSyntetizeIndex]))
-                    {
-                        string unit = _data[_currentSyntetizeIndex].ToLower();
-                        _currentSyntetizeIndex++;
-                        AfterDelayNs = unit switch
-                        {
-                            "fs" => value / 1_000_000L,
-                            "ps" => value / 1_000L,
-                            "ns" => value,
-                            "us" => value * 1_000L,
-                            "ms" => value * 1_000_000L,
-                            "sec" or "s" => value * 1_000_000_000L,
-                            _ => value,
-                        };
-                    }
-                    else
-                    {
-                        AfterDelayNs = value; // assume ns when unit is missing
-                    }
-                }
                 continue;
             }
 

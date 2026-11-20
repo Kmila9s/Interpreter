@@ -21,7 +21,7 @@ namespace Interpreter.Services;
 /// Generate statements holding instances or local declarations are unrolled
 /// first (<see cref="GenerateUnroller"/>, G57).</para>
 /// </remarks>
-public sealed class SourceElaborator
+public sealed partial class SourceElaborator
 {
     // ---------- Public entry points ----------
 
@@ -232,13 +232,26 @@ public sealed class SourceElaborator
             // A formal written with selectors (`p.lo => a`, `v(0) => b`) renames
             // and declares its base port once; each association wires its part.
             // An input left `open` or not associated takes its default (LRM 6.5.6.3): its
-            // alias is declared with the default and has no driver.
+            // alias is declared with the default and has no driver; an output left
+            // `open` gets its own alias too, so it never drives a parent signal of
+            // the same name.
             portMappings.RemoveAll(kv => kv.Value.Equals("open", StringComparison.OrdinalIgnoreCase));
             var associated = portMappings.Select(kv => FormalBase(kv.Key)).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var unassociated = portInfo.Where(p => !p.Value.IsOutput && !associated.Contains(p.Key))
+            var unassociated = portInfo.Where(p => !associated.Contains(p.Key))
                 .Select(p => p.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            // An `inout` formal is its actual (G53): the child reads the resolved
+            // value and its drivers join the actual's, with no copy in either
+            // direction (two copies of a resolved signal would latch each other).
+            var inoutActuals = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var kv in portMappings)
-                rename[FormalBase(kv.Key)] = aliasPrefix + FormalBase(kv.Key);
+            {
+                if (!portInfo.TryGetValue(FormalBase(kv.Key), out var pi) || !pi.IsInout) continue;
+                if (!string.Equals(kv.Key, FormalBase(kv.Key), StringComparison.OrdinalIgnoreCase) || !StaticNameRe().IsMatch(kv.Value.Trim()))
+                    throw new ParserException($"inout port \"{kv.Key}\" of {label} must be associated with a signal name (\"{kv.Value.Trim()}\" is not supported yet)", 0, 0);
+                inoutActuals[kv.Key] = kv.Value.Trim();
+            }
+            foreach (var kv in portMappings)
+                rename[FormalBase(kv.Key)] = inoutActuals.TryGetValue(kv.Key, out var actual) ? actual : aliasPrefix + FormalBase(kv.Key);
             foreach (var formal in unassociated)
                 rename[formal] = aliasPrefix + formal;
 
@@ -276,6 +289,7 @@ public sealed class SourceElaborator
             // Declaration order = association order (the flattened text must stay stable), then the defaults.
             foreach (var formal in portMappings.Select(kv => FormalBase(kv.Key)).Distinct(StringComparer.OrdinalIgnoreCase).Concat(unassociated))
             {
+                if (inoutActuals.ContainsKey(formal)) continue;
                 var aliasName = aliasPrefix + formal;
                 if (portInfo.TryGetValue(formal, out var info))
                 {
@@ -306,6 +320,7 @@ public sealed class SourceElaborator
             {
                 var aliasName = aliasPrefix + kv.Key;
                 var mapped = kv.Value;
+                if (inoutActuals.ContainsKey(kv.Key)) continue;
                 if (!portInfo.TryGetValue(FormalBase(kv.Key), out var info))
                 {
                     bodySb.AppendLine($"  {aliasName} <= {mapped};");
@@ -373,6 +388,8 @@ public sealed class SourceElaborator
     {
         public string TypeText { get; init; } = "STD_LOGIC";
         public bool   IsOutput { get; init; }
+        /// <summary>True for an <c>inout</c> port: renamed to its actual, which it reads and drives.</summary>
+        public bool   IsInout { get; init; }
         /// <summary>The port's default expression (<c>:= …</c>), or null.</summary>
         public string? Default { get; init; }
     }
@@ -415,6 +432,7 @@ public sealed class SourceElaborator
                 {
                     TypeText = type,
                     IsOutput = isOutput,
+                    IsInout = direction == "inout",
                     Default = @default,
                 };
             }
@@ -641,4 +659,8 @@ public sealed class SourceElaborator
         if (j < entityText.Length && entityText[j] == ';') j++;
         return entityText.Remove(open, j - open);
     }
+
+    /// <summary>A signal name, optionally with one static index or range: the actuals an <c>inout</c> formal may take.</summary>
+    [System.Text.RegularExpressions.GeneratedRegex(@"^[A-Za-z]\w*(?:\.[A-Za-z]\w*)*(?:\s*\([^()]*\))?$")]
+    private static partial System.Text.RegularExpressions.Regex StaticNameRe();
 }

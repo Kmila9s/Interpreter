@@ -49,6 +49,38 @@ public static class StdLogic
     /// <summary>VHDL-2008 <c>??</c> (the condition operator): <c>To_X01(c) = '1'</c>.</summary>
     public static bool Condition(char c) => ToX01(c) == '1';
 
+    /// <summary>
+    /// The IEEE 1164 resolution table (<c>resolved</c>), rows and columns in
+    /// <see cref="Values"/> order: <c>U</c> dominates, then <c>X</c>/<c>-</c>, a
+    /// forcing <c>0</c>/<c>1</c> beats the weak values, <c>Z</c> yields to anything.
+    /// </summary>
+    private static readonly string[] ResolutionRows =
+    [
+        "UUUUUUUUU", // U
+        "UXXXXXXXX", // X
+        "UX0X0000X", // 0
+        "UXX11111X", // 1
+        "UX01ZWLHX", // Z
+        "UX01WWWWX", // W
+        "UX01LWLWX", // L
+        "UX01HWWHX", // H
+        "UXXXXXXXX", // -
+    ];
+
+    /// <summary>
+    /// The value of a resolved signal driven by <paramref name="a"/> and
+    /// <paramref name="b"/> (<c>0</c>+<c>1</c> → <c>X</c>, <c>Z</c>+<c>1</c> → <c>1</c>,
+    /// <c>L</c>+<c>H</c> → <c>W</c>); folding it over every driver gives the
+    /// resolution of N drivers (the table is commutative and associative).
+    /// A character outside the nine values resolves to itself when both agree, else <c>X</c>.
+    /// </summary>
+    public static char Resolve(char a, char b)
+    {
+        int i = Values.IndexOf(Norm(a)), j = Values.IndexOf(Norm(b));
+        if (i < 0 || j < 0) return Norm(a) == Norm(b) ? a : 'X';
+        return ResolutionRows[i][j];
+    }
+
     /// <summary><c>not</c>.</summary>
     public static char Not(char a) => Norm(a) == 'U' ? 'U' : ToX01(a) switch { '0' => '1', '1' => '0', _ => 'X' };
 

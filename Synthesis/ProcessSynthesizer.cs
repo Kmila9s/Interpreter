@@ -776,7 +776,7 @@ internal static class ProcessSynthesizer
             ? v.PortType switch
             {
                 Constants.PortType.IN => NetOrigin.PortIn,
-                Constants.PortType.OUT => NetOrigin.PortOut,
+                Constants.PortType.OUT or Constants.PortType.BUFFER => NetOrigin.PortOut,
                 Constants.PortType.INOUT => NetOrigin.PortInOut,
                 _ => NetOrigin.PortIn,
             }

@@ -254,8 +254,8 @@ public class VariableSyntetizer : ISControl
                     {
                         "in" => Constants.PortType.IN,
                         "out" => Constants.PortType.OUT,
-                        "inout" => Constants.PortType.OUT, // Treat inout as out for resource estimation
-                        "buffer" => Constants.PortType.OUT, // Treat buffer as out
+                        "inout" => Constants.PortType.INOUT,
+                        "buffer" => Constants.PortType.BUFFER,
                         _ => Constants.PortType.IN
                     };
                     _streamer.MoveNext(); // Consume direction keyword

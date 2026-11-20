@@ -45,25 +45,51 @@ public sealed partial class AssignmentTarget
 
     /// <summary>
     /// Writes <paramref name="value"/>: immediately for variables
-    /// (<paramref name="immediate"/>), otherwise as a scheduled update — after
-    /// <paramref name="afterNs"/> when given — that keeps statement order. A
-    /// partial write whose selectors do not resolve (dynamic index out of
-    /// range) is dropped.
+    /// (<paramref name="immediate"/>), otherwise as a zero-delay scheduled
+    /// update. A partial write whose selectors do not resolve is dropped.
     /// </summary>
-    public void Assign(SignalScheduler scheduler, object value, int sourceLine, long afterNs, bool immediate)
+    public void Assign(SignalScheduler? scheduler, object value, int sourceLine, bool immediate)
     {
-        (int Start, int Width)? span;
+        if (immediate || scheduler is null)
+        {
+            (int Start, int Width)? span;
+            try
+            {
+                if (!TryEncode(ref value, out span)) return;
+            }
+            catch (SimulationRuntimeException e) { throw e.At(sourceLine); }
+            Write(value, span);
+        }
+        else Schedule(scheduler, [new WaveformElement(value, 0)], sourceLine, DelayMechanism.Inertial, -1);
+    }
+
+    /// <summary>
+    /// Schedules the waveform <paramref name="elements"/> on the current
+    /// process's driver of <see cref="Base"/> (the part named by the selectors,
+    /// resolved now; a dynamic index makes the driver cover the whole object).
+    /// </summary>
+    public void Schedule(SignalScheduler scheduler, IReadOnlyList<WaveformElement> elements, int sourceLine,
+        DelayMechanism mechanism, long rejectNs)
+    {
+        (int Start, int Width)? span = null;
+        var encoded = new WaveformElement[elements.Count];
         try
         {
-            if (!TryEncode(ref value, out span)) return;
+            for (int i = 0; i < elements.Count; i++)
+            {
+                object value = elements[i].Value;
+                if (!TryEncode(ref value, out span)) return;
+                encoded[i] = elements[i] with { Value = value };
+            }
         }
         catch (SimulationRuntimeException e) { throw e.At(sourceLine); }
-        if (immediate)
-            Write(value, span);
-        else if (afterNs > 0)
-            scheduler.ScheduleAfterNs(Base, value, afterNs, sourceLine, span);
-        else
-            scheduler.Schedule(Base, value, sourceLine, span);
+        scheduler.ScheduleWaveform(Base, encoded, sourceLine, span, wholeDriver: IsPartial && !Path.IsStatic, mechanism, rejectNs);
+    }
+
+    /// <summary>Drives <paramref name="value"/> from outside the design (the stimulus of an <c>inout</c> port, see <see cref="SignalScheduler.DriveExternal"/>).</summary>
+    public void DriveExternal(SignalScheduler scheduler, object value)
+    {
+        if (TryEncode(ref value, out var span)) scheduler.DriveExternal(Base, value, span);
     }
 
     /// <summary>Writes <paramref name="value"/> now (variables, external stimulus).</summary>
