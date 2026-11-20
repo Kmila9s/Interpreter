@@ -1,3 +1,4 @@
+using Interpreter.Models;
 using Interpreter.Services;
 using Parser.Models;
 using Parser.Repositories;
@@ -373,30 +374,11 @@ class Program
             // Collect all signals for simulation
             HashSet<Variable> allSignals = [.. entity.Ports, .. entity.Architecture.Signals];
 
-            // Set default values for input ports
+            // This developer runner has no stimulus: inputs start at 0 (didactic policy).
+            InitialValueSeeder.Apply(InitialValuePolicy.Didactic, InitialValueSeeder.ObjectsOf(entity), new HashSet<Variable>());
             Console.WriteLine("Setting up input signals:");
-            foreach (var signal in allSignals)
-            {
-                if (signal.PortType == Parser.Models.Constants.PortType.IN)
-                {
-                    string defaultVal = signal.Size > 1 ? new string('0', signal.Size) : "0";
-
-                    // Special handling for common signal names
-                    if (signal.Name.Equals("reset", StringComparison.OrdinalIgnoreCase) ||
-                        signal.Name.Equals("rst", StringComparison.OrdinalIgnoreCase))
-                    {
-                        defaultVal = "0"; // Active low reset, not asserted
-                    }
-                    else if (signal.Name.Equals("enable", StringComparison.OrdinalIgnoreCase) ||
-                             signal.Name.Equals("en", StringComparison.OrdinalIgnoreCase))
-                    {
-                        defaultVal = "1"; // Enable active
-                    }
-
-                    signal.Value = defaultVal;
-                    Console.WriteLine($"  {signal.Name} = {defaultVal}");
-                }
-            }
+            foreach (var signal in allSignals.Where(s => s.PortType == Parser.Models.Constants.PortType.IN))
+                Console.WriteLine($"  {signal.Name} = {signal.Value}");
             Console.WriteLine();
 
             // Create delta cycle engine

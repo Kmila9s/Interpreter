@@ -115,41 +115,7 @@ public class FastSimulationRunner : IDisposable, ISimulationRunner
             // Collect all signals.
             HashSet<Variable> allSignals = [.. entity.Ports, .. arch.Signals];
 
-            // Seed uninitialized signals to safe defaults (identical policy to
-            // SimulationRunner — see its comments for the rationale).
-            var configuredSignals = new HashSet<Variable>(
-                config.Clocks.Select(c => c.Signal)
-                    .Concat(config.Stimuli.Select(s => s.Signal))
-            );
-
-            foreach (var signal in allSignals)
-            {
-                if (configuredSignals.Contains(signal))
-                    continue;
-
-                string? existing = signal.Value?.ToString();
-                bool needsDefault =
-                    string.IsNullOrEmpty(existing) ||
-                    existing.All(c => c == 'U' || c == 'u') ||
-                    existing == "System.Object";
-                if (!needsDefault && !signal.IsPort)
-                    continue;
-
-                string defaultVal = signal.Size > 1 ? new string('0', signal.Size) : "0";
-
-                if (signal.Name.Equals("reset", StringComparison.OrdinalIgnoreCase) ||
-                    signal.Name.Equals("rst", StringComparison.OrdinalIgnoreCase))
-                {
-                    defaultVal = "0";
-                }
-                else if (signal.Name.Equals("enable", StringComparison.OrdinalIgnoreCase) ||
-                         signal.Name.Equals("en", StringComparison.OrdinalIgnoreCase))
-                {
-                    defaultVal = "1";
-                }
-
-                signal.Value = defaultVal;
-            }
+            InitialValueSeeder.Prepare(config);
 
             _engine = new DeltaCycleEngine();
             _engine.Initialize(allSignals, arch.Tasks);
@@ -216,6 +182,10 @@ public class FastSimulationRunner : IDisposable, ISimulationRunner
                     {
                         clk.Signal.Value = clk.Signal.Value?.ToString() == "1" ? "0" : "1";
                         directlyChanged.Add(clk.Signal);
+                    }
+                    else if (tick == 0)
+                    {
+                        directlyChanged.Add(clk.Signal); // its initial level, set before the loop
                     }
                 }
 

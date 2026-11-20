@@ -75,7 +75,7 @@ public sealed class IndexValue
             _cachedOperation ??= new Services.Operation(Expression!, Scope!);
             return ToInt(_cachedOperation.Evaluate());
         }
-        catch
+        catch (Exception e) when (e is not SimulationRuntimeException)
         {
             return -1;
         }

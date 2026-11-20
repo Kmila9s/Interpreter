@@ -121,10 +121,10 @@ public sealed class AssertStatement : ISControl
             {
                 var op = new Operation(ConditionString, _variables);
                 var result = op.Execute();
-                conditionHolds = EvaluateConditionResult(result);
+                conditionHolds = Truth.Of(result);
             }
         }
-        catch
+        catch (Exception e) when (e is not SimulationRuntimeException)
         {
             // Evaluation failed — treat as failure so the assertion surfaces
             // rather than being silently swallowed. Matches educational
@@ -143,18 +143,5 @@ public sealed class AssertStatement : ISControl
         return Task.CompletedTask;
     }
 
-    /// <summary>
-    /// Mirrors <see cref="ExitStatement.EvaluateConditionResult"/>: accept
-    /// bool / char('1') / string("1"/"true") / Variable wrapping any of these.
-    /// </summary>
-    private static bool EvaluateConditionResult(object? result)
-    {
-        if (result is bool b) return b;
-        if (result is char c) return c == '1';
-        if (result is string s) return s == "1" ||
-                                      s.Equals("true", StringComparison.OrdinalIgnoreCase);
-        if (result is Variable v) return EvaluateConditionResult(v.Value);
-        return false;
-    }
 
 }

@@ -1,3 +1,4 @@
+using Interpreter.Models;
 using System.Text.Json;
 using Interpreter.Services;
 using Parser.Models;
@@ -145,32 +146,12 @@ public static class PracticeExerciseTests
         var entity = entities.FirstOrDefault(e => e.Architecture != null)
                      ?? throw new InvalidOperationException("No entity with architecture");
 
-        // Seed every signal — including outputs and internal signals — to a
-        // safe default. The simulator's expression evaluator dereferences
-        // outputs on the first delta cycle, NRE'ing on plain combinational
-        // assigns like `y <= a and b` if their initial Value is null. This
-        // mirrors what SimulationRunner.RunAsync does for the live app.
+        // Smoke run without stimulus: the didactic policy starts every object at 0
+        // (en/enable at 1); a `load` input is held at 1 so loadable registers move.
         var allSignals = new HashSet<Variable>(entity.Ports.Concat(entity.Architecture!.Signals));
-        foreach (var s in allSignals)
-        {
-            if (s is null) continue;
-            string defaultVal = s.Size > 1 ? new string('0', s.Size) : "0";
-            if (s.PortType == Constants.PortType.IN)
-            {
-                if (s.Name?.Equals("reset", StringComparison.OrdinalIgnoreCase) == true ||
-                    s.Name?.Equals("rst",   StringComparison.OrdinalIgnoreCase) == true)
-                {
-                    defaultVal = "0";
-                }
-                else if (s.Name?.Equals("enable", StringComparison.OrdinalIgnoreCase) == true ||
-                         s.Name?.Equals("en",     StringComparison.OrdinalIgnoreCase) == true ||
-                         s.Name?.Equals("load",   StringComparison.OrdinalIgnoreCase) == true)
-                {
-                    defaultVal = "1";
-                }
-            }
-            try { s.Value = defaultVal; } catch { /* one bad signal shouldn't disqualify */ }
-        }
+        InitialValueSeeder.Apply(InitialValuePolicy.Didactic, InitialValueSeeder.ObjectsOf(entity), new HashSet<Variable>());
+        foreach (var s in entity.Ports.Where(p => p.PortType == Constants.PortType.IN && p.Name.Equals("load", StringComparison.OrdinalIgnoreCase)))
+            s.Value = "1";
 
         using var engine = new DeltaCycleEngine();
         engine.Initialize(allSignals, entity.Architecture.Tasks);

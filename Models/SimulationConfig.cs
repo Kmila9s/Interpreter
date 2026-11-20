@@ -26,6 +26,27 @@ public class SimulationConfig
     /// Stimulus events (value changes at specific ticks).
     /// </summary>
     public List<StimulusEvent> Stimuli { get; init; } = new();
+
+    /// <summary>
+    /// Initial values of input ports set before time 0 (the actual's initial value in a
+    /// testbench): the port starts there, with no event at t=0.
+    /// </summary>
+    public List<StimulusEvent> PortInitials { get; init; } = new();
+
+    /// <summary>How objects declared without <c>:=</c> start (LRM by default).</summary>
+    public InitialValuePolicy InitialValues { get; init; } = InitialValuePolicy.Lrm;
+}
+
+/// <summary>Initial values of objects declared without an explicit <c>:=</c>.</summary>
+public enum InitialValuePolicy
+{
+    /// <summary>IEEE 1076 (like GHDL): every object starts at its declared value or <c>T'left</c> (<c>'U'</c> for std_logic).</summary>
+    Lrm,
+    /// <summary>
+    /// Teaching aid: objects without <c>:=</c> and undriven ports start at 0 (<c>en</c>/<c>enable</c> at 1),
+    /// so a design without reset shows numbers instead of <c>U</c>.
+    /// </summary>
+    Didactic,
 }
 
 /// <summary>

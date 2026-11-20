@@ -33,6 +33,14 @@ public class LiteralsFinder : IFinder{
     /// <returns>True if the item matches the general literal pattern, otherwise false.</returns>
     public bool IsLiteral(string item) => _literals.IsMatch(item);
 
+    /// <summary>A character literal that is not a std_logic value (<c>'a'</c>, <c>' '</c>).</summary>
+    private static bool IsCharacter(string item) =>
+        item.Length == 3 && item[0] == '\'' && item[2] == '\'' && !Interpreter.Models.StdLogic.IsValue(item[1]) && !char.IsDigit(item[1]);
+
+    /// <summary>A string literal whose text is not a bit string (<c>"abc"</c>; <c>"0101"</c> stays a vector).</summary>
+    private static bool IsText(string item) =>
+        item.Length >= 2 && item[0] == '"' && item[^1] == '"' && !Interpreter.Models.StdLogic.IsVector(item[1..^1]);
+
     /// <summary>
     /// Determines the specific data type of a given literal string.
     /// </summary>
@@ -43,6 +51,10 @@ public class LiteralsFinder : IFinder{
             (
                 _stdLogic.IsMatch(item) ?
                     DATATYPES.STD_LOGIC :
+                IsCharacter(item) ?
+                    DATATYPES.CHARACTER :
+                IsText(item) ?
+                    DATATYPES.STRING :
                 _stdLogicVector.IsMatch(item) ?
                     DATATYPES.STD_LOGIC_VECTOR :
                 _decimalOrInteger.IsMatch(item) ?

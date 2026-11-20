@@ -124,19 +124,7 @@ public class WhileLoopStructure : ILoopStructure
             Operation conditionOp = new(ConditionString, _variables);
             var result = conditionOp.Execute();
 
-            // Check if condition is still true
-            if (result is bool boolResult && !boolResult)
-            {
-                break;
-            }
-            else if (result is char charResult && charResult != '1')
-            {
-                break;
-            }
-            else if (result is string strResult && strResult != "1" && strResult.ToLower() != "true")
-            {
-                break;
-            }
+            if (!Truth.Of(result)) break;
 
             if (!await LoopPass.RunAsync(Tasks, LoopLabel)) break;
             iterations++;

@@ -228,7 +228,7 @@ public class Operation : IOperation {
             Console.WriteLine($"  - {item.GetType().Name}: {item}");
         }
 #endif
-        ShuntingYard shuntingYard = new(syntetized);
+        ShuntingYard shuntingYard = new(WithUnarySigns(syntetized));
         Items = shuntingYard.Result.ToArray();
 
         // v1.19.0 (P4/C4+C5): type/width validation for a single-atom assignment
@@ -251,12 +251,42 @@ public class Operation : IOperation {
     }
 
     /// <summary>
+    /// VHDL sign operators: a <c>-</c>/<c>+</c> that starts an expression (first item, or right after
+    /// <c>(</c>, <c>,</c> or another operator) applies to the whole following term, so it reads
+    /// as <c>0 - term</c> / <c>0 + term</c> (<c>a &lt;= -7;</c>, <c>x := -n * 2;</c>). A logical
+    /// operator in that position is a VHDL-2008 unary reduction (<c>and v</c>).
+    /// </summary>
+    private static List<object> WithUnarySigns(List<object> items)
+    {
+        var result = new List<object>(items.Count + 1);
+        foreach (var item in items)
+        {
+            bool prefix = result.Count == 0 || result[^1] is Operator { OperatorName: not ")" };
+            if (prefix && item is Operator { OperatorName: "-" or "+" })
+                result.Add(new Variable($"Literal-{Interlocked.Increment(ref _literalCounter)}", "0", Constants.DATATYPES.INTEGER) { IsConstant = true });
+            else if (prefix && item is Operator op && StdLogic.Binary(op.OperatorName) is not null && !op.OperatorName.StartsWith('?'))
+            {
+                result.Add(new Operator(op.OperatorName).AsReduction());
+                continue;
+            }
+            result.Add(item);
+        }
+        return result;
+    }
+
+    /// <summary>
     /// Evaluates the expression (assignment right-hand side or condition)
     /// against its operands' current values and returns the result without
     /// writing anything. Shared by <see cref="Execute"/> and
     /// <see cref="ScheduledOperation.Run"/>.
     /// </summary>
     public object Evaluate()
+    {
+        try { return EvaluateItems(); }
+        catch (SimulationRuntimeException e) { throw e.At(SourceLine); }
+    }
+
+    private object EvaluateItems()
     {
         Stack<Variable> variables = new();
 
@@ -340,7 +370,9 @@ public class Operation : IOperation {
                         // always returns a bit string; retag the wrapper so
                         // downstream operators (and the LHS assignment) see a
                         // proper STD_LOGIC_VECTOR with the correct Size.
-                        vari.Type = Constants.DATATYPES.STD_LOGIC_VECTOR;
+                        bool text = left.Type is Constants.DATATYPES.STRING or Constants.DATATYPES.CHARACTER
+                            || right.Type is Constants.DATATYPES.STRING or Constants.DATATYPES.CHARACTER;
+                        vari.Type = text ? Constants.DATATYPES.STRING : Constants.DATATYPES.STD_LOGIC_VECTOR;
                         if (vari.Value is string concat) vari.Size = concat.Length;
                     }
                     variables.Push(vari);
@@ -1103,8 +1135,12 @@ public class Operation : IOperation {
         // Determine result type
         Constants.DATATYPES resultType = functionName.ToLower() switch
         {
-            "rising_edge" or "falling_edge" => Constants.DATATYPES.BOOLEAN,
+            "rising_edge" or "falling_edge" or "is_x" or "std_match" => Constants.DATATYPES.BOOLEAN,
             "to_integer" or "conv_integer" or "clog2" => Constants.DATATYPES.INTEGER,
+            "to_x01" or "to_x01z" or "to_ux01" when args.FirstOrDefault() is Variable { Type: Constants.DATATYPES.STD_LOGIC } =>
+                Constants.DATATYPES.STD_LOGIC,
+            "to_stdulogic" => Constants.DATATYPES.STD_LOGIC,
+            "to_bit" => Constants.DATATYPES.BIT,
             _ => Constants.DATATYPES.STD_LOGIC_VECTOR
         };
 

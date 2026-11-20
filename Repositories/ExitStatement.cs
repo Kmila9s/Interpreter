@@ -89,7 +89,7 @@ public class ExitStatement : ISControl
         Operation conditionOp = new(ConditionString, _variables);
         var result = conditionOp.Execute();
 
-        bool shouldExit = EvaluateConditionResult(result);
+        bool shouldExit = Truth.Of(result);
         if (shouldExit)
         {
             throw new ExitException(Label);
@@ -98,23 +98,6 @@ public class ExitStatement : ISControl
         return Task.CompletedTask;
     }
 
-    /// <summary>
-    /// Evaluates a condition result to determine if it represents true.
-    /// </summary>
-    /// <param name="result">The result of a condition evaluation (bool, char, string, or Variable).</param>
-    /// <returns>True if the result represents a true/positive condition.</returns>
-    private static bool EvaluateConditionResult(object? result)
-    {
-        if (result is bool boolResult)
-            return boolResult;
-        if (result is char charResult)
-            return charResult == '1';
-        if (result is string strResult)
-            return strResult == "1" || strResult.Equals("true", StringComparison.OrdinalIgnoreCase);
-        if (result is Variable varResult)
-            return EvaluateConditionResult(varResult.Value);
-        return false;
-    }
 
     /// <summary>
     /// Synthesizes the exit statement from the token stream.

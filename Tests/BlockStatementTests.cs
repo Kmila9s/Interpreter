@@ -1,3 +1,4 @@
+using Interpreter.Models;
 using Interpreter.Repositories;
 using Interpreter.Services;
 using Parser.Models;
@@ -154,11 +155,7 @@ end rtl;";
         var allSignals = new HashSet<Variable>(entity.Ports.Concat(arch.Signals));
         Variable Sig(string n) => allSignals.First(s => s.Name.Equals(n, StringComparison.OrdinalIgnoreCase));
 
-        // Seed defaults so combinational evaluation never dereferences a null.
-        foreach (var s in allSignals)
-        {
-            try { s.Value = s.Size > 1 ? new string('0', s.Size) : "0"; } catch { }
-        }
+        InitialValueSeeder.Apply(InitialValuePolicy.Didactic, InitialValueSeeder.ObjectsOf(entity), new HashSet<Variable>());
 
         using var engine = new DeltaCycleEngine();
         engine.Initialize(allSignals, arch.Tasks);

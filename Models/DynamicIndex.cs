@@ -64,9 +64,13 @@ public class DynamicIndex
         var srcName = Source?.Name ?? "unknown";
         bool element = (Source?.ElementSize ?? 0) > 1;
         int width = element ? Source!.ElementSize : 1;
-        var span = Source is null || vec.Length == 0 || index < 0 ? null : VectorIndexing.Element(Source, index, vec.Length);
-        string value = span is { } s ? vec.Substring(s.Start, s.Width) : new string('U', width);
+        // An unresolvable index (-1) still reads 'U'; a resolved one outside the range is a run-time error.
+        var span = Source is null || vec.Length == 0 || index < 0 ? ((int, int)?)null
+            : VectorIndexing.ElementAtRunTime(Source, index, Math.Max(vec.Length, Source.Size));
+        if (span is { } sp && sp.Item1 + sp.Item2 > vec.Length) span = null;
+        string value = span is { } s ? vec.Substring(s.Item1, s.Item2) : new string('U', width);
         return new Variable(index < 0 ? $"{srcName}_dyn" : $"{srcName}_dyn_{index}", value,
-            element ? Constants.DATATYPES.STD_LOGIC_VECTOR : Constants.DATATYPES.STD_LOGIC);
+            Source?.Type == Constants.DATATYPES.STRING ? Constants.DATATYPES.CHARACTER
+            : element ? Constants.DATATYPES.STD_LOGIC_VECTOR : Constants.DATATYPES.STD_LOGIC);
     }
 }

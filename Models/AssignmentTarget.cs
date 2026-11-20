@@ -52,7 +52,12 @@ public sealed partial class AssignmentTarget
     /// </summary>
     public void Assign(SignalScheduler scheduler, object value, int sourceLine, long afterNs, bool immediate)
     {
-        if (!TryEncode(ref value, out var span)) return;
+        (int Start, int Width)? span;
+        try
+        {
+            if (!TryEncode(ref value, out span)) return;
+        }
+        catch (SimulationRuntimeException e) { throw e.At(sourceLine); }
         if (immediate)
             Write(value, span);
         else if (afterNs > 0)

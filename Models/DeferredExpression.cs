@@ -40,6 +40,7 @@ namespace Interpreter.Models;
 public class DeferredExpression
 {
     private readonly List<object> _items;
+    private DeferredExpression? _tail; // the operand of a leading unary operator
 
     /// <summary>Creates a deferred expression buffering the given RPN items.</summary>
     /// <param name="items">The buffered expression items to defer.</param>
@@ -65,6 +66,15 @@ public class DeferredExpression
     {
         if (_items.Count == 0) return new Variable("__DExprEmpty", "", DATATYPES.STD_LOGIC_VECTOR);
         if (_items.Count == 1) return Services.Operation.ToArgVariablePublic(_items[0]);
+
+        // A leading unary operator (`abs x`, `not x`, `-x`) applies to the rest of the argument.
+        if (_items[0] is Services.Operator { OperatorName: var unary } prefix)
+        {
+            var operand = (_tail ??= new DeferredExpression(_items.GetRange(1, _items.Count - 1))).Evaluate();
+            if (unary is "-" or "+")
+                return new Variable("__DExprSign", prefix.Execute(new Variable("__Zero", "0", DATATYPES.INTEGER), operand), operand.Type);
+            return new Variable("__DExprUnary", prefix.Execute(operand), operand.Type);
+        }
 
         // Sanity-check shape: [operand, op, operand, op, operand, …]. If
         // it doesn't alternate, fall back to items[0] resolved live —

@@ -35,7 +35,7 @@ public static class FieldCodec
     public static string Encode(FieldSlot field, object? value) => field.Kind switch
     {
         FieldKind.Integer => IntegerBits(IntegerOf(value), field.Width),
-        FieldKind.Boolean => Operator.ToBool(value) ? "1" : "0",
+        FieldKind.Boolean => Truth.Of(value) ? "1" : "0",
         FieldKind.Enum => IntegerBits(EnumIndex(field.Shape.EnumLiterals, value), field.Width),
         _ => VectorIndexing.Fit(LogicBits(value, field.Width), field.Width),
     };

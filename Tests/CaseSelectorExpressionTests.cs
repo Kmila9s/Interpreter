@@ -1,3 +1,4 @@
+using Interpreter.Models;
 using Interpreter.Services;
 using Parser.Models;
 
@@ -168,12 +169,7 @@ end architecture behavioral;";
                      ?? throw new InvalidOperationException("No entity with architecture parsed");
 
         var allSignals = new HashSet<Variable>(entity.Ports.Concat(entity.Architecture!.Signals));
-        foreach (var s in allSignals)
-        {
-            if (s is null) continue;
-            string def = s.Size > 1 ? new string('0', s.Size) : "0";
-            try { s.Value = def; } catch { }
-        }
+        InitialValueSeeder.Apply(InitialValuePolicy.Didactic, InitialValueSeeder.ObjectsOf(entity), new HashSet<Variable>());
         // run=1, reset=0 so the counter free-runs.
         foreach (var p in entity.Ports)
         {

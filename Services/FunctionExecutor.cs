@@ -301,7 +301,7 @@ public class FunctionExecutor
                         }
                     }
                     catch (ReturnException) { throw; }
-                    catch { /* partial-progress tolerance */ }
+                    catch (Exception e) when (e is not SimulationRuntimeException) { /* partial-progress tolerance */ }
                 }
                 else if (task is ISControl sControl)
                 {

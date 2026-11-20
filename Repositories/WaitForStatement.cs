@@ -1,3 +1,4 @@
+using Interpreter.Models;
 using Interpreter.Interfaces;
 using Interpreter.Services;
 using Parser.Models;
@@ -178,8 +179,8 @@ public sealed class WaitForStatement : ISControl
     public bool EvaluateCondition()
     {
         if (Condition == null) return IsCondition;
-        var result = Condition.Execute() as Variable;
-        return result?.Value is bool b && b;
+        var result = Condition.Execute();
+        return Truth.Of(result);
     }
 
     /// <summary>No-op; wait timing is handled specially by the engine.</summary>

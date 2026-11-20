@@ -146,7 +146,7 @@ public class SelectedAssignment : ISControl
             if (choice.IsOthers) { defaultChoice = choice; continue; }
             foreach (var choiceVal in choice.Choices)
             {
-                if (ChoicesMatch(choiceVal, selectorValue))
+                if (CaseChoice.Matches(choiceVal, selectorValue, numeric: true))
                 {
                     matched = choice;
                     break;
@@ -171,31 +171,6 @@ public class SelectedAssignment : ISControl
         if (result is Variable varResult)
             return varResult.Value?.ToString() ?? "";
         return result?.ToString() ?? "";
-    }
-
-    /// <summary>
-    /// Cleans a value by removing quotes.
-    /// </summary>
-    /// <param name="value">The value to clean.</param>
-    /// <returns>The value with single and double quotes removed and whitespace trimmed.</returns>
-    private static string CleanValue(string value)
-    {
-        return value.Replace("\"", "").Replace("'", "").Trim();
-    }
-
-    /// <summary>
-    /// Numeric-first alternative match for with…select. Tries both sides as
-    /// integers (accepting bit-string, decimal, or hex); falls back to case-
-    /// insensitive string equality when either side isn't numeric. Closes
-    /// STATUS §1: `when 0|1|7` vs. an `std_logic_vector` selector.
-    /// </summary>
-    private static bool ChoicesMatch(string choiceVal, string selectorValue)
-    {
-        var a = CleanValue(choiceVal);
-        var b = CleanValue(selectorValue);
-        if (HdlLiteral.TryParseInt(a, out long ai) && HdlLiteral.TryParseInt(b, out long bi))
-            return ai == bi;
-        return a.Equals(b, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
