@@ -62,6 +62,18 @@ public partial class Process : ISControl
     /// </summary>
     public bool HasWait { get; private set; } = false;
 
+    /// <summary>1-based source line of the <c>process</c> keyword (0 for an equivalent process).</summary>
+    public int SourceLine { get; private set; }
+
+    /// <summary>True when the process was written with a sensitivity list (<c>process (…)</c>, also <c>process (all)</c>).</summary>
+    public bool HasSensitivityList { get; private set; }
+
+    /// <summary>True for the equivalent process of a concurrent statement (assertion, procedure call).</summary>
+    public bool IsEquivalent { get; private set; }
+
+    /// <summary>True for VHDL-2008 <c>process (all)</c>: sensitive to every signal its statement part reads.</summary>
+    private bool _sensitiveToAll;
+
     /// <summary>
     /// F-G-13d (Phase 2, 2026-07-22): tracks whether the process has
     /// yielded (via any wait) since the last time it started iterating
@@ -109,27 +121,6 @@ public partial class Process : ISControl
     private readonly TypeRegistry? _types;
 
     /// <summary>
-    /// Every signal of <paramref name="scope"/> named in <paramref name="texts"/> —
-    /// the implicit sensitivity of an equivalent process or of <c>wait until</c>.
-    /// String literals are ignored; constants are not signals.
-    /// </summary>
-    internal static IEnumerable<Variable> SignalsNamedIn(IEnumerable<string> texts, HashSet<Variable> scope)
-    {
-        foreach (var text in texts)
-            foreach (System.Text.RegularExpressions.Match m in NameRegex().Matches(StringLiteralRegex().Replace(text, "")))
-            {
-                var signal = scope.FirstOrDefault(v => v is not null && !v.IsConstant && v.Name.Equals(m.Value, StringComparison.OrdinalIgnoreCase));
-                if (signal is not null) yield return signal;
-            }
-    }
-
-    [System.Text.RegularExpressions.GeneratedRegex(@"[A-Za-z_]\w*")]
-    private static partial System.Text.RegularExpressions.Regex NameRegex();
-
-    [System.Text.RegularExpressions.GeneratedRegex("\"[^\"]*\"")]
-    private static partial System.Text.RegularExpressions.Regex StringLiteralRegex();
-
-    /// <summary>
     /// The equivalent process of a concurrent statement (LRM §11.4/§11.5: concurrent
     /// assertion and procedure call): runs <paramref name="statement"/> at
     /// initialisation and on every event of the signals the statement reads.
@@ -142,7 +133,8 @@ public partial class Process : ISControl
     {
         var process = new Process(scope, null!) { Label = label };
         process.Tasks.Add(statement);
-        process.SensitiveList.UnionWith(SignalsNamedIn(reads, scope));
+        process.SensitiveList.UnionWith(ImplicitSensitivity.SignalsIn(reads, scope));
+        process.IsEquivalent = true;
         return process;
     }
 
@@ -210,6 +202,7 @@ public partial class Process : ISControl
         cancellationToken.ThrowIfCancellationRequested();
 
         VariableSyntetizer syntetizer = new(_streamer, SignalsPorts, TypeRegistry: _types);
+        SourceLine = _streamer.Current?.SourceLine ?? 0;
         SyntentizeSensitiveList();
 
         progress.ReportPhase(0.3f, $"Sensitivity list: {SensitiveList.Count} signal(s)", ProcessingPhase.ParsingProcess);
@@ -336,11 +329,17 @@ public partial class Process : ISControl
         if (_streamer.Current?.Value == "(")
         {
             _streamer.Expect(PARENTHESIS);
+            HasSensitivityList = true;
+            if (string.Equals(_streamer.Current?.Value, "all", StringComparison.OrdinalIgnoreCase))
+            {
+                _sensitiveToAll = true;   // VHDL-2008: filled from the statement part
+                _streamer.MoveNext();
+            }
             while (_streamer.Current?.Value != ")")
             {
                 string varName = _streamer.Current?.Value ?? string.Empty;
                 _streamer.Expect(IDENTIFIERS);
-                var variable = SignalsPorts.FirstOrDefault(p => p.Name.Equals(varName));
+                var variable = SignalsPorts.FirstOrDefault(p => p.Name.Equals(varName, StringComparison.OrdinalIgnoreCase));
                 if (variable is null)
                     throw ParserException.UndeclaredVariable(varName, _streamer.Previous);
                 else
@@ -367,8 +366,14 @@ public partial class Process : ISControl
     {
         // Signals/ports plus the process-local variables.
         HashSet<Variable> allVariables = [.. SignalsPorts, .. _variables];
+        int start = _streamer.Position;
         new SequentialStatementReader(_streamer, allVariables, SequentialBody.Process, cancellationToken)
             .ReadUntil(Tasks, "end");
+        // process (all): the signals the statement part reads (GHDL: not those read
+        // only inside the subprograms it calls).
+        if (_sensitiveToAll)
+            SensitiveList.UnionWith(ImplicitSensitivity.SignalsIn(
+                [ImplicitSensitivity.ReadText(_streamer.Slice(start, _streamer.Position))], SignalsPorts));
         EndClause.Consume(_streamer, "process", Label, allowPostponed: true);
     }
 }

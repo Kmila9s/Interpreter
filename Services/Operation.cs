@@ -50,7 +50,7 @@ public enum SignalAttributeType
 /// <see cref="ScheduledOperation.Execute"/> has a twin dispatch loop that
 /// must stay in sync when new item kinds land.
 /// </remarks>
-public class Operation : IOperation {
+public class Operation : IOperation, IConcurrentStatement {
     /// <summary>
     /// Gets the result of the operation.
     /// </summary>
@@ -1248,6 +1248,25 @@ public class Operation : IOperation {
     /// <c>Items</c> — <see cref="Execute()"/> switches on the type and
     /// invokes <c>Evaluate</c> per fire.
     /// </remarks>
+    /// <inheritdoc/>
+    public IEnumerable<string> ReadTexts => [TargetSelectors(_rawData), RawRhs];
+
+    /// <summary>
+    /// The selectors of an assignment's target (<c>(addr)</c> of <c>mem(addr) &lt;= d</c>):
+    /// read by the statement, unlike the target's name. Empty for an aggregate target.
+    /// </summary>
+    internal static string TargetSelectors(string statement)
+    {
+        int opIdx = statement.IndexOf("<=", StringComparison.Ordinal);
+        if (opIdx < 0) opIdx = statement.IndexOf(":=", StringComparison.Ordinal);
+        if (opIdx < 0) return string.Empty;
+        string lhs = statement[..opIdx].Trim();
+        if (lhs.StartsWith('(')) return string.Empty;
+        int end = 0;
+        while (end < lhs.Length && (char.IsLetterOrDigit(lhs[end]) || lhs[end] == '_')) end++;
+        return lhs[end..];
+    }
+
     /// <summary>The assignment's right-hand side as written (empty when there is no <c>&lt;=</c>/<c>:=</c>).</summary>
     private string RawRhs
     {

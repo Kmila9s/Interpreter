@@ -19,7 +19,7 @@ namespace Interpreter.Services;
 /// <item>Only then does simulation time advance</item>
 /// </list>
 /// </remarks>
-public class DeltaCycleEngine : IDisposable
+public partial class DeltaCycleEngine : IDisposable
 {
     /// <summary>
     /// Signal update scheduling.
@@ -52,16 +52,6 @@ public class DeltaCycleEngine : IDisposable
     /// </summary>
     private readonly Dictionary<Operation, ScheduledOperation> _scheduledOpCache = new();
 
-    /// <summary>
-    /// Phase H.3: per-Operation cache of input-signal sets. Concurrent
-    /// assignments re-evaluate only when one of their inputs changed in
-    /// the previous delta cycle, so we look this up once per task and
-    /// intersect with [[_lastDeltaChangedSignals]]. A null entry means
-    /// "inputs not statically determinable" (e.g. the Operation reads a
-    /// DeferredFunction whose argument list may include arbitrary live
-    /// signals) — those run unconditionally.
-    /// </summary>
-    private readonly Dictionary<Operation, HashSet<Variable>?> _operationInputs = new();
 
     /// <summary>
     /// Phase H.3: signals that committed new values in the most recent
@@ -72,32 +62,22 @@ public class DeltaCycleEngine : IDisposable
     private HashSet<Variable>? _lastDeltaChangedSignals = null;
 
     /// <summary>
-    /// F-G-08 pass 2 (2026-07-16): reverse index from Variable → concurrent
-    /// Operations that read it. Built once in <see cref="Initialize"/> from
-    /// the static input scan performed by <see cref="GetOperationInputs"/>.
-    /// Reference-keyed by Variable (single-instance-per-signal invariant is
-    /// guaranteed by the parser; see project memory).
-    /// Replaces the previous per-task <c>inputs.Overlaps(changed)</c> loop
-    /// (O(#tasks × avg-inputs)) with a per-changed-signal fanout walk
-    /// (O(|changed| × avg-fanout)).
+    /// Reverse index from a signal to the concurrent statements (simple,
+    /// conditional and selected assignments) sensitive to it, built once in
+    /// <see cref="Initialize"/> from <see cref="SensitivityOf"/>. Keyed by
+    /// <see cref="Variable"/> name equality (one object per elaborated signal).
     /// </summary>
-    private readonly Dictionary<Variable, List<Operation>> _signalToOps = new();
+    private readonly Dictionary<Variable, List<object>> _signalToOps = new();
 
     /// <summary>
-    /// F-G-08 pass 2: Operations whose static input set couldn't be resolved
-    /// (DeferredFunction / expression-mode DynamicIndex). Always enqueued on
-    /// every non-first delta — matches the pre-index <c>inputs == null</c>
-    /// unconditional-run guard.
+    /// Concurrent statements whose value can change without an event on a signal
+    /// they name (<c>'stable(T)</c>, <c>'quiet</c>, <c>'delayed</c>, <c>now</c>):
+    /// enqueued on every delta.
     /// </summary>
-    private readonly List<Operation> _alwaysRunOps = new();
+    private readonly List<object> _alwaysRunOps = new();
 
-    /// <summary>
-    /// F-G-08 pass 2: per-delta scratch set of Operations to execute. Cleared
-    /// and refilled from <see cref="_signalToOps"/> + <see cref="_alwaysRunOps"/>
-    /// at the top of each gated delta. Reused across deltas to dodge the
-    /// per-delta allocation.
-    /// </summary>
-    private readonly HashSet<Operation> _pendingOpsScratch = new();
+    /// <summary>Per-delta scratch set of the sensitive statements to execute (reference identity).</summary>
+    private readonly HashSet<object> _pendingOpsScratch = new(ReferenceEqualityComparer.Instance);
 
     /// <summary>
     /// F-G-13 MVP (2026-07-18): time-scheduled process wakes. Populated at
@@ -429,66 +409,20 @@ public class DeltaCycleEngine : IDisposable
     }
 
     /// <summary>
-    /// Phase H.3: returns the set of Variables an Operation reads, computed
-    /// once and cached. A null return means "inputs aren't statically
-    /// known" (e.g. the Operation holds a DeferredFunction that may invoke
-    /// a user function reading arbitrary signals) — caller must run the
-    /// operation unconditionally in that case.
+    /// The implicit sensitivity of a concurrent statement (LRM §11.6): the signals
+    /// named in its text, never those read inside a function it calls (G62). Null
+    /// when its value can change without an event on them (implicit signals
+    /// <c>'stable</c>/<c>'quiet</c>/<c>'delayed</c>/<c>'transaction</c>, <c>now</c>).
     /// </summary>
-    private HashSet<Variable>? GetOperationInputs(Operation op)
+    private static HashSet<Variable>? SensitivityOf(IConcurrentStatement statement, HashSet<Variable> scope)
     {
-        if (_operationInputs.TryGetValue(op, out var cached)) return cached;
-        var inputs = new HashSet<Variable>();
-        bool dynamic = false;
-        foreach (var item in op.Items)
-        {
-            switch (item)
-            {
-                case Variable v:
-                    if (!string.IsNullOrEmpty(v.Name)) inputs.Add(v);
-                    break;
-                case Models.DeferredIndex di:
-                    if (di.Source is not null) inputs.Add(di.Source);
-                    break;
-                case Models.DynamicIndex dyni:
-                    if (dyni.Source is not null) inputs.Add(dyni.Source);
-                    if (dyni.Index.Source is not null) inputs.Add(dyni.Index.Source);
-                    // Expression-mode DynamicIndex may read any signal in
-                    // its scope. Mark dynamic so we run unconditionally.
-                    if (dyni.Index.Expression != null) dynamic = true;
-                    break;
-                case Models.IDeferredOperand deferred:
-                    if (deferred.Inputs is { } reads) inputs.UnionWith(reads);
-                    else dynamic = true;
-                    break;
-                case Models.DeferredFunction:
-                    // User / deferred function args reach into call-time
-                    // state. Treat as dynamic to be safe.
-                    dynamic = true;
-                    break;
-                case Models.DeferredUserFunction:
-                    // Tier 4.3 exposure (2026-07-28): concurrent assigns of
-                    // shape `y <= userFn(a,b);` had no _signalToOps entry
-                    // because the DeferredUserFunction was silently skipped
-                    // by this switch — `y` never updated when a/b changed
-                    // (the arg-string signals are hidden inside the wrapper
-                    // and aren't emitted as Variable items). Treat as dynamic;
-                    // args are re-parsed against live scope on every Evaluate.
-                    dynamic = true;
-                    break;
-                case Models.DeferredAttribute:
-                    // Tier 4.1 close-out companion: same shape — the attr's
-                    // handler reads live SignalAttributeHandler state on every
-                    // Execute, so the enclosing op must run every delta.
-                    dynamic = true;
-                    break;
-            }
-            if (dynamic) break;
-        }
-        HashSet<Variable>? result = dynamic ? null : inputs;
-        _operationInputs[op] = result;
-        return result;
+        var texts = statement.ReadTexts.ToList();
+        if (texts.Any(t => TimeDependent().IsMatch(t))) return null;
+        return [.. ImplicitSensitivity.SignalsIn(texts, scope)];
     }
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"'\s*(stable|quiet|delayed|transaction)\b|\bnow\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase)]
+    private static partial System.Text.RegularExpressions.Regex TimeDependent();
 
     /// <summary>The concurrent tasks with every (nested) generate replaced by its statements.</summary>
     private static List<object> FlattenGenerates(List<object> tasks)
@@ -562,6 +496,13 @@ public class DeltaCycleEngine : IDisposable
                 {
                     ScheduleProcessWake(process, atTick: 0);
                 }
+                else if (!process.HasSensitivityList && !process.IsEquivalent)
+                {
+                    // GHDL warns at analysis and then loops for ever at time 0.
+                    throw new SimulationRuntimeException(
+                        "a process without a sensitivity list or a wait statement never suspends (infinite loop at time 0)",
+                        process.SourceLine);
+                }
                 else
                 {
                     _processScheduler.RegisterProcess(process);
@@ -577,28 +518,19 @@ public class DeltaCycleEngine : IDisposable
         _alwaysRunOps.Clear();
         foreach (var task in tasks)
         {
-            if (task is not Operation op) continue;
-            var inputs = GetOperationInputs(op);
+            if (task is not IConcurrentStatement statement) continue;
+            var inputs = SensitivityOf(statement, signals);
             if (inputs == null)
             {
-                // Dynamic — must run every delta.
-                _alwaysRunOps.Add(op);
+                _alwaysRunOps.Add(task);
                 continue;
             }
-            if (inputs.Count == 0)
-            {
-                // Constant RHS — only the first-delta runAll pass fires it.
-                // Matches the pre-index `inputs.Count == 0 → continue` short-circuit.
-                continue;
-            }
+            // A statement reading no signal runs only at initialisation (first delta).
             foreach (var v in inputs)
             {
                 if (!_signalToOps.TryGetValue(v, out var list))
-                {
-                    list = new List<Operation>();
-                    _signalToOps[v] = list;
-                }
-                list.Add(op);
+                    _signalToOps[v] = list = new List<object>();
+                list.Add(task);
             }
         }
 
@@ -856,10 +788,10 @@ public class DeltaCycleEngine : IDisposable
                 if (_cts.IsCancellationRequested)
                     break;
 
+                if (task is IConcurrentStatement && !_pendingOpsScratch.Contains(task)) continue;
                 using var owner = _signalScheduler.OwnedBy(task);
                 if (task is Operation operation)
                 {
-                    if (!_pendingOpsScratch.Contains(operation)) continue;
                     var scheduledOp = GetScheduledOperation(operation);
                     scheduledOp.Execute();
                 }

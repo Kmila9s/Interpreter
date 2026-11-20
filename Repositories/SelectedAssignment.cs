@@ -47,7 +47,7 @@ public class SelectionChoice
 /// The 'others' clause provides a default value.
 /// </para>
 /// </remarks>
-public class SelectedAssignment : ISControl
+public class SelectedAssignment : ISControl, IConcurrentStatement
 {
     /// <summary>The variables in scope during selector and value evaluation.</summary>
     private readonly HashSet<Variable> _variables;
@@ -83,6 +83,10 @@ public class SelectedAssignment : ISControl
     /// Gets the list of selection choices.
     /// </summary>
     public List<SelectionChoice> Choices { get; private set; } = new();
+
+    /// <inheritdoc/>
+    public IEnumerable<string> ReadTexts =>
+        [Operation.TargetSelectors(_target.Text + " <="), SelectorExpression, .. Choices.Select(c => c.ValueExpression)];
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SelectedAssignment"/> class.

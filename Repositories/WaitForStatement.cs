@@ -164,7 +164,7 @@ public sealed class WaitForStatement : ISControl
         else
         {
             // Implicit sensitivity of `wait until`: every signal named in the condition.
-            Sensitivity.UnionWith(Process.SignalsNamedIn(until, _variables));
+            Sensitivity.UnionWith(ImplicitSensitivity.SignalsIn(until, _variables));
         }
 
         // Nothing can wake the process: it halts, like a bare wait.

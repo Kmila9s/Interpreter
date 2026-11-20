@@ -48,7 +48,7 @@ public class ConditionalBranch
 /// determines the assigned value. If no condition is true, the default value is used.
 /// </para>
 /// </remarks>
-public class ConditionalAssignment : ISControl
+public class ConditionalAssignment : ISControl, IConcurrentStatement
 {
     /// <summary>The variables in scope during condition and value evaluation.</summary>
     private readonly HashSet<Variable> _variables;
@@ -77,6 +77,10 @@ public class ConditionalAssignment : ISControl
     /// Gets the list of conditional branches.
     /// </summary>
     public List<ConditionalBranch> Branches { get; private set; } = new();
+
+    /// <inheritdoc/>
+    public IEnumerable<string> ReadTexts =>
+        [Operation.TargetSelectors(_target.Text + " <="), .. Branches.Select(b => b.ValueExpression), .. Branches.Select(b => b.ConditionExpression ?? string.Empty)];
 
     /// <summary>
     /// Initializes a new instance of the <see cref="ConditionalAssignment"/> class.

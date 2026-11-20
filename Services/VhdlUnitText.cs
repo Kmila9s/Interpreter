@@ -35,8 +35,19 @@ internal static class VhdlUnitText
                 var t = nm.Trim();
                 if (!string.IsNullOrEmpty(t)) names.Add(t.ToLowerInvariant());
             }
+        // Subprograms too: each inlined instance gets its own copy, bound to its
+        // own signals (G67) instead of every instance sharing the last one.
+        foreach (Match sp in SubprogramDeclRe.Matches(decl))
+        {
+            string name = sp.Groups["name"].Value.ToLowerInvariant();
+            if (!names.Contains(name)) names.Add(name);
+        }
         return names;
     }
+
+    private static readonly Regex SubprogramDeclRe = new(
+        @"\b(?:pure\s+|impure\s+)?(?:function|procedure)\s+(?<name>[A-Za-z]\w*)",
+        RegexOptions.IgnoreCase);
 
     // Splits the body of a `port(...)` or `generic(...)` block into
     // individual identifier names. Each clause looks like
