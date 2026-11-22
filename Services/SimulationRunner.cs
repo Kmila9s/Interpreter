@@ -142,7 +142,7 @@ public class SimulationRunner : IDisposable, ISimulationRunner
             // false at tick 0, so process bodies that depend on it (e.g.
             // a 052-style PISO with `Q<=r(3)` outside the edge gate) miss
             // their first load.
-            _engine = new DeltaCycleEngine();
+            _engine = new DeltaCycleEngine { TickResolutionNs = config.TickResNs };
             _engine.Initialize(allSignals, arch.Tasks);
 
             // F-G-08 pass 3 diag (2026-07-16): propagate the runner's cancel

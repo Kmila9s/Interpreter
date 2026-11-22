@@ -50,11 +50,10 @@ public sealed partial class Waveform
             int after = TopLevelAfter(part);
             elements.Add(after < 0 ? (part.Trim(), null) : (part[..after].Trim(), part[(after + 5)..].Trim()));
         }
-        return new Waveform
-        {
-            Mechanism = mechanism, Reject = reject, Elements = elements,
-            _folded = [.. elements.Select(e => e.After is null ? 0L : TimeValue.TryEvaluateNs(e.After, null, out double ns) ? (long?)Math.Round(ns) : null)],
-        };
+        long?[] folded = [.. elements.Select(e => e.After is null ? 0L : TimeValue.TryEvaluateNs(e.After, null, out double ns) ? (long?)Math.Round(ns) : null)];
+        foreach (var delay in folded)
+            if (delay is long ns) Services.DesignTimeGrid.Instance.Note(ns);
+        return new Waveform { Mechanism = mechanism, Reject = reject, Elements = elements, _folded = folded };
     }
 
     /// <summary>

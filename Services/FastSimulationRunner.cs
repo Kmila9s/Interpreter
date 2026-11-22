@@ -117,7 +117,7 @@ public class FastSimulationRunner : IDisposable, ISimulationRunner
 
             InitialValueSeeder.Prepare(config);
 
-            _engine = new DeltaCycleEngine();
+            _engine = new DeltaCycleEngine { TickResolutionNs = config.TickResNs };
             _engine.Initialize(allSignals, arch.Tasks);
 
             _cts.Token.Register(() => _engine?.Stop());

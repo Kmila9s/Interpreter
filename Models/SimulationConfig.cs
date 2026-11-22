@@ -18,6 +18,12 @@ public class SimulationConfig
     public ulong TotalTicks { get; init; }
 
     /// <summary>
+    /// Nanoseconds per tick: what every tick count in this configuration is in,
+    /// and what the engine converts <c>after</c>/<c>wait for</c> delays with.
+    /// </summary>
+    public int TickResNs { get; init; } = 10;
+
+    /// <summary>
     /// Clock signal configurations (auto-toggling clocks).
     /// </summary>
     public List<ClockConfig> Clocks { get; init; } = new();
