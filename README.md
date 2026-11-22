@@ -73,7 +73,7 @@ This specific module, the **VHDL Interpreter**, is the execution engine of the s
 *   **Progress / cancellation:** `ProgressReporter` (singleton, event-based) drives Editor build-status UI; `CancellationToken` is threaded through the synthesis and run pipeline.
 *   **Test status:** Two independent test surfaces exist today (see §7):
     1.  The historic console corpus driven by `Program.cs` — now **54 `test*.vhdl` fixtures** (numbered through `test41`, plus named variants) — of which the old *80 % (16/20)* figure quoted in the changelog is a **v0.15.0 snapshot over the first 20 fixtures only** and has **not** been re-measured since; re-run `Program.cs` against the corpus to obtain a current number.
-    2.  A first-class **xUnit suite under `Interpreter/Tests/`** (`DeltaCycleEngineTests`, `SynthesisTests`, `NestedIEEECallTests`, `IEEEPrimitivesTests`, `IEEELibraryLoaderTests`, `IEEELoweringEndToEndTests`, `LibraryCompilerTests`, `PortStrictnessTests`, `PracticeExerciseTests`, `VcdComparison`) run via `dotnet test`. This is the authoritative regression surface; the console corpus is a smoke/exploration harness.
+    2.  The engine suites (`DeltaCycleEngineTests`, `SynthesisTests`, `NestedIEEECallTests`, `IEEEPrimitivesTests`, `IEEELibraryLoaderTests`, `IEEELoweringEndToEndTests`, `LibraryCompilerTests`, `PortStrictnessTests`, `SyntaxStrictnessTests`, `CaseSelectorExpressionTests`, `BlockStatementTests`) in `kmila-9s/Tests` (`Unit/Kmila.Engine.Tests/Interpreter/`, since v3.0.10) run via `dotnet test`. This is the authoritative regression surface; the console corpus is a smoke/exploration harness.
 
 ### Core Responsibilities
 *   **Expression Evaluation:** Calculating results of arithmetic, logical, and relational operations using the Shunting-yard algorithm with proper operator precedence
@@ -1072,14 +1072,15 @@ foreach (var entity in entities)
 
 There are **two test surfaces** today:
 
-#### 7.1. Engine unit suites (`Interpreter/Tests/`) — authoritative
+#### 7.1. Engine unit suites — authoritative
 
-Hand-rolled suites compiled into this project and run with
-`dotnet run -c Release -f net10.0 -- --test-delta` from the module root (the
-GHDL reference VCDs `reference_*.vcd` and `test_*.vhdl` fixtures are read from
-there). The process exit code is the total failure count; a test that throws
-counts as a failure without aborting the rest. Runs in CI since v3.0.4.
-(Moving them to an xUnit project is tracked in the multi-HDL handoff.)
+Since v3.0.10 the suites live in `kmila-9s/Tests` (`Unit/Kmila.Engine.Tests/Interpreter/`,
+one xUnit fact per suite, `dotnet test Unit/Kmila.Engine.Tests -f net10.0 -p:TargetFrameworks=net10.0`)
+instead of this shipping assembly (`--test-delta` is gone). The four GHDL comparisons
+(counter, delta swap, combinational, shift register) became fixture cases in
+`Unit/Kmila.Shared.Tests/Fixtures/Cases/delta/` that really simulate Kmila against the GHDL
+golden; the practice-solution sweep is `PracticeValidator`'s job. The tables below
+describe the suites as they were moved.
 
 | Test file | Focus |
 |-----------|-------|
@@ -1090,8 +1091,6 @@ counts as a failure without aborting the rest. Runs in CI since v3.0.4.
 | `IEEELibraryLoaderTests` / `IEEELoweringEndToEndTests` | IEEE library load + end-to-end lowering |
 | `LibraryCompilerTests` | Cross-module LibraryCompiler resolution/build |
 | `PortStrictnessTests` | Port direction / connectivity strictness |
-| `PracticeExerciseTests` | Practice-grader integration cases |
-| `VcdComparison` | VCD golden comparison (waveform equivalence) |
 
 > The `FastSimulationRunner` ↔ `SimulationRunner` byte-for-byte equivalence is covered by VCD-diff / equivalence tests (see the `Fast mode` notes in §2).
 
@@ -1099,7 +1098,7 @@ counts as a failure without aborting the rest. Runs in CI since v3.0.4.
 
 The corpus has grown to **54 `test*.vhdl` fixtures** (numbered through `test41`, plus named variants). It is a smoke/exploration harness, not a pass/fail gate. Rough coverage of the first fixtures:
 
-> **Repository hygiene:** `Program.cs.1` and `run_delta_tests.cs` were removed in v3.0.1. The `reference_*.vcd` files in the module root are **used** by `DeltaCycleEngineTests` (GHDL goldens); `counter_sim.vcd`, `test_output.vcd` and `test_*_counter.vcd` are scratch output.
+> **Repository hygiene:** `Program.cs.1` and `run_delta_tests.cs` were removed in v3.0.1. Since v3.0.10 the GHDL goldens (`reference_*.vcd`) live with their fixture cases in `kmila-9s/Tests` and every `*.vcd` here is untracked scratch output (`--sim`).
 
 | Tests | Coverage |
 |-------|----------|

@@ -5,3 +5,5 @@ launch.json
 task.json
 *.cs.*
 .codeviz/
+# Simulation output (`--sim` writes <design>.vcd next to the source)
+*.vcd
