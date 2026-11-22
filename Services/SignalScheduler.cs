@@ -183,7 +183,7 @@ public class SignalScheduler
             var driver = DriverOf(signal, ExternalOwner, span, wholeDriver: false, line: 0);
             driver.Value = span is { } part
                 ? VectorIndexing.Write(target, driver.Value?.ToString() ?? string.Empty, part, value?.ToString() ?? string.Empty)
-                : ExpandAggregateMarker(value!, target);
+                : HdlLiteral.ExpandOthers(value!, target.Size);
             target.Value = Resolved(signal);
         }
     }
@@ -293,15 +293,6 @@ public class SignalScheduler
     public HashSet<Variable> ApplyCurrentUpdates() => new(ApplyCurrentUpdatesWithLines().Keys);
 
     /// <summary>
-    /// Expands an <c>(others=>X)</c> aggregate marker to a literal bit string of
-    /// the target's declared width.
-    /// </summary>
-    private static object ExpandAggregateMarker(object newValue, Variable target) =>
-        target.Size > 0 && HdlLiteral.TryOthersFill(newValue as string, out char fill)
-            ? new string(fill, target.Size)
-            : newValue;
-
-    /// <summary>
     /// Commits the delta: the signals whose value changed, each with the 1-based
     /// source line of the last transaction that drove it (0 when unknown).
     /// </summary>
@@ -336,7 +327,7 @@ public class SignalScheduler
                         driver.Value = t.Span is { } part
                             ? VectorIndexing.Write(signal.Signal, driver.Value?.ToString() ?? string.Empty,
                                                    part, t.Value?.ToString() ?? string.Empty)
-                            : ExpandAggregateMarker(t.Value, signal.Signal);
+                            : HdlLiteral.ExpandOthers(t.Value, signal.Signal.Size);
                         if (t.Line > 0) line = t.Line;
                     }
                     if (n > 0) w.RemoveRange(0, n);

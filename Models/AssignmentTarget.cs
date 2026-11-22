@@ -106,7 +106,13 @@ public sealed partial class AssignmentTarget
     private bool TryEncode(ref object value, out (int Start, int Width)? span)
     {
         span = null;
-        if (!IsPartial) { CheckBounds(value); return true; }
+        if (!IsPartial)
+        {
+            // G87: a whole vector write stores the bits, never the `(others=>X)` marker.
+            if (Base.Layout is null && Base.ElementSize == 0) value = HdlLiteral.ExpandOthers(value, Base.Size);
+            CheckBounds(value);
+            return true;
+        }
         if (Path.Resolve() is not { } at) return false;
         span = (at.Start, at.Width);
         value = at.Field is { } field ? FieldCodec.Encode(field, value) : FieldCodec.LogicBits(value, at.Width);

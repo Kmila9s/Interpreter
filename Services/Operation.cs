@@ -1115,6 +1115,11 @@ public class Operation : IOperation, IConcurrentStatement {
                 {
                     argBuffer.Add(variable);
                 }
+                // G84: an attribute argument (`to_unsigned(4, s'length)`), not raw text.
+                else if (TryParseSignalAttribute(token) is (true, var attribute))
+                {
+                    argBuffer.Add(attribute);
+                }
                 else if (int.TryParse(token, out int intVal))
                 {
                     argBuffer.Add(intVal);
@@ -1635,7 +1640,7 @@ public class Operation : IOperation, IConcurrentStatement {
         // `Variable.Size`'s `(others=>X)` expansion path (Variable.cs:135)
         // and collapses our marker to an empty string. Keeping Size at its
         // default (0) AND skipping the setter preserves the marker string
-        // intact so `SignalScheduler.ExpandAggregateMarker` can expand it
+        // intact so `HdlLiteral.ExpandOthers` can expand it
         // against the LHS target's declared width at assignment time.
         var resultVar = new Variable
         {
@@ -1737,11 +1742,19 @@ public class Operation : IOperation, IConcurrentStatement {
             : AggregateTarget is not null ? null : Target?.Path.StaticShape ?? Result;
         bool othersOnly = _data[open + 1].Equals("others", StringComparison.OrdinalIgnoreCase)
                           && !inner.Contains(',');
-        if (othersOnly && shape?.Layout == null) return null;
+        // A literal fill (`(others => '0')`, a bit string, a nested `(others => …)`) keeps the
+        // marker, expanded at the write; any other element (`x(i)`, a constant) is evaluated (G85).
+        if (othersOnly && shape?.Layout == null && (shape is not { Size: > 0 } || IsLiteralFill(open + 3, close)))
+            return null;
 
         _currentSyntetizeIndex = close + 1;
         return Models.Aggregate.Parse(inner, shape, Variables);
     }
+
+    /// <summary>True when the tokens in [<paramref name="from"/>, <paramref name="to"/>) are one character or bit-string literal, or a nested <c>(others =&gt; …)</c>.</summary>
+    private bool IsLiteralFill(int from, int to) =>
+        to - from == 1 ? _data[from] is ['\'' or '"', ..] || _data[from].Length > 1 && _data[from][1] == '"'
+                       : to - from > 1 && _data[from] == "(" && _data[from + 1].Equals("others", StringComparison.OrdinalIgnoreCase);
 
     private (bool success, Models.DeferredIndex? deferred) ParseIndexedAccessDeferred(Variable variable)
     {
