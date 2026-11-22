@@ -10,7 +10,7 @@
     <AndroidUseAndroidX>true</AndroidUseAndroidX>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <GenerateRuntimeConfigDevFile>false</GenerateRuntimeConfigDevFile>
-    <NoWarn>$(NoWarn);CS1587;CS1591;CS1570;CS1573;CS1574;CS1998;CS8602;CS8604;CS8625;CS8892;CS0219;CS0618;CS4014</NoWarn>
+    <NoWarn>$(NoWarn);CS1587;CS1591;CS1570;CS1573;CS1574;CS1998;CS8602;CS8604;CS8625;CS0219;CS0618;CS4014</NoWarn>
     <!-- Memory profile for low-RAM targets (mobile / embedded MAUI heads).
          Workstation GC keeps the heap smaller and compacts eagerly; the
          Server GC defaults that .NET 9 picks on multi-core hosts hold

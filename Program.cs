@@ -7,13 +7,12 @@ namespace Interpreter;
 
 /// <summary>
 /// Main entry point for the Kmila VHDL interpreter and simulator.
-/// Supports test file processing, delta cycle testing, and simulation with VCD export.
+/// Supports test file processing and simulation with VCD export (the engine unit suites live in Tests/Unit/Kmila.Engine.Tests).
 /// </summary>
 /// <remarks>
 /// <para><strong>Command-line usage:</strong></para>
 /// <list type="bullet">
 /// <item><c>dotnet run</c> -- Process all test*.vhdl files in the current directory</item>
-/// <item><c>dotnet run -- --test-delta</c> -- Run delta cycle engine unit tests</item>
 /// <item><c>dotnet run -- --sim file.vhdl --cycles 100 --vcd output.vcd</c> -- Simulate and export VCD</item>
 /// <item><c>dotnet run -- --verbose</c> -- Enable verbose progress reporting</item>
 /// <item><c>dotnet run -- --progress</c> -- Show progress bar during batch processing</item>
@@ -41,37 +40,6 @@ class Program
         // Parse command line arguments
         _verboseProgress = args.Contains("--verbose") || args.Contains("-v");
         bool showProgressBar = args.Contains("--progress") || args.Contains("-p");
-
-        // Check for delta cycle test mode
-        if (args.Contains("--test-delta") || args.Contains("-td"))
-        {
-            RunDeltaCycleTests().Wait();
-            return;
-        }
-
-        // Check for synthesis-only test mode (layout/routing/block tests),
-        // so they can be exercised without the full delta-cycle suite.
-        if (args.Contains("--test-synth"))
-        {
-            Environment.ExitCode = Tests.SynthesisTests.RunAllTests().GetAwaiter().GetResult();
-            return;
-        }
-
-        // Case-selector expression regression tests (2026-10-11). Standalone
-        // flag so they run independently of the full --test-delta battery.
-        if (args.Contains("--test-case-selector"))
-        {
-            Environment.ExitCode = Tests.CaseSelectorExpressionTests.RunAllTests().GetAwaiter().GetResult();
-            return;
-        }
-
-        // Syntax-strictness regression tests (P1, 2026-10-20). Standalone flag
-        // so they run independently of the full --test-delta battery.
-        if (args.Contains("--test-syntax"))
-        {
-            Environment.ExitCode = Tests.SyntaxStrictnessTests.RunAllTests();
-            return;
-        }
 
         // Check for simulation mode with VCD export
         // Usage: --sim <file.vhdl> [--cycles N] [--vcd output.vcd]
@@ -304,26 +272,6 @@ class Program
     }
 
     /// <summary>
-    /// Runs the delta cycle engine unit tests.
-    /// </summary>
-    static async Task RunDeltaCycleTests()
-    {
-        int failures = await Tests.DeltaCycleEngineTests.RunAllTests();
-        failures += await Tests.SynthesisTests.RunAllTests();
-        failures += Tests.IEEELibraryLoaderTests.RunAllTests();
-        failures += Tests.LibraryCompilerTests.RunAllTests();
-        failures += Tests.IEEEPrimitivesTests.RunAllTests();
-        failures += Tests.IEEELoweringEndToEndTests.RunAllTests();
-        failures += Tests.NestedIEEECallTests.RunAllTests();
-        failures += Tests.PracticeExerciseTests.RunAllTests();
-        failures += await Tests.CaseSelectorExpressionTests.RunAllTests();
-        failures += Tests.PortStrictnessTests.RunAllTests();
-        failures += Tests.SyntaxStrictnessTests.RunAllTests();
-        failures += await Tests.BlockStatementTests.RunAllTests();
-        Environment.ExitCode = failures;
-    }
-
-    /// <summary>
     /// Runs a simulation on a VHDL file and exports waveforms to VCD.
     /// </summary>
     /// <param name="vhdlFile">The VHDL file to simulate.</param>
@@ -462,12 +410,9 @@ class Program
     /// A tuple containing the list of parsed <see cref="Entity"/> objects and the number
     /// of architecture bodies that were successfully synthesized.
     /// </returns>
-    // Marked `internal` (was implicit private) so the in-assembly test
-    // suite at Interpreter/Tests/PracticeExerciseTests.cs can run the
-    // same parsing pipeline the --sim CLI flag uses, without copying its
-    // ~300-line line-state-machine + private helpers (JoinContinuationLines,
-    // ParsePackageConstants, …) into the test file. Still invisible
-    // outside the assembly.
+    // Internal: the engine suites (Tests/Unit/Kmila.Engine.Tests, BlockStatement and
+    // CaseSelectorExpression) drive this legacy line pipeline; moving them onto the
+    // front-end goes with the design-unit splitter consolidation (audit FE-3).
     internal static (List<Entity> entities, int architectureCount) ProcessVhdlCode(string raw, CancellationToken cancellationToken = default)
     {
         // Seed the IEEE library symbol table once per process so calls into
