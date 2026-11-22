@@ -958,20 +958,8 @@ public class Operation : IOperation, IConcurrentStatement {
             foreach (var arg in argParts)
             {
                 string trimmedArg = arg.Trim();
-                // Try to find variable
                 var variable = Variables.FirstOrDefault(v => v.Name.Equals(trimmedArg, StringComparison.OrdinalIgnoreCase));
-                if (variable is not null)
-                {
-                    args.Add(variable);
-                }
-                else if (int.TryParse(trimmedArg, out int intVal))
-                {
-                    args.Add(intVal);
-                }
-                else
-                {
-                    args.Add(trimmedArg);
-                }
+                args.Add(ArgOperand(trimmedArg, variable) ?? trimmedArg);
             }
         }
 
@@ -1111,18 +1099,9 @@ public class Operation : IOperation, IConcurrentStatement {
                     }
                 }
 
-                if (!ReferenceEquals(variable, null))
+                if (ArgOperand(token, variable) is { } operand)
                 {
-                    argBuffer.Add(variable);
-                }
-                // G84: an attribute argument (`to_unsigned(4, s'length)`), not raw text.
-                else if (TryParseSignalAttribute(token) is (true, var attribute))
-                {
-                    argBuffer.Add(attribute);
-                }
-                else if (int.TryParse(token, out int intVal))
-                {
-                    argBuffer.Add(intVal);
+                    argBuffer.Add(operand);
                 }
                 else if (token == "&" || _arithOperators.IsMatch(token) || _logicOperators.IsMatch(token.ToLower()))
                 {
@@ -1147,6 +1126,17 @@ public class Operation : IOperation, IConcurrentStatement {
         // v0.17.0: functions read while simulating (edges, conversions of live values) are deferred.
         return (true, StandardCall(functionName, args));
     }
+
+    /// <summary>
+    /// One function-call argument token as an operand: the declared object
+    /// <paramref name="variable"/> it names, an attribute (<c>s'length</c>, G84),
+    /// or an integer literal; null otherwise. Shared by both call parse paths.
+    /// </summary>
+    private object? ArgOperand(string token, Variable? variable) =>
+        variable is not null ? variable
+        : TryParseSignalAttribute(token) is (true, var attribute) ? attribute
+        : int.TryParse(token, out int n) ? n
+        : null;
 
     /// <summary>
     /// A standard-function call: deferred (evaluated while simulating) when its value
@@ -1599,7 +1589,8 @@ public class Operation : IOperation, IConcurrentStatement {
             _currentSyntetizeIndex++; // skip '=>'
         }
 
-        // Get the value. Handle three cases:
+        // Only reached when the target width is unknown (a known width goes through
+        // Models.Aggregate in TryParseAggregate). Get the value. Handle three cases:
         //   1. Literal char/bitstring:           others => '0'
         //   2. Nested-aggregate (2D arrays):     others => ( others => '0' )
         //   3. Plain identifier (e.g. constant): others => MY_BLANK
@@ -1637,7 +1628,7 @@ public class Operation : IOperation, IConcurrentStatement {
         // Create a variable that represents the aggregate. We DELIBERATELY
         // do NOT pass Size to the constructor — the 4-arg ctor calls the
         // Size setter with `value=0`, which in turn triggers
-        // `Variable.Size`'s `(others=>X)` expansion path (Variable.cs:135)
+        // `Variable.Size`'s `(others=>X)` expansion path (Parser/Models/Variable.cs)
         // and collapses our marker to an empty string. Keeping Size at its
         // default (0) AND skipping the setter preserves the marker string
         // intact so `HdlLiteral.ExpandOthers` can expand it
@@ -1727,7 +1718,7 @@ public class Operation : IOperation, IConcurrentStatement {
     /// At a <c>(</c> in operand position: when the group is an aggregate, consumes
     /// it and returns it typed by its context — the operand it is compared or
     /// concatenated with, else the assignment target. A lone
-    /// <c>(others =&gt; c)</c> for a non-record target keeps the fill-marker path.
+    /// <c>(others =&gt; c)</c> whose width is unknown keeps the fill-marker path.
     /// </summary>
     private Models.Aggregate? TryParseAggregate(List<object> items)
     {
@@ -1742,19 +1733,14 @@ public class Operation : IOperation, IConcurrentStatement {
             : AggregateTarget is not null ? null : Target?.Path.StaticShape ?? Result;
         bool othersOnly = _data[open + 1].Equals("others", StringComparison.OrdinalIgnoreCase)
                           && !inner.Contains(',');
-        // A literal fill (`(others => '0')`, a bit string, a nested `(others => …)`) keeps the
-        // marker, expanded at the write; any other element (`x(i)`, a constant) is evaluated (G85).
-        if (othersOnly && shape?.Layout == null && (shape is not { Size: > 0 } || IsLiteralFill(open + 3, close)))
+        // With a known width the aggregate yields the bits itself (G85, G87); only an
+        // unknown width keeps the `(others=>X)` marker, expanded at the write.
+        if (othersOnly && shape?.Layout == null && shape is not { Size: > 0 })
             return null;
 
         _currentSyntetizeIndex = close + 1;
         return Models.Aggregate.Parse(inner, shape, Variables);
     }
-
-    /// <summary>True when the tokens in [<paramref name="from"/>, <paramref name="to"/>) are one character or bit-string literal, or a nested <c>(others =&gt; …)</c>.</summary>
-    private bool IsLiteralFill(int from, int to) =>
-        to - from == 1 ? _data[from] is ['\'' or '"', ..] || _data[from].Length > 1 && _data[from][1] == '"'
-                       : to - from > 1 && _data[from] == "(" && _data[from + 1].Equals("others", StringComparison.OrdinalIgnoreCase);
 
     private (bool success, Models.DeferredIndex? deferred) ParseIndexedAccessDeferred(Variable variable)
     {

@@ -410,11 +410,7 @@ public class VariableSyntetizer : ISControl
                 // Covers std_logic_vector, unsigned, signed, bit_vector, and the
                 // other vector-shaped types — the marker form is by definition
                 // vector-only in VHDL, so VectorSize>0 + marker pattern suffices.
-                if (VectorSize > 0
-                    && HdlLiteral.TryOthersFill(initValue as string, out char fill))
-                {
-                    initValue = new string(fill, VectorSize);
-                }
+                initValue = HdlLiteral.ExpandOthers(initValue, VectorSize);
                 var newVar = new Variable()
                 {
                     Name = variable.Name,

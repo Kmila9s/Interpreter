@@ -131,8 +131,7 @@ public sealed partial class AssignmentTarget
             && (n < range.Low || n > range.High))
             throw new SimulationRuntimeException("bound check failure");
         if (b.Type == Constants.DATATYPES.STD_LOGIC_VECTOR && b.Size > 0 && b.Layout is null && b.ElementSize == 0
-            && value is string bits && bits.Length != b.Size && bits.Length > 0 && StdLogic.IsVector(bits)
-            && !HdlLiteral.TryOthersFill(bits, out _))
+            && value is string bits && bits.Length != b.Size && bits.Length > 0 && StdLogic.IsVector(bits))
             throw new SimulationRuntimeException("bound check failure");
     }
 
