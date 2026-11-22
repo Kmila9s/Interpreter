@@ -21,7 +21,7 @@ public class SimulationConfig
     /// Nanoseconds per tick: what every tick count in this configuration is in,
     /// and what the engine converts <c>after</c>/<c>wait for</c> delays with.
     /// </summary>
-    public int TickResNs { get; init; } = 10;
+    public int TickResNs { get; init; } = TimeMachine.Models.TimeClock.NS_PER_TICK;
 
     /// <summary>
     /// Clock signal configurations (auto-toggling clocks).

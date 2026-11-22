@@ -51,8 +51,6 @@ public sealed partial class Waveform
             elements.Add(after < 0 ? (part.Trim(), null) : (part[..after].Trim(), part[(after + 5)..].Trim()));
         }
         long?[] folded = [.. elements.Select(e => e.After is null ? 0L : TimeValue.TryEvaluateNs(e.After, null, out double ns) ? (long?)Math.Round(ns) : null)];
-        foreach (var delay in folded)
-            if (delay is long ns) Services.DesignTimeGrid.Instance.Note(ns);
         return new Waveform { Mechanism = mechanism, Reject = reject, Elements = elements, _folded = folded };
     }
 
@@ -82,6 +80,9 @@ public sealed partial class Waveform
     }
 
     private static bool IsWordChar(char c) => char.IsLetterOrDigit(c) || c == '_';
+
+    /// <summary>The literal (parse-time) delays of the elements, in ns; delays that need the run-time scope are left out.</summary>
+    public IEnumerable<long> StaticDelaysNs => _folded.OfType<long>();
 
     /// <summary>The delay in ns of element <paramref name="index"/>: folded when literal, else evaluated now against <paramref name="scope"/>.</summary>
     public long ElementDelayNs(int index, HashSet<Variable> scope, int line) =>

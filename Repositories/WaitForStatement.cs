@@ -154,7 +154,6 @@ public sealed class WaitForStatement : ISControl
         if (!Interpreter.Models.TimeValue.TryEvaluateNs(text, _variables, out double ns))
             throw new ParserException($"time expression '{text}' is not supported in a wait statement yet", tokens[0]);
         DelayNs = (long)Math.Round(ns, MidpointRounding.AwayFromZero);
-        Interpreter.Services.DesignTimeGrid.Instance.Note(DelayNs);
         IsTimed = DelayNs > 0;
         IsTerminal = !IsTimed;
     }
