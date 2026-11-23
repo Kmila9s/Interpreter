@@ -47,7 +47,7 @@ public sealed partial class SourceElaborator
         var generics = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         ExtractGenericDefaults(generics, top.EntityText);
         PackageRegistry.Instance.RegisterUnitArithmetic(string.Empty, top.Context + "\n" + arch.Context);
-        var (decl, body, _) = Inline(arch.DeclPart, arch.Body, arch.Specs, block, lib, generics, depth: 0, pathPrefix: string.Empty);
+        var (decl, body, _) = Inline(arch, block, lib, generics, depth: 0, pathPrefix: string.Empty);
 
         var sb = new StringBuilder();
         // Library / use clauses (and packages) of the top's files; children's
@@ -176,29 +176,37 @@ public sealed partial class SourceElaborator
     }
 
     /// <summary>
-    /// Flattens one architecture (<paramref name="decl"/>/<paramref name="body"/>):
-    /// unrolls its generates, then inlines every instance — recursively, so a child
+    /// Flattens one architecture (<paramref name="arch"/>, with its configuration
+    /// specifications): unrolls its generates, then inlines every instance — recursively, so a child
     /// with further instances arrives already flattened (three-level
     /// <c>tb → dut → sub</c>, audit F-G-06). Returns the declarative part, the body
     /// and the local names the generate unrolling added (unprefixed by the caller's
-    /// instance path yet).
+    /// instance path yet). Marker comments locate every copied piece in its file (G82).
     /// </summary>
     private static (string Decl, string Body, List<string> NewLocals) Inline(
-        string decl, string body, BlockConfig specs, BlockConfig? config,
+        ArchRecord arch, BlockConfig? config,
         DesignLibrary lib, IReadOnlyDictionary<string, string> generics, int depth, string pathPrefix)
     {
+        string decl = arch.DeclPart, body = arch.Body;
         if (depth > MaxElaborationDepth)
         {
             Console.Error.WriteLine($"[SourceElaborator] Recursion depth {depth} exceeded — leaving remaining child instances unresolved.");
             return (decl, body, []);
         }
 
+        var specs = arch.Specs;
         var unrolled = GenerateUnroller.Unroll(decl, body, Lookup(decl, generics));
+        // Statement lines map back to the file only while the text is the file's: an
+        // unrolled generate repeats its statements, so its body gets no origin (G82).
+        bool linesExact = unrolled.Body == body;
         decl = unrolled.Decl;
         body = unrolled.Body;
+        var bodyLines = new DesignLibrary.LineIndex(body, arch.BodyLine);
+        string MarkerAt(int offset) => linesExact ? ElaborationLineMap.Marker(arch.File, bodyLines.LineOf(offset)) : ElaborationLineMap.Unknown;
+        string PinnedAt(int offset) => linesExact ? ElaborationLineMap.Pinned(arch.File, bodyLines.LineOf(offset)) : ElaborationLineMap.Unknown;
 
-        var declSb = new StringBuilder(decl);
-        var bodySb = new StringBuilder();
+        var declSb = new StringBuilder(ElaborationLineMap.Marker(arch.File, arch.DeclLine)).Append('\n').Append(decl);
+        var bodySb = new StringBuilder(MarkerAt(0)).Append('\n');
         // Type declarations already in the flattened declarative part (name → text).
         var emittedTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (name, text, _, _) in TypeDeclarations(decl))
@@ -209,6 +217,8 @@ public sealed partial class SourceElaborator
         {
             bodySb.Append(body, cursor, im.Index - cursor);
             cursor = im.Index + im.Length;
+            // The instance's port connections and alias declarations are all its line.
+            string instanceMarker = PinnedAt(im.Index);
 
             string label = im.Groups["label"].Value;
             string entName = im.Groups["ent"].Value;
@@ -222,6 +232,7 @@ public sealed partial class SourceElaborator
             if (open)
             {
                 bodySb.AppendLine($"  -- {label} : {entName} bound to open (not elaborated)");
+                bodySb.AppendLine(MarkerAt(cursor));
                 continue;
             }
             // Unknown unit: left as written, so the parser reports it.
@@ -253,12 +264,17 @@ public sealed partial class SourceElaborator
             // `open` gets its own alias too, so it never drives a parent signal of
             // the same name.
             portMappings.RemoveAll(kv => kv.Value.Equals("open", StringComparison.OrdinalIgnoreCase));
+            portMappings = portMappings.Select(kv => WithoutTypeConversions(kv, portInfo, label)).ToList();
             var associated = portMappings.Select(kv => FormalBase(kv.Key)).ToHashSet(StringComparer.OrdinalIgnoreCase);
             var unassociated = portInfo.Where(p => !associated.Contains(p.Key))
                 .Select(p => p.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
             // An `inout` formal is its actual (G53): the child reads the resolved
             // value and its drivers join the actual's, with no copy in either
             // direction (two copies of a resolved signal would latch each other).
+            // Whole formals → their actual text (`a => x`; `a(0) => x` is a partial association).
+            var actualOf = portMappings.Where(kv => string.Equals(kv.Key, FormalBase(kv.Key), StringComparison.OrdinalIgnoreCase))
+                .GroupBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First().Value.Trim(), StringComparer.OrdinalIgnoreCase);
             var inoutActuals = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var kv in portMappings)
             {
@@ -281,8 +297,7 @@ public sealed partial class SourceElaborator
 
             // Flatten the child's own instances and generates first, so the
             // fragments renamed here already have every descendant inlined.
-            var (grandDecl, grandBody, childLocals) = Inline(childArch.DeclPart, childArch.Body, childArch.Specs,
-                childBlock, lib, genericValues, depth + 1, aliasPrefix);
+            var (grandDecl, grandBody, childLocals) = Inline(childArch, childBlock, lib, genericValues, depth + 1, aliasPrefix);
             foreach (var sig in childArch.LocalSignals.Concat(childLocals))
                 rename[sig] = aliasPrefix + sig;
 
@@ -302,6 +317,7 @@ public sealed partial class SourceElaborator
             childDecl = DeduplicateTypes(childDecl, ref childBody, emittedTypes, aliasPrefix);
 
             declSb.AppendLine();
+            declSb.AppendLine(instanceMarker);
             declSb.AppendLine($"  -- ↓ inlined from component {label} : {entName}");
             // Declaration order = association order (the flattened text must stay stable), then the defaults.
             foreach (var formal in portMappings.Select(kv => FormalBase(kv.Key)).Distinct(StringComparer.OrdinalIgnoreCase).Concat(unassociated))
@@ -320,8 +336,13 @@ public sealed partial class SourceElaborator
                             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                                 { [gv.Key] = gv.Value });
                     }
-                    string init = unassociated.Contains(formal) && info.Default is { } d
-                        ? $" := {d}" : "";
+                    // An unassociated port starts at its default; an input associated with a
+                    // plain signal is that signal (one object in the LRM), so its alias starts
+                    // at the actual's value, not at 'U' for the first delta (G88).
+                    string init = unassociated.Contains(formal) && info.Default is { } d ? $" := {d}"
+                        : !info.IsOutput && actualOf.TryGetValue(formal, out var actual)
+                          && System.Text.RegularExpressions.Regex.IsMatch(actual, global::Parser.Models.Constants.IDENTIFIERS) ? $" := {actual}"
+                        : "";
                     declSb.AppendLine($"  signal {aliasName} : {typeText}{init};");
                 }
                 else
@@ -332,6 +353,7 @@ public sealed partial class SourceElaborator
             declSb.Append(childDecl);
 
             bodySb.AppendLine();
+            bodySb.AppendLine(instanceMarker);
             bodySb.AppendLine($"  -- ↓ inlined body for component {label} : {entName}");
             foreach (var kv in portMappings)
             {
@@ -356,6 +378,8 @@ public sealed partial class SourceElaborator
             bodySb.Append(childBody);
             bodySb.AppendLine();
             bodySb.AppendLine($"  -- ↑ end inlined body for {label} : {entName}");
+            // The parent's statements resume at the instance's last line.
+            bodySb.AppendLine(MarkerAt(cursor));
         }
         // Trailing text after the last instance.
         bodySb.Append(body, cursor, body.Length - cursor);
@@ -533,6 +557,33 @@ public sealed partial class SourceElaborator
         }
     }
 
+    /// <summary>
+    /// An association whose formal is converted (<c>unsigned(b) =&gt; std_logic_vector(u)</c>,
+    /// G83): with a type conversion between closely related vector types on both sides the
+    /// bits are the same, so it is the plain association <c>b =&gt; u</c>. A conversion
+    /// function on the formal (<c>to_bit(b) =&gt; …</c>) is rejected instead of being
+    /// dropped as an association with an unknown port.
+    /// </summary>
+    private static KeyValuePair<string, string> WithoutTypeConversions(
+        KeyValuePair<string, string> association, Dictionary<string, PortInfo> ports, string label)
+    {
+        if (ConversionRe().Match(association.Key) is not { Success: true } formal
+            || ports.ContainsKey(formal.Groups["fn"].Value) || !ports.TryGetValue(formal.Groups["arg"].Value, out var port))
+            return association;
+        string portName = formal.Groups["arg"].Value, actual = association.Value.Trim();
+        var actualConversion = ConversionRe().Match(actual);
+        bool formalIsTypeMark = TypeMarks.IsBitVector(formal.Groups["fn"].Value);
+        bool actualIsTypeMark = actualConversion.Success && TypeMarks.IsBitVector(actualConversion.Groups["fn"].Value);
+        // An inout needs the conversion both ways; an in/out formal only its own.
+        if (!formalIsTypeMark || port.IsInout && !actualIsTypeMark)
+            throw new ParserException($"port \"{portName}\" of {label}: conversion \"{association.Key.Trim()} => {actual}\" is not supported yet", 0, 0);
+        return new(portName, port.IsInout ? actualConversion.Groups["arg"].Value : actual);
+    }
+
+    /// <summary><c>f(name)</c>: a conversion (function or type mark) applied to one name.</summary>
+    [System.Text.RegularExpressions.GeneratedRegex(@"^\s*(?<fn>[A-Za-z]\w*)\s*\(\s*(?<arg>[A-Za-z]\w*)\s*\)\s*$")]
+    private static partial System.Text.RegularExpressions.Regex ConversionRe();
+
     /// <summary>Port named by a formal that may carry selectors: <c>p</c> for <c>p.lo</c> or <c>p(3)</c>.</summary>
     private static string FormalBase(string formal)
     {
@@ -582,8 +633,9 @@ public sealed partial class SourceElaborator
                 emitted[aliasPrefix + name] = text;
             }
         }
+        // A dropped declaration keeps its line breaks: the lines after it stay the file's (G82).
         foreach (var (start, length) in drop.OrderByDescending(d => d.Start))
-            childDecl = childDecl.Remove(start, length);
+            childDecl = childDecl.Remove(start, length).Insert(start, new string('\n', childDecl.AsSpan(start, length).Count('\n')));
         if (renames.Count > 0)
         {
             childDecl = VhdlUnitText.RenameTokens(childDecl, renames);

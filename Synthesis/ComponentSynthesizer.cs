@@ -167,7 +167,7 @@ internal static class ComponentSynthesizer
         if (parent.Length == 0 || inner.Length == 0) return null;
 
         // "c(4)" → c_idx_4; "H downto L" / "L to H" → c_idx_{high}_{low}.
-        var (left, right) = AssignmentTarget.SplitRange(inner);
+        var (left, right, _) = AssignmentTarget.SplitRange(inner);
         if (!int.TryParse(left.Trim(), out var a)) return null;
         if (right is null) return VectorIndexing.PartName(parent, a);
         if (!int.TryParse(right.Trim(), out var b)) return null;

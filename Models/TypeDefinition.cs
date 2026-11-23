@@ -92,6 +92,13 @@ public class TypeDefinition
     public bool IsUnconstrained { get; set; } = false;
 
     /// <summary>
+    /// For an unconstrained array, the left bound its index subtype starts at
+    /// (<c>natural range &lt;&gt;</c> → 0, <c>positive range &lt;&gt;</c> → 1): where an
+    /// object constrained by its initializer begins.
+    /// </summary>
+    public int UnconstrainedLow { get; set; }
+
+    /// <summary>
     /// Gets or sets the element size in bits for array types.
     /// Example: for "array of std_logic_vector(7 downto 0)", ElementSize=8.
     /// For "array of std_logic", ElementSize=1.

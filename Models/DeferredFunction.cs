@@ -75,6 +75,8 @@ public class DeferredFunction
                 return (object)nested.Evaluate();
             if (arg is DeferredExpression subExpr)
                 return (object)subExpr.Evaluate();
+            if (arg is DeferredUserFunction userCall)
+                return (object)userCall.Evaluate();
             if (arg is string s)
             {
                 var found = Variables.FirstOrDefault(v =>

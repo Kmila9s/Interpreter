@@ -769,7 +769,10 @@ public class SignalHistory
         string valueStr = value.ToString() ?? "";
         static char Bit(char c) => StdLogic.IsValue(c) ? StdLogic.Norm(c) : 'X';
         if (width == 1)
-            return valueStr.Length == 1 ? Bit(valueStr[0]).ToString() : "X";
+            return valueStr.Length == 1 ? Bit(valueStr[0]).ToString()
+                // A boolean is dumped as one bit, like GHDL (false → 0, true → 1).
+                : bool.TryParse(valueStr, out bool flag) ? (flag ? "1" : "0")
+                : "X";
         // VCD format: bVALUE IDENTIFIER (note the space before identifier)
         return string.Create(valueStr.Length + 2, valueStr, static (r, src) =>
         {

@@ -73,7 +73,7 @@ public sealed class ValuePath
             {
                 int close = VhdlText.MatchingParen(text, pos);
                 if (close < 0) return null;
-                var (left, right) = AssignmentTarget.SplitRange(text[(pos + 1)..close]);
+                var (left, right, _) = AssignmentTarget.SplitRange(text[(pos + 1)..close]);
                 steps.Add(new IndexStep(IndexValue.Parse(left, scope),
                     right == null ? null : IndexValue.Parse(right, scope)));
                 pos = close + 1;

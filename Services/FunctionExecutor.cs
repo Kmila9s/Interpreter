@@ -91,16 +91,19 @@ public class FunctionExecutor
             // re-synthesised against a fresh scope, which was ~20× slower
             // on signal-heavy designs (P22, P3) and made P4 unusable.
             HashSet<Variable> localScope;
-            if (function.IsSynthesized && function.CachedScope != null)
+            string shape = ShapeOf(function, arguments);
+            if (function.ShapeCache.TryGetValue(shape, out var cached))
             {
-                localScope = function.CachedScope;
+                localScope = cached.Scope;
+                function.SynthesizedBody = cached.Body;
                 RefreshScopeArgs(function, localScope, arguments, callerVariables);
             }
             else
             {
                 localScope = CreateLocalScope(function, arguments, callerVariables);
                 SynthesizeFunctionBody(function, localScope);
-                function.CachedScope = localScope;
+                if (function.ShapeCache.Count >= MaxShapes) function.ShapeCache.Clear();
+                function.ShapeCache[shape] = (localScope, function.SynthesizedBody!);
             }
 
             // Execute the function body
@@ -110,6 +113,27 @@ public class FunctionExecutor
         {
             _callStack.Pop();
         }
+    }
+
+    /// <summary>Distinct shapes of one function's unconstrained formals kept synthesised (recursion over halving widths).</summary>
+    private const int MaxShapes = 8;
+
+    /// <summary>
+    /// The shapes the unconstrained formals take for this call (as
+    /// <see cref="ParameterDefinition.CreateVariable"/> builds them): the key of the
+    /// synthesised body that fits it. Empty for a function without unconstrained formals.
+    /// </summary>
+    private static string ShapeOf(FunctionDefinition function, object[] arguments)
+    {
+        var key = new System.Text.StringBuilder();
+        for (int i = 0; i < function.Parameters.Count && i < arguments.Length; i++)
+        {
+            var param = function.Parameters[i];
+            if (!param.IsUnconstrained) continue;
+            var actual = arguments[i] as Variable;
+            key.Append(i).Append('=').Append(ParameterDefinition.ShapeKey(param.CreateVariable(actual?.Value ?? arguments[i], actual))).Append(';');
+        }
+        return key.ToString();
     }
 
     /// <summary>
@@ -178,7 +202,7 @@ public class FunctionExecutor
                 value = param.DefaultValue;
             }
 
-            var variable = param.CreateVariable(value);
+            var variable = param.CreateVariable(value, i < arguments.Length ? arguments[i] as Variable : null);
             localScope.Add(variable);
         }
 
@@ -394,7 +418,7 @@ public class FunctionExecutor
                 value = param.DefaultValue;
             }
 
-            var variable = param.CreateVariable(value);
+            var variable = param.CreateVariable(value, i < arguments.Length ? arguments[i] as Variable : null);
             localScope.Add(variable);
         }
 

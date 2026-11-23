@@ -33,6 +33,14 @@ public static class HdlLiteral
     }
 
     /// <summary>
+    /// Expands an <c>(others=&gt;X)</c> marker to <paramref name="width"/> copies of
+    /// its fill (the value a whole-object write of a vector stores); any other
+    /// value, or an unknown width, is returned as is.
+    /// </summary>
+    public static object ExpandOthers(object value, int width) =>
+        width > 0 && TryOthersFill(value as string, out char fill) ? new string(fill, width) : value;
+
+    /// <summary>
     /// The fill character of an <c>(others=&gt;X)</c> marker (quotes removed;
     /// <c>0</c> when empty); false when <paramref name="text"/> is not one.
     /// </summary>

@@ -53,14 +53,18 @@ public class SimulationRunner : IDisposable, ISimulationRunner
     /// stack frame, so headless callers can pinpoint it rather than just see
     /// a generic "Object reference not set". Shared by both runners.
     /// </summary>
-    internal static string DescribeFailure(Exception ex)
+    internal static string DescribeFailure(Exception ex, ElaborationLineMap? lines = null)
     {
         var firstFrame = (ex.StackTrace ?? string.Empty).Split('\n').FirstOrDefault()?.Trim() ?? string.Empty;
-        return $"{ex.GetType().Name}: {ex.Message} | {firstFrame}";
+        // An elaborated design's error names the file and line the user wrote (G82).
+        var located = lines?.Locate(ex) ?? ex;
+        return $"{located.GetType().Name}: {located.Message} | {firstFrame}";
     }
 
     /// <summary>
-    /// Seals the trace at the last simulated tick — the end of the window, or the
+    /// Seals the trace at the last simulated tick — the end of the window
+    /// (<paramref name="totalTicks"/>, which is simulated: the window is
+    /// <c>0..totalTicks</c> inclusive, as GHDL's <c>--stop-time</c>), or the
     /// tick where the design ended the run (<c>std.env.stop</c>/<c>finish</c>,
     /// <c>severity failure</c>) — so it spans the whole run even for a stable
     /// design. Returns the error of a <c>severity failure</c> end, else null.
@@ -68,8 +72,7 @@ public class SimulationRunner : IDisposable, ISimulationRunner
     /// </summary>
     internal static string? SealRun(DeltaCycleEngine engine, IEnumerable<Variable> allSignals, ulong totalTicks, ulong? endTick)
     {
-        ulong last = endTick ?? (totalTicks > 0 ? totalTicks - 1 : 0);
-        if (totalTicks > 0) engine.History.RecordChanges(allSignals, (long)last * 1000);
+        engine.History.RecordChanges(allSignals, (long)(endTick ?? totalTicks) * 1000);
         return engine.EndRequest is { Failed: true } failure ? $"severity failure: {failure.Message}" : null;
     }
 
@@ -142,7 +145,7 @@ public class SimulationRunner : IDisposable, ISimulationRunner
             // false at tick 0, so process bodies that depend on it (e.g.
             // a 052-style PISO with `Q<=r(3)` outside the edge gate) miss
             // their first load.
-            _engine = new DeltaCycleEngine();
+            _engine = new DeltaCycleEngine { TickResolutionNs = config.TickResNs };
             _engine.Initialize(allSignals, arch.Tasks);
 
             // F-G-08 pass 3 diag (2026-07-16): propagate the runner's cancel
@@ -190,7 +193,8 @@ public class SimulationRunner : IDisposable, ISimulationRunner
 
             // Main simulation loop
             ulong? endTick = null;
-            for (ulong tick = 0; tick < totalTicks; tick++)
+            // The window is 0..totalTicks inclusive: events at the end time run, as with GHDL's --stop-time.
+            for (ulong tick = 0; tick <= totalTicks; tick++)
             {
                 // Check cancellation
                 if (_cts.IsCancellationRequested)
@@ -257,7 +261,7 @@ public class SimulationRunner : IDisposable, ISimulationRunner
                 if (_engine.EndRequest is not null) { endTick = tick; break; }
 
                 // Report progress every percent change
-                double percent = (double)(tick + 1) / totalTicks * 100.0;
+                double percent = (double)(tick + 1) / (totalTicks + 1) * 100.0;
                 double rounded = Math.Floor(percent);
                 if (rounded > lastReportedPercent)
                 {
@@ -292,7 +296,7 @@ public class SimulationRunner : IDisposable, ISimulationRunner
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            Error = DescribeFailure(ex);
+            Error = DescribeFailure(ex, config.LineMap);
             OnError?.Invoke(Error);
             OnSimulationEnded?.Invoke(false);
         }

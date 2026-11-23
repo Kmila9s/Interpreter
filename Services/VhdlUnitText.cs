@@ -72,6 +72,10 @@ internal static class VhdlUnitText
         return names;
     }
 
+    /// <summary>True for <c>end record</c> / <c>end units</c> / <c>end protected</c>: the end of a type definition, which opened no begin/end level.</summary>
+    private static bool ClosesTypeDefinition(Match m) =>
+        m.Groups[2].Value.ToLowerInvariant() is "record" or "units" or "protected";
+
     /// <summary>
     /// Walks the architecture starting at <paramref name="startIdx"/> (just
     /// past the architecture's `is`) and locates the architecture-level
@@ -121,7 +125,7 @@ internal static class VhdlUnitText
         // the `case` keyword from the depth counter and caused
         // SplitArchitecture to terminate prematurely at the inner
         // `end process` instead of the architecture-level `end`.
-        var rx = new Regex(@"\b(architecture|process|function|procedure|generate|block|begin|end|if|elsif|else|case|loop|then|is)\b(?:[ \t]+(function|procedure|process|generate|block|architecture|if|case|loop)\b)?",
+        var rx = new Regex(@"\b(architecture|process|function|procedure|generate|block|begin|end|if|elsif|else|case|loop|then|is)\b(?:[ \t]+(function|procedure|process|generate|block|architecture|if|case|loop|record|units|protected)\b)?",
                            RegexOptions.IgnoreCase);
         // First locate the architecture-level `begin`.
         Match m = rx.Match(masked, startIdx);
@@ -142,7 +146,7 @@ internal static class VhdlUnitText
                 // function/procedure declaration — adds one level (the body's begin/end will balance it).
                 depth++;
             }
-            else if (kw == "end")
+            else if (kw == "end" && !ClosesTypeDefinition(m))
             {
                 // `end function` / `end procedure` closes a nested block.
                 if (depth > 0) depth--;
@@ -201,6 +205,9 @@ internal static class VhdlUnitText
                 case "loop":
                     innerDepth++;
                     conditionPending = false;
+                    break;
+                case "end" when ClosesTypeDefinition(em):
+                    // `end record` / `end units` / `end protected` close a type, not a block (G90).
                     break;
                 case "end":
                     if (innerDepth == 0)
@@ -327,7 +334,8 @@ internal static class VhdlUnitText
     /// occurrence of a key in <paramref name="rename"/> with its mapped
     /// value. Identifiers are matched case-insensitively; substring matches
     /// (e.g. `clk` inside `clkx`), names after a <c>.</c> (record fields,
-    /// selected names) and text inside string literals are NOT replaced.
+    /// selected names) or a <c>'</c> (character literals, attributes) and text
+    /// inside string literals are NOT replaced.
     /// </summary>
     internal static string RenameTokens(string source, Dictionary<string, string> rename)
     {
@@ -336,12 +344,13 @@ internal static class VhdlUnitText
         // Build one alternation regex from the keys (longest-first so longer
         // names aren't shadowed by shorter ones that share a prefix).
         // Matched on a copy with string literals masked, and never right after
-        // a `.`: record fields (`p.lo`) and selected names (`work.pkg.x`) keep
-        // their spelling.
+        // a `.` or a `'`: record fields (`p.lo`), selected names (`work.pkg.x`),
+        // character literals (`'X'` beside a port `x`, G89) and attribute names
+        // keep their spelling.
         var keys = rename.Keys
                          .OrderByDescending(k => k.Length)
                          .Select(Regex.Escape);
-        var pattern = @"(?<![\w.])(" + string.Join("|", keys) + @")\b";
+        var pattern = @"(?<![\w.'])(" + string.Join("|", keys) + @")\b";
         var rx = new Regex(pattern, RegexOptions.IgnoreCase);
         var sb = new StringBuilder(source.Length);
         int last = 0;

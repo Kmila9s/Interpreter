@@ -375,8 +375,8 @@ public partial class DeltaCycleEngine : IDisposable
     /// <summary>
     /// Tick resolution in nanoseconds. Forwarded to `SignalScheduler` so
     /// `after N ns` assignments convert to the right future-tick offset.
-    /// Default 10 (matching `TimeClock.NS_PER_TICK`); update before
-    /// running for sub-10ns sims. Bench bug #8.
+    /// Default 10 (`TimeClock.NS_PER_TICK`); the runners set it from
+    /// <see cref="Models.SimulationConfig.TickResNs"/> when they create the engine.
     /// </summary>
     public int TickResolutionNs
     {

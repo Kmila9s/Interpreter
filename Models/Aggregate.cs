@@ -126,8 +126,9 @@ public sealed class Aggregate : IDeferredOperand
 
     private string ArrayBits(Variable shape)
     {
-        int width = shape.Size;
         int unit = shape.ElementSize > 1 ? shape.ElementSize : 1;
+        // An unconstrained array type takes its length from the positional elements (G99).
+        int width = Math.Max(shape.Size, _elements.Count(e => e.Choices is null) * unit);
         var parts = new string?[width / unit];
         Element? others = null;
         int position = 0;
@@ -213,7 +214,7 @@ public sealed class Aggregate : IDeferredOperand
     {
         if (text.Equals("others", StringComparison.OrdinalIgnoreCase)) return new OthersChoice();
         if (shape?.Layout is not null) return new NameChoice(text);
-        var (left, right) = AssignmentTarget.SplitRange(text);
+        var (left, right, _) = AssignmentTarget.SplitRange(text);
         return new IndexChoice(IndexValue.Parse(left, scope), right is null ? null : IndexValue.Parse(right, scope));
     }
 

@@ -13,9 +13,16 @@ public class SimulationConfig
     public required Services.Entity Entity { get; init; }
 
     /// <summary>
-    /// Total number of simulation ticks to run.
+    /// The last tick of the run (the stop time): ticks 0..TotalTicks are simulated,
+    /// events at the stop time included, as GHDL's <c>--stop-time</c>.
     /// </summary>
     public ulong TotalTicks { get; init; }
+
+    /// <summary>
+    /// Nanoseconds per tick: what every tick count in this configuration is in,
+    /// and what the engine converts <c>after</c>/<c>wait for</c> delays with.
+    /// </summary>
+    public int TickResNs { get; init; } = TimeMachine.Models.TimeClock.NS_PER_TICK;
 
     /// <summary>
     /// Clock signal configurations (auto-toggling clocks).
@@ -32,6 +39,9 @@ public class SimulationConfig
     /// testbench): the port starts there, with no event at t=0.
     /// </summary>
     public List<StimulusEvent> PortInitials { get; init; } = new();
+
+    /// <summary>Where the lines of an elaborated design come from, so run-time errors name the user's file and line (G82); null for a design as written.</summary>
+    public Services.ElaborationLineMap? LineMap { get; init; }
 
     /// <summary>How objects declared without <c>:=</c> start (LRM by default).</summary>
     public InitialValuePolicy InitialValues { get; init; } = InitialValuePolicy.Lrm;
