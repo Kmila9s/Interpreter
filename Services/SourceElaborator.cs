@@ -47,7 +47,7 @@ public sealed partial class SourceElaborator
         var generics = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         ExtractGenericDefaults(generics, top.EntityText);
         PackageRegistry.Instance.RegisterUnitArithmetic(string.Empty, top.Context + "\n" + arch.Context);
-        var (decl, body, _) = Inline(arch.DeclPart, arch.Body, arch.Specs, block, lib, generics, depth: 0, pathPrefix: string.Empty);
+        var (decl, body, _) = Inline(arch, arch.Specs, block, lib, generics, depth: 0, pathPrefix: string.Empty);
 
         var sb = new StringBuilder();
         // Library / use clauses (and packages) of the top's files; children's
@@ -184,9 +184,10 @@ public sealed partial class SourceElaborator
     /// instance path yet).
     /// </summary>
     private static (string Decl, string Body, List<string> NewLocals) Inline(
-        string decl, string body, BlockConfig specs, BlockConfig? config,
+        ArchRecord arch, BlockConfig specs, BlockConfig? config,
         DesignLibrary lib, IReadOnlyDictionary<string, string> generics, int depth, string pathPrefix)
     {
+        string decl = arch.DeclPart, body = arch.Body;
         if (depth > MaxElaborationDepth)
         {
             Console.Error.WriteLine($"[SourceElaborator] Recursion depth {depth} exceeded — leaving remaining child instances unresolved.");
@@ -194,11 +195,15 @@ public sealed partial class SourceElaborator
         }
 
         var unrolled = GenerateUnroller.Unroll(decl, body, Lookup(decl, generics));
+        // Statement lines map back to the file only while the text is the file's (an
+        // unrolled generate repeats its statements): G82 markers before each piece.
+        bool linesExact = unrolled.Body == body;
         decl = unrolled.Decl;
         body = unrolled.Body;
+        int LineAt(int offset) => arch.BodyLine + body.AsSpan(0, offset).Count('\n');
 
-        var declSb = new StringBuilder(decl);
-        var bodySb = new StringBuilder();
+        var declSb = new StringBuilder(ElaborationLineMap.Marker(arch.File, arch.DeclLine)).Append('\n').Append(decl);
+        var bodySb = new StringBuilder(ElaborationLineMap.Marker(arch.File, arch.BodyLine)).Append('\n');
         // Type declarations already in the flattened declarative part (name → text).
         var emittedTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (name, text, _, _) in TypeDeclarations(decl))
@@ -209,6 +214,8 @@ public sealed partial class SourceElaborator
         {
             bodySb.Append(body, cursor, im.Index - cursor);
             cursor = im.Index + im.Length;
+            // The instance's port connections and alias declarations are its own lines.
+            string instanceMarker = ElaborationLineMap.Marker(arch.File, LineAt(im.Index));
 
             string label = im.Groups["label"].Value;
             string entName = im.Groups["ent"].Value;
@@ -222,6 +229,7 @@ public sealed partial class SourceElaborator
             if (open)
             {
                 bodySb.AppendLine($"  -- {label} : {entName} bound to open (not elaborated)");
+                if (linesExact) bodySb.AppendLine(ElaborationLineMap.Marker(arch.File, LineAt(cursor)));
                 continue;
             }
             // Unknown unit: left as written, so the parser reports it.
@@ -286,7 +294,7 @@ public sealed partial class SourceElaborator
 
             // Flatten the child's own instances and generates first, so the
             // fragments renamed here already have every descendant inlined.
-            var (grandDecl, grandBody, childLocals) = Inline(childArch.DeclPart, childArch.Body, childArch.Specs,
+            var (grandDecl, grandBody, childLocals) = Inline(childArch, childArch.Specs,
                 childBlock, lib, genericValues, depth + 1, aliasPrefix);
             foreach (var sig in childArch.LocalSignals.Concat(childLocals))
                 rename[sig] = aliasPrefix + sig;
@@ -307,6 +315,7 @@ public sealed partial class SourceElaborator
             childDecl = DeduplicateTypes(childDecl, ref childBody, emittedTypes, aliasPrefix);
 
             declSb.AppendLine();
+            declSb.AppendLine(instanceMarker);
             declSb.AppendLine($"  -- ↓ inlined from component {label} : {entName}");
             // Declaration order = association order (the flattened text must stay stable), then the defaults.
             foreach (var formal in portMappings.Select(kv => FormalBase(kv.Key)).Distinct(StringComparer.OrdinalIgnoreCase).Concat(unassociated))
@@ -342,6 +351,7 @@ public sealed partial class SourceElaborator
             declSb.Append(childDecl);
 
             bodySb.AppendLine();
+            bodySb.AppendLine(instanceMarker);
             bodySb.AppendLine($"  -- ↓ inlined body for component {label} : {entName}");
             foreach (var kv in portMappings)
             {
@@ -366,6 +376,8 @@ public sealed partial class SourceElaborator
             bodySb.Append(childBody);
             bodySb.AppendLine();
             bodySb.AppendLine($"  -- ↑ end inlined body for {label} : {entName}");
+            // The parent's statements resume at the instance's last line.
+            if (linesExact) bodySb.AppendLine(ElaborationLineMap.Marker(arch.File, LineAt(cursor)));
         }
         // Trailing text after the last instance.
         bodySb.Append(body, cursor, body.Length - cursor);

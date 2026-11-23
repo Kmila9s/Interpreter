@@ -247,7 +247,7 @@ public class FastSimulationRunner : IDisposable, ISimulationRunner
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            Error = SimulationRunner.DescribeFailure(ex);
+            Error = SimulationRunner.DescribeFailure(ex, config.LineMap);
             OnError?.Invoke(Error);
             OnSimulationEnded?.Invoke(false);
         }

@@ -53,10 +53,17 @@ public class SimulationRunner : IDisposable, ISimulationRunner
     /// stack frame, so headless callers can pinpoint it rather than just see
     /// a generic "Object reference not set". Shared by both runners.
     /// </summary>
-    internal static string DescribeFailure(Exception ex)
+    internal static string DescribeFailure(Exception ex, ElaborationLineMap? lines = null)
     {
         var firstFrame = (ex.StackTrace ?? string.Empty).Split('\n').FirstOrDefault()?.Trim() ?? string.Empty;
-        return $"{ex.GetType().Name}: {ex.Message} | {firstFrame}";
+        // An elaborated design's error names the file and line the user wrote (G82).
+        Exception located = (ex, lines) switch
+        {
+            (SimulationRuntimeException runtime, { } map) => map.Relocate(runtime),
+            (Parser.Models.ParserException parse, { } map) => map.Relocate(parse),
+            _ => ex,
+        };
+        return $"{located.GetType().Name}: {located.Message} | {firstFrame}";
     }
 
     /// <summary>
@@ -294,7 +301,7 @@ public class SimulationRunner : IDisposable, ISimulationRunner
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            Error = DescribeFailure(ex);
+            Error = DescribeFailure(ex, config.LineMap);
             OnError?.Invoke(Error);
             OnSimulationEnded?.Invoke(false);
         }
