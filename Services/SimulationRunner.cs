@@ -57,12 +57,7 @@ public class SimulationRunner : IDisposable, ISimulationRunner
     {
         var firstFrame = (ex.StackTrace ?? string.Empty).Split('\n').FirstOrDefault()?.Trim() ?? string.Empty;
         // An elaborated design's error names the file and line the user wrote (G82).
-        Exception located = (ex, lines) switch
-        {
-            (SimulationRuntimeException runtime, { } map) => map.Relocate(runtime),
-            (Parser.Models.ParserException parse, { } map) => map.Relocate(parse),
-            _ => ex,
-        };
+        var located = lines?.Locate(ex) ?? ex;
         return $"{located.GetType().Name}: {located.Message} | {firstFrame}";
     }
 

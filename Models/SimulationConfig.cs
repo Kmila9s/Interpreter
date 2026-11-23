@@ -41,7 +41,7 @@ public class SimulationConfig
     public List<StimulusEvent> PortInitials { get; init; } = new();
 
     /// <summary>Where the lines of an elaborated design come from, so run-time errors name the user's file and line (G82); null for a design as written.</summary>
-    public Services.ElaborationLineMap? LineMap { get; set; }
+    public Services.ElaborationLineMap? LineMap { get; init; }
 
     /// <summary>How objects declared without <c>:=</c> start (LRM by default).</summary>
     public InitialValuePolicy InitialValues { get; init; } = InitialValuePolicy.Lrm;

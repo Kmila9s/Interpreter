@@ -272,9 +272,10 @@ internal sealed class DesignLibrary
             lines ??= new LineIndex(text);
             int declLine = lines.LineOf(am.Index + am.Length);
             var specs = new BlockConfig { Architecture = am.Groups["aname"].Value };
+            var declLines = new LineIndex(decl, declLine);
             foreach (Match sm in ConfigSpecRe.Matches(decl))
                 specs.Add(sm.Groups["labels"].Value.Split(','), sm.Groups["comp"].Value,
-                    new ComponentConfig { Binding = ParseBinding(sm.Groups["binding"].Value, declLine + new LineIndex(decl).LineOf(sm.Index) - 1) });
+                    new ComponentConfig { Binding = ParseBinding(sm.Groups["binding"].Value, declLines.LineOf(sm.Index)) });
             int bodyLine = lines.LineOf(am.Index + am.Length + decl.Length + "begin".Length);
             // Removed text keeps its line breaks, so DeclPart's lines stay those of the file (G82).
             decl = ConfigSpecRe.Replace(ComponentDeclRe.Replace(decl, KeepLineBreaks), KeepLineBreaks);
@@ -300,20 +301,26 @@ internal sealed class DesignLibrary
     /// <summary>The line breaks of a removed match: the text around keeps its line numbers.</summary>
     private static string KeepLineBreaks(Match m) => new('\n', m.Value.Count(c => c == '\n'));
 
-    /// <summary>1-based line of a text offset (line starts indexed once, binary search).</summary>
-    private sealed class LineIndex
+    /// <summary>
+    /// The line of a text offset (line starts indexed once, binary search); the
+    /// text's first line is <paramref name="firstLine"/> (1 for a whole file, the
+    /// starting line for a piece of one).
+    /// </summary>
+    internal sealed class LineIndex(string text, int firstLine = 1)
     {
-        private readonly List<int> _starts = [0];
+        private readonly List<int> _starts = Starts(text);
 
-        public LineIndex(string text)
+        private static List<int> Starts(string text)
         {
-            for (int i = 0; i < text.Length; i++) if (text[i] == '\n') _starts.Add(i + 1);
+            var starts = new List<int> { 0 };
+            for (int i = 0; i < text.Length; i++) if (text[i] == '\n') starts.Add(i + 1);
+            return starts;
         }
 
         public int LineOf(int offset)
         {
             int at = _starts.BinarySearch(offset);
-            return at >= 0 ? at + 1 : ~at;
+            return firstLine - 1 + (at >= 0 ? at + 1 : ~at);
         }
     }
 

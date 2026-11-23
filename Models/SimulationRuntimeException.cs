@@ -8,7 +8,7 @@ namespace Interpreter.Models;
 /// evaluator throws it without a position; <see cref="Interpreter.Services.Operation"/>
 /// re-throws it with the source line of the statement being executed.
 /// </summary>
-public sealed class SimulationRuntimeException : Exception, ISourcePosition
+public sealed class SimulationRuntimeException : Exception, IRelocatable<SimulationRuntimeException>
 {
     /// <inheritdoc/>
     public int Line { get; }

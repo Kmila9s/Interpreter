@@ -22,6 +22,12 @@ public sealed class ElaborationLineMap
     /// <summary>The marker that makes the following lines lines <paramref name="line"/>… of <paramref name="file"/>.</summary>
     public static string Marker(string file, int line) => $"{Prefix}{line} \"{file}\"";
 
+    /// <summary>The marker that makes every following line line <paramref name="line"/> of <paramref name="file"/> (generated lines of one statement).</summary>
+    public static string Pinned(string file, int line) => $"{Prefix}={line} \"{file}\"";
+
+    /// <summary>The marker after which lines have no known origin (text that is no longer the file's, e.g. an unrolled generate).</summary>
+    public static string Unknown => $"{Prefix}?";
+
     /// <summary>The map of <paramref name="text"/>; null when it has no markers (not an elaborated text).</summary>
     public static ElaborationLineMap? Parse(string? text)
     {
@@ -30,26 +36,30 @@ public sealed class ElaborationLineMap
         var origins = new (string File, int Line)?[lines.Length];
         string? file = null;
         int next = 0;
+        bool pinned = false;
         for (int i = 0; i < lines.Length; i++)
         {
-            string line = lines[i].Trim();
-            if (line.StartsWith(Prefix, StringComparison.Ordinal) && TryReadMarker(line, out var markerFile, out int markerLine))
+            var line = lines[i].AsSpan().Trim();
+            if (line.StartsWith(Prefix, StringComparison.Ordinal))
             {
-                (file, next) = (markerFile, markerLine);
+                file = TryReadMarker(line[Prefix.Length..], out var markerFile, out next, out pinned) ? markerFile : null;
                 continue;
             }
-            if (file is not null) origins[i] = (file, next++);
+            if (file is not null) origins[i] = (file, pinned ? next : next++);
         }
         return new ElaborationLineMap(origins);
     }
 
-    private static bool TryReadMarker(string line, out string file, out int number)
+    /// <summary>Reads <c>N "file"</c> or <c>=N "file"</c> (pinned); false for <c>?</c> (no origin) or anything else.</summary>
+    private static bool TryReadMarker(ReadOnlySpan<char> marker, out string file, out int number, out bool pinned)
     {
         file = string.Empty;
         number = 0;
-        int space = line.IndexOf(' ', Prefix.Length);
-        if (space < 0 || !int.TryParse(line.AsSpan(Prefix.Length, space - Prefix.Length), out number)) return false;
-        file = line[(space + 1)..].Trim().Trim('"');
+        pinned = marker.StartsWith("=");
+        if (pinned) marker = marker[1..];
+        int space = marker.IndexOf(' ');
+        if (space < 0 || !int.TryParse(marker[..space], out number)) return false;
+        file = marker[(space + 1)..].Trim().Trim('"').ToString();
         return file.Length > 0;
     }
 
@@ -58,20 +68,18 @@ public sealed class ElaborationLineMap
         flatLine >= 1 && flatLine <= _origins.Length ? _origins[flatLine - 1] : null;
 
     /// <summary><paramref name="error"/> moved to its source position (itself when the line is unknown).</summary>
-    public ParserException Relocate(ParserException error) =>
+    public T Relocate<T>(T error) where T : IRelocatable<T> =>
         error.File is null && Origin(error.Line) is var (file, line) ? error.Relocated(file, line) : error;
 
-    /// <summary><paramref name="error"/> moved to its source position (itself when the line is unknown).</summary>
-    public SimulationRuntimeException Relocate(SimulationRuntimeException error) =>
-        error.File is null && Origin(error.Line) is var (file, line) ? error.Relocated(file, line) : error;
+    /// <summary>Any failure moved to its source position when it carries one (parse and run-time errors); others unchanged.</summary>
+    public Exception Locate(Exception error) => error switch
+    {
+        SimulationRuntimeException runtime => Relocate(runtime),
+        ParserException parse => Relocate(parse),
+        _ => error,
+    };
 
     /// <summary><paramref name="diagnostic"/> moved to its source position (itself when the line is unknown).</summary>
     public Diagnostic Relocate(Diagnostic diagnostic) =>
-        diagnostic.File is null && Origin(diagnostic.Line) is var (file, line)
-            ? new Diagnostic
-            {
-                Severity = diagnostic.Severity, Line = line, File = file, Code = diagnostic.Code, Message = diagnostic.Message,
-                StartColumn = diagnostic.StartColumn, EndColumn = diagnostic.EndColumn,
-            }
-            : diagnostic;
+        diagnostic.File is null && Origin(diagnostic.Line) is var (file, line) ? diagnostic with { Line = line, File = file } : diagnostic;
 }

@@ -47,7 +47,7 @@ public sealed partial class SourceElaborator
         var generics = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         ExtractGenericDefaults(generics, top.EntityText);
         PackageRegistry.Instance.RegisterUnitArithmetic(string.Empty, top.Context + "\n" + arch.Context);
-        var (decl, body, _) = Inline(arch, arch.Specs, block, lib, generics, depth: 0, pathPrefix: string.Empty);
+        var (decl, body, _) = Inline(arch, block, lib, generics, depth: 0, pathPrefix: string.Empty);
 
         var sb = new StringBuilder();
         // Library / use clauses (and packages) of the top's files; children's
@@ -176,15 +176,15 @@ public sealed partial class SourceElaborator
     }
 
     /// <summary>
-    /// Flattens one architecture (<paramref name="decl"/>/<paramref name="body"/>):
-    /// unrolls its generates, then inlines every instance — recursively, so a child
+    /// Flattens one architecture (<paramref name="arch"/>, with its configuration
+    /// specifications): unrolls its generates, then inlines every instance — recursively, so a child
     /// with further instances arrives already flattened (three-level
     /// <c>tb → dut → sub</c>, audit F-G-06). Returns the declarative part, the body
     /// and the local names the generate unrolling added (unprefixed by the caller's
-    /// instance path yet).
+    /// instance path yet). Marker comments locate every copied piece in its file (G82).
     /// </summary>
     private static (string Decl, string Body, List<string> NewLocals) Inline(
-        ArchRecord arch, BlockConfig specs, BlockConfig? config,
+        ArchRecord arch, BlockConfig? config,
         DesignLibrary lib, IReadOnlyDictionary<string, string> generics, int depth, string pathPrefix)
     {
         string decl = arch.DeclPart, body = arch.Body;
@@ -194,16 +194,19 @@ public sealed partial class SourceElaborator
             return (decl, body, []);
         }
 
+        var specs = arch.Specs;
         var unrolled = GenerateUnroller.Unroll(decl, body, Lookup(decl, generics));
-        // Statement lines map back to the file only while the text is the file's (an
-        // unrolled generate repeats its statements): G82 markers before each piece.
+        // Statement lines map back to the file only while the text is the file's: an
+        // unrolled generate repeats its statements, so its body gets no origin (G82).
         bool linesExact = unrolled.Body == body;
         decl = unrolled.Decl;
         body = unrolled.Body;
-        int LineAt(int offset) => arch.BodyLine + body.AsSpan(0, offset).Count('\n');
+        var bodyLines = new DesignLibrary.LineIndex(body, arch.BodyLine);
+        string MarkerAt(int offset) => linesExact ? ElaborationLineMap.Marker(arch.File, bodyLines.LineOf(offset)) : ElaborationLineMap.Unknown;
+        string PinnedAt(int offset) => linesExact ? ElaborationLineMap.Pinned(arch.File, bodyLines.LineOf(offset)) : ElaborationLineMap.Unknown;
 
         var declSb = new StringBuilder(ElaborationLineMap.Marker(arch.File, arch.DeclLine)).Append('\n').Append(decl);
-        var bodySb = new StringBuilder(ElaborationLineMap.Marker(arch.File, arch.BodyLine)).Append('\n');
+        var bodySb = new StringBuilder(MarkerAt(0)).Append('\n');
         // Type declarations already in the flattened declarative part (name → text).
         var emittedTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (name, text, _, _) in TypeDeclarations(decl))
@@ -214,8 +217,8 @@ public sealed partial class SourceElaborator
         {
             bodySb.Append(body, cursor, im.Index - cursor);
             cursor = im.Index + im.Length;
-            // The instance's port connections and alias declarations are its own lines.
-            string instanceMarker = ElaborationLineMap.Marker(arch.File, LineAt(im.Index));
+            // The instance's port connections and alias declarations are all its line.
+            string instanceMarker = PinnedAt(im.Index);
 
             string label = im.Groups["label"].Value;
             string entName = im.Groups["ent"].Value;
@@ -229,7 +232,7 @@ public sealed partial class SourceElaborator
             if (open)
             {
                 bodySb.AppendLine($"  -- {label} : {entName} bound to open (not elaborated)");
-                if (linesExact) bodySb.AppendLine(ElaborationLineMap.Marker(arch.File, LineAt(cursor)));
+                bodySb.AppendLine(MarkerAt(cursor));
                 continue;
             }
             // Unknown unit: left as written, so the parser reports it.
@@ -294,8 +297,7 @@ public sealed partial class SourceElaborator
 
             // Flatten the child's own instances and generates first, so the
             // fragments renamed here already have every descendant inlined.
-            var (grandDecl, grandBody, childLocals) = Inline(childArch, childArch.Specs,
-                childBlock, lib, genericValues, depth + 1, aliasPrefix);
+            var (grandDecl, grandBody, childLocals) = Inline(childArch, childBlock, lib, genericValues, depth + 1, aliasPrefix);
             foreach (var sig in childArch.LocalSignals.Concat(childLocals))
                 rename[sig] = aliasPrefix + sig;
 
@@ -377,7 +379,7 @@ public sealed partial class SourceElaborator
             bodySb.AppendLine();
             bodySb.AppendLine($"  -- ↑ end inlined body for {label} : {entName}");
             // The parent's statements resume at the instance's last line.
-            if (linesExact) bodySb.AppendLine(ElaborationLineMap.Marker(arch.File, LineAt(cursor)));
+            bodySb.AppendLine(MarkerAt(cursor));
         }
         // Trailing text after the last instance.
         bodySb.Append(body, cursor, body.Length - cursor);
@@ -566,19 +568,17 @@ public sealed partial class SourceElaborator
         KeyValuePair<string, string> association, Dictionary<string, PortInfo> ports, string label)
     {
         if (ConversionRe().Match(association.Key) is not { Success: true } formal
-            || ports.ContainsKey(formal.Groups["fn"].Value) || !ports.ContainsKey(formal.Groups["arg"].Value))
+            || ports.ContainsKey(formal.Groups["fn"].Value) || !ports.TryGetValue(formal.Groups["arg"].Value, out var port))
             return association;
-        string port = formal.Groups["arg"].Value;
-        var actual = ConversionRe().Match(association.Value.Trim());
-        if (VectorTypeMarks.Contains(formal.Groups["fn"].Value)
-            && (!ports[port].IsInout || actual.Success && VectorTypeMarks.Contains(actual.Groups["fn"].Value)))
-            return new(port.ToLowerInvariant(), actual.Success && ports[port].IsInout ? actual.Groups["arg"].Value : association.Value.Trim());
-        throw new ParserException($"port \"{port}\" of {label}: conversion \"{association.Key.Trim()} => {association.Value.Trim()}\" is not supported yet", 0, 0);
+        string portName = formal.Groups["arg"].Value, actual = association.Value.Trim();
+        var actualConversion = ConversionRe().Match(actual);
+        bool formalIsTypeMark = TypeMarks.IsBitVector(formal.Groups["fn"].Value);
+        bool actualIsTypeMark = actualConversion.Success && TypeMarks.IsBitVector(actualConversion.Groups["fn"].Value);
+        // An inout needs the conversion both ways; an in/out formal only its own.
+        if (!formalIsTypeMark || port.IsInout && !actualIsTypeMark)
+            throw new ParserException($"port \"{portName}\" of {label}: conversion \"{association.Key.Trim()} => {actual}\" is not supported yet", 0, 0);
+        return new(portName, port.IsInout ? actualConversion.Groups["arg"].Value : actual);
     }
-
-    /// <summary>Closely related vector types: a conversion between two of them keeps the bits.</summary>
-    private static readonly HashSet<string> VectorTypeMarks = new(StringComparer.OrdinalIgnoreCase)
-        { "std_logic_vector", "std_ulogic_vector", "unsigned", "signed", "bit_vector" };
 
     /// <summary><c>f(name)</c>: a conversion (function or type mark) applied to one name.</summary>
     [System.Text.RegularExpressions.GeneratedRegex(@"^\s*(?<fn>[A-Za-z]\w*)\s*\(\s*(?<arg>[A-Za-z]\w*)\s*\)\s*$")]
@@ -633,8 +633,9 @@ public sealed partial class SourceElaborator
                 emitted[aliasPrefix + name] = text;
             }
         }
+        // A dropped declaration keeps its line breaks: the lines after it stay the file's (G82).
         foreach (var (start, length) in drop.OrderByDescending(d => d.Start))
-            childDecl = childDecl.Remove(start, length);
+            childDecl = childDecl.Remove(start, length).Insert(start, new string('\n', childDecl.AsSpan(start, length).Count('\n')));
         if (renames.Count > 0)
         {
             childDecl = VhdlUnitText.RenameTokens(childDecl, renames);
