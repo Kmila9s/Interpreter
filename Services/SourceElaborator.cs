@@ -253,6 +253,7 @@ public sealed partial class SourceElaborator
             // `open` gets its own alias too, so it never drives a parent signal of
             // the same name.
             portMappings.RemoveAll(kv => kv.Value.Equals("open", StringComparison.OrdinalIgnoreCase));
+            portMappings = portMappings.Select(kv => WithoutTypeConversions(kv, portInfo, label)).ToList();
             var associated = portMappings.Select(kv => FormalBase(kv.Key)).ToHashSet(StringComparer.OrdinalIgnoreCase);
             var unassociated = portInfo.Where(p => !associated.Contains(p.Key))
                 .Select(p => p.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -541,6 +542,35 @@ public sealed partial class SourceElaborator
             }
         }
     }
+
+    /// <summary>
+    /// An association whose formal is converted (<c>unsigned(b) =&gt; std_logic_vector(u)</c>,
+    /// G83): with a type conversion between closely related vector types on both sides the
+    /// bits are the same, so it is the plain association <c>b =&gt; u</c>. A conversion
+    /// function on the formal (<c>to_bit(b) =&gt; …</c>) is rejected instead of being
+    /// dropped as an association with an unknown port.
+    /// </summary>
+    private static KeyValuePair<string, string> WithoutTypeConversions(
+        KeyValuePair<string, string> association, Dictionary<string, PortInfo> ports, string label)
+    {
+        if (ConversionRe().Match(association.Key) is not { Success: true } formal
+            || ports.ContainsKey(formal.Groups["fn"].Value) || !ports.ContainsKey(formal.Groups["arg"].Value))
+            return association;
+        string port = formal.Groups["arg"].Value;
+        var actual = ConversionRe().Match(association.Value.Trim());
+        if (VectorTypeMarks.Contains(formal.Groups["fn"].Value)
+            && (!ports[port].IsInout || actual.Success && VectorTypeMarks.Contains(actual.Groups["fn"].Value)))
+            return new(port.ToLowerInvariant(), actual.Success && ports[port].IsInout ? actual.Groups["arg"].Value : association.Value.Trim());
+        throw new ParserException($"port \"{port}\" of {label}: conversion \"{association.Key.Trim()} => {association.Value.Trim()}\" is not supported yet", 0, 0);
+    }
+
+    /// <summary>Closely related vector types: a conversion between two of them keeps the bits.</summary>
+    private static readonly HashSet<string> VectorTypeMarks = new(StringComparer.OrdinalIgnoreCase)
+        { "std_logic_vector", "std_ulogic_vector", "unsigned", "signed", "bit_vector" };
+
+    /// <summary><c>f(name)</c>: a conversion (function or type mark) applied to one name.</summary>
+    [System.Text.RegularExpressions.GeneratedRegex(@"^\s*(?<fn>[A-Za-z]\w*)\s*\(\s*(?<arg>[A-Za-z]\w*)\s*\)\s*$")]
+    private static partial System.Text.RegularExpressions.Regex ConversionRe();
 
     /// <summary>Port named by a formal that may carry selectors: <c>p</c> for <c>p.lo</c> or <c>p(3)</c>.</summary>
     private static string FormalBase(string formal)
