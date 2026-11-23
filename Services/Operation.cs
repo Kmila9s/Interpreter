@@ -1058,7 +1058,11 @@ public class Operation : IOperation, IConcurrentStatement {
                                || Services.FunctionRegistry.Instance.IsKnown(token));
                 if (isKnownFn)
                 {
-                    var nested = ParseFunctionCall(token);
+                    // A user function inside a standard call (`to_unsigned(f(x), 8)`) is a
+                    // user call, evaluated with its body (G101: it was taken as a builtin → 0).
+                    (bool success, object result) nested = StandardFunctions.IsStandardFunction(token)
+                        ? ParseFunctionCall(token)
+                        : ParseUserDefinedFunctionCall(token);
                     if (nested.success)
                     {
                         argBuffer.Add(nested.result);
@@ -1901,32 +1905,23 @@ public class Operation : IOperation, IConcurrentStatement {
     /// </summary>
     private Models.DeferredIndex? TryConsumeSliceArg(Variable source)
     {
-        int sliceStart = _currentSyntetizeIndex + 1; // points at '('
-        if (sliceStart >= _data.Length || _data[sliceStart] != "(") return null;
+        int open = _currentSyntetizeIndex + 1; // points at '('
+        if (open >= _data.Length || _data[open] != "(") return null;
+        int close = MatchingClose(open);
+        if (close <= open + 1) return null;
 
-        // Need at least `( <int> )`.
-        if (sliceStart + 2 >= _data.Length) return null;
-        if (!int.TryParse(_data[sliceStart + 1], out int hi)) return null;
-
-        // Single-bit form: `var(N)`.
-        if (_data[sliceStart + 2] == ")")
+        // `var(N)`, `var(H downto L)` or `var(L to H)` with static bounds: literals or
+        // expressions over constants (`3-1` after generic substitution, G98).
+        var (leftText, rightText, downto) = Models.AssignmentTarget.SplitRange(string.Join(" ", _data[(open + 1)..close]));
+        if (Models.IndexValue.Parse(leftText, Variables).StaticValue is not int left) return null;
+        if (rightText is null)
         {
-            // Advance past the slice tokens.
-            _currentSyntetizeIndex = sliceStart + 3;
-            return new Models.DeferredIndex(source, hi, hi, isSlice: false);
+            _currentSyntetizeIndex = close + 1;
+            return new Models.DeferredIndex(source, left, left, isSlice: false);
         }
-
-        // Range form: `var(H downto L)` or `var(L to H)`.
-        if (sliceStart + 4 >= _data.Length) return null;
-        string dir = _data[sliceStart + 2].ToLower();
-        if (dir != "downto" && dir != "to") return null;
-        if (!int.TryParse(_data[sliceStart + 3], out int lo)) return null;
-        if (_data[sliceStart + 4] != ")") return null;
-
-        int high = dir == "downto" ? hi : lo;
-        int low  = dir == "downto" ? lo : hi;
-        _currentSyntetizeIndex = sliceStart + 5;
-        return new Models.DeferredIndex(source, high, low, isSlice: true);
+        if (Models.IndexValue.Parse(rightText, Variables).StaticValue is not int right) return null;
+        _currentSyntetizeIndex = close + 1;
+        return new Models.DeferredIndex(source, downto ? left : right, downto ? right : left, isSlice: true);
     }
 
     // Bug #14 side-channel: ParseIndexedAccessDeferred writes the source +

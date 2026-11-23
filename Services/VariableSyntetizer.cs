@@ -428,6 +428,7 @@ public class VariableSyntetizer : ISControl
                 };
 
                 ApplyShape(newVar, subtype);
+                ConstrainByInitializer(newVar, subtype);
 #if DEBUG
                 if (_isPort && dataType == Constants.DATATYPES.STD_LOGIC_VECTOR)
                     Console.WriteLine($"[VariableSyntetizer] Created port '{newVar.Name}' actual Size={newVar.Size}");
@@ -707,38 +708,9 @@ public class VariableSyntetizer : ISControl
             _streamer.MoveNext();
         }
 
-        // Handle arithmetic chains in default-value expressions, e.g.
-        // `generic (TOTAL : integer := BASE * TIMES)` or
-        // `signal x : integer := WIDTH + 1`. The parser accepts these and
-        // tries to fold the result; if any operand is an unresolved
-        // placeholder (typical for generic-of-generic forward refs), the
-        // partial fold falls back to 0 and the value is materialised by
-        // downstream synthesizers when the actual generic is resolved.
-        while (_streamer.Current?.Type == OPERATORS &&
-               (_streamer.Current.Value == "+" ||
-                _streamer.Current.Value == "-" ||
-                _streamer.Current.Value == "*" ||
-                _streamer.Current.Value == "/"))
-        {
-            string op = _streamer.Current.Value;
-            _streamer.MoveNext();
-
-            object rhs = ParseInitializationOperand();
-
-            int? lhsInt = TryAsInt(value);
-            int? rhsInt = TryAsInt(rhs);
-            if (lhsInt.HasValue && rhsInt.HasValue)
-            {
-                if (op is "+" or "-" or "*" or "/")
-                    value = (int)IntegerArithmetic.Apply(op, lhsInt.Value, rhsInt.Value);
-            }
-            else
-            {
-                // Either side is a forward / unresolved reference. Keep
-                // the LHS so downstream code at least has a deterministic
-                // (if approximate) value rather than a raw object().
-            }
-        }
+        // An arithmetic chain after the first operand (`2**N`, `W + 2 * K`) is folded with
+        // precedence when static (G102); otherwise the first operand stands, as before.
+        if (TryFoldInitializerChain(value) is int folded) value = folded;
 
         // Handle concatenation operator &
         // E.g., "0000" & A or x"FF" & B
@@ -870,54 +842,28 @@ public class VariableSyntetizer : ISControl
     }
 
     /// <summary>
-    /// Reads one operand of a default-value arithmetic expression — a single
-    /// literal, identifier (resolved against the comparator and Variables),
-    /// or parenthesised sub-expression. Used by the <c>+ - * /</c> chain
-    /// handler in <see cref="ParseInitializationValue"/>.
+    /// After the first operand <paramref name="first"/> of an initializer, consumes the
+    /// rest of an arithmetic chain (up to <c>; ) , &amp;</c>) and folds it with
+    /// <see cref="StaticExpression"/> (precedence, <c>**</c>, <c>mod</c>/<c>rem</c>);
+    /// null when no operator follows or the chain is not static here.
     /// </summary>
-    private object ParseInitializationOperand()
+    private int? TryFoldInitializerChain(object first)
     {
-        if (_streamer.Current == null) return 0;
-        if (_streamer.Current.Value == "(")
+        if (_streamer.Current?.Value?.ToLowerInvariant() is not ("+" or "-" or "*" or "/" or "**" or "mod" or "rem"))
+            return null;
+        var text = new System.Text.StringBuilder(first?.ToString());
+        int depth = 0;
+        while (_streamer.Current is { } t && !(depth == 0 && t.Value is ";" or ")" or "," or "&"))
         {
-            return ParseAggregateOrExpression();
-        }
-        if (_streamer.Current.Type == LITERALS)
-        {
-            string raw = _streamer.Current.Value?.Replace("\"", "").Replace("'", "") ?? "0";
+            if (t.Value == "(") depth++; else if (t.Value == ")") depth--;
+            text.Append(' ').Append(t.Value);
             _streamer.MoveNext();
-            if (int.TryParse(raw, out int n)) return n;
-            return raw;
         }
-        if (_streamer.Current.Type == IDENTIFIERS)
-        {
-            string lookupName = _streamer.Current.Value ?? string.Empty;
-            var refVar = _comparator.FirstOrDefault(p => p.Name.Equals(lookupName, StringComparison.OrdinalIgnoreCase))
-                      ?? Variables.FirstOrDefault(p => p.Name.Equals(lookupName, StringComparison.OrdinalIgnoreCase));
-            _streamer.MoveNext();
-            return refVar?.Value ?? 0;
-        }
-        // Unrecognised operand — consume one token and return 0 so the
-        // arithmetic chain doesn't loop forever.
-        _streamer.MoveNext();
-        return 0;
+        return StaticExpression.TryEvaluate(text.ToString(), ConstantLookup(), out long value) ? (int)value : null;
     }
 
-    /// <summary>
-    /// Best-effort int extraction from the heterogeneous <c>object</c> values
-    /// stored as Variable.Value (int / string / bool). Returns null when the
-    /// value isn't recognisable as a numeric integer — in that case the
-    /// caller falls back to the LHS instead of folding.
-    /// </summary>
-    private static int? TryAsInt(object? v)
-    {
-        if (v is null) return null;
-        if (v is int i) return i;
-        if (v is long l) return (int)l;
-        if (v is bool b) return b ? 1 : 0;
-        if (v is string s && int.TryParse(s, out int parsed)) return parsed;
-        return null;
-    }
+    /// <summary>The constants (and generics) visible here, then package constants, as a <see cref="StaticExpression"/> lookup.</summary>
+    private Func<string, string?> ConstantLookup() => StaticExpression.ConstantsIn(Variables, _comparator);
 
     /// <summary>
     /// Parses an aggregate expression like (others => '0') or a parenthesized expression.
@@ -971,6 +917,9 @@ public class VariableSyntetizer : ISControl
             scope.UnionWith(Variables);
             return Aggregate.Parse(group, _currentShape, scope).Bits();
         }
+
+        // A parenthesized literal is the literal (`("0110")`, G96: the `(` was kept as element 0).
+        if (tokens.Count == 1 && HdlLiteral.TryBits(tokens[0], out string bits)) return bits;
 
         // A regular parenthesized expression: kept as text.
         return ("(" + string.Concat(tokens.Select(t => t + " ")) + ")").Trim();
@@ -1089,6 +1038,25 @@ public class VariableSyntetizer : ISControl
         };
     }
 
+    /// <summary>
+    /// An object of an unconstrained array type of records or vectors takes its
+    /// range from its initializer (<c>constant p : pattern_array := ((…), (…))</c>
+    /// → <c>0 to 1</c>), as the LRM constrains it (G99: it stayed <c>0 downto 0</c>).
+    /// </summary>
+    private static void ConstrainByInitializer(Variable v, SubtypeIndication subtype)
+    {
+        if (subtype.Custom is not { Kind: TypeKind.Array, IsUnconstrained: true } t || v.ElementSize <= 1
+            || v.Value is not string bits || bits.Length == 0 || bits.Length % v.ElementSize != 0)
+            return;
+        int count = bits.Length / v.ElementSize;
+        v.SetDeclaredRange(t.UnconstrainedLow, t.UnconstrainedLow + count - 1, isDownto: false);
+        v.ArrayLength = count;
+        v.Size = bits.Length;
+    }
+
+    /// <summary>The low bound of the predefined integer subtypes (<c>natural</c> → 0, <c>positive</c> → 1); null for any other name.</summary>
+    private static long? IntegerSubtypeLow(string name) => name switch { "natural" => 0, "positive" => 1, _ => null };
+
     /// <summary>A template object of <paramref name="subtype"/> (record fields, array elements, initializer shape).</summary>
     private static Variable ShapeOf(SubtypeIndication subtype) =>
         ApplyShape(new Variable { Type = subtype.Type, Size = subtype.Width }, subtype);
@@ -1135,6 +1103,21 @@ public class VariableSyntetizer : ISControl
                 break;
         }
         return v;
+    }
+
+    /// <summary>
+    /// The local declarations of a subprogram (function or procedure) up to its
+    /// body's <c>begin</c>, read with its <paramref name="parameters"/> and the
+    /// enclosing objects and types in scope.
+    /// </summary>
+    private List<Variable> ParseSubprogramLocals(List<ParameterDefinition> parameters)
+    {
+        var scope = new HashSet<Variable>(_comparator);
+        scope.UnionWith(Variables);
+        foreach (var p in parameters) scope.Add(p.CreateVariable());
+        var types = new TypeRegistry();
+        foreach (var t in (_typeRegistry?.Types.Values ?? []).Concat(ParsedTypes.Types.Values)) types.TryRegister(t);
+        return ParseSubprogramLocals(scope, types);
     }
 
     /// <summary>
@@ -1294,7 +1277,7 @@ public class VariableSyntetizer : ISControl
         var customTypeDef = mark.Custom;
         bool signedInt = dataType == Constants.DATATYPES.INTEGER;
         // Integer subtypes: 'left and the bounds (natural = 0 to integer'high, positive = 1 to …).
-        long? scalarLeft = dataTypeStr switch { "natural" => 0, "positive" => 1, _ => null };
+        long? scalarLeft = IntegerSubtypeLow(dataTypeStr);
         (long Low, long High)? scalarRange = scalarLeft is long l0 ? (l0, int.MaxValue) : null;
         // v0.13.0: Handle custom types - they are IDENTIFIERS not KEYWORDS
         // For custom types found in the registry, consume the type identifier directly
@@ -1617,7 +1600,10 @@ public class VariableSyntetizer : ISControl
         {
             var bounds = ReadParenthesized();
             if (bounds.Contains("<>"))
+            {
                 typeDef.IsUnconstrained = true;
+                typeDef.UnconstrainedLow = (int)(IntegerSubtypeLow(bounds[0].ToLowerInvariant()) ?? 0);
+            }
             else if (FoldRange(bounds) is { } range)
             {
                 typeDef.IsDownto = range.IsDownto;
@@ -2022,12 +2008,7 @@ public class VariableSyntetizer : ISControl
         // read by the same declaration parser as a process's: user types (arrays of
         // vectors, records), constant bounds and initial values (G54: a local
         // `m : mem_t` was untyped and the function returned '0').
-        var localScope = new HashSet<Variable>(_comparator);
-        localScope.UnionWith(Variables);
-        foreach (var p in parameters) localScope.Add(p.CreateVariable());
-        var localTypes = new TypeRegistry();
-        foreach (var t in (_typeRegistry?.Types.Values ?? []).Concat(ParsedTypes.Types.Values)) localTypes.TryRegister(t);
-        var localVariables = ParseSubprogramLocals(localScope, localTypes);
+        var localVariables = ParseSubprogramLocals(parameters);
         if (_streamer.Current?.Value?.ToLower() == "begin")
         {
             _streamer.MoveNext(); // consume 'begin'
@@ -2211,25 +2192,11 @@ public class VariableSyntetizer : ISControl
             string? customTypeName = dataType == Constants.DATATYPES.UNKNOWN ? typeTok : null;
             _streamer.MoveNext();
 
-            int size = 0, hi = 0, lo = 0;
-            if (_streamer.Current?.Value == "(")
-            {
-                _streamer.MoveNext();
-                if (int.TryParse(_streamer.Current?.Value, out int h))
-                {
-                    hi = h; _streamer.MoveNext();
-                    _streamer.MoveNext(); // downto/to
-                    if (int.TryParse(_streamer.Current?.Value, out int l))
-                    {
-                        lo = l;
-                        size = Math.Abs(hi - lo) + 1;
-                        _streamer.MoveNext();
-                    }
-                }
-                while (_streamer.Current != null && _streamer.Current.Value != ")")
-                    _streamer.MoveNext();
-                if (_streamer.Current?.Value == ")") _streamer.MoveNext();
-            }
+            // The index constraint, folded like any other range (`W-1 downto 0`); none
+            // written means an unconstrained formal that takes its actual's shape.
+            bool constrained = _streamer.Current?.Value == "(";
+            var range = constrained ? FoldRange(ReadParenthesized()) : null;
+            int size = range is var (rl, rr, _) ? Math.Abs(rl - rr) + 1 : 0;
 
             foreach (var n in names)
             {
@@ -2241,8 +2208,8 @@ public class VariableSyntetizer : ISControl
                     TypeMark = typeTok.ToLowerInvariant(),
                     Mode = mode,
                     Size = size,
-                    HighBound = hi,
-                    LowBound = lo,
+                    Range = range,
+                    IsUnconstrained = dataType == Constants.DATATYPES.STD_LOGIC_VECTOR && !constrained,
                     IsSignal = isSignal,
                 });
             }
@@ -2294,14 +2261,10 @@ public class VariableSyntetizer : ISControl
             _streamer.MoveNext();
         }
 
-        // Skip local declarations (variables, constants) between 'is' and the
-        // body-opening 'begin'.
-        int _declIter = 0;
-        while (_streamer.Current != null && _streamer.Current.Value?.ToLower() != "begin")
-        {
-            ParseTrace.Step(ref _declIter, _streamer, _currentCt);
-            _streamer.MoveNext();
-        }
+        // Local declarations (variables, constants, types) between 'is' and the
+        // body-opening 'begin', read like a function's (G94: a local `l : line`
+        // was skipped, so `write(l, …)` in the body found no `l`).
+        var localVariables = ParseSubprogramLocals(parameters);
         if (_streamer.Current?.Value?.ToLower() == "begin")
         {
             _streamer.MoveNext();
@@ -2365,6 +2328,7 @@ public class VariableSyntetizer : ISControl
                 Name = procedureNameRaw,
                 Parameters = parameters,
                 BodyRaw = bodyRaw,
+                LocalVariables = localVariables,
                 IsPure = false,   // procedures may have side effects
             });
             // Diagnostic stays as-is — MVP inlining only fires report
@@ -2498,66 +2462,16 @@ public class VariableSyntetizer : ISControl
     }
 
     /// <summary>
-    /// F-G-01 helper (session 8, 2026-07-09): fold a small VHDL range-bound
-    /// expression to an integer. Handles integer literals, single-token
-    /// constant references (resolved via PackageRegistry), and left-to-right
-    /// two-operand or three-operand chains over +, -, *, /. Returns null
-    /// when the expression contains anything more complex — the caller then
-    /// falls back to the pre-existing default-8 behaviour.
+    /// Folds a range-bound expression to an integer with <see cref="StaticExpression"/>;
+    /// names are this scope's constants and package constants (<see cref="ConstantLookup"/>).
+    /// Null when it is not static here — the caller then falls back to its default.
     /// </summary>
-    private int? FoldSimpleExpr(List<string> tokens)
-    {
-        // Filter out whitespace-only tokens defensively.
-        var t = tokens.Where(x => !string.IsNullOrWhiteSpace(x)).ToList();
-        if (t.Count == 0) return null;
-
-        // Single operand.
-        if (t.Count == 1) return ResolveToken(t[0]);
-
-        // Two-operand: OP a  (unary -/+)  — rare in range specs but cheap.
-        if (t.Count == 2 && (t[0] == "-" || t[0] == "+"))
-        {
-            var v = ResolveToken(t[1]);
-            if (v == null) return null;
-            return t[0] == "-" ? -v.Value : v.Value;
-        }
-
-        // Left-to-right fold: value op value op value ... (no precedence).
-        int i = 0;
-        var a = ResolveToken(t[i++]);
-        if (a == null) return null;
-        int acc = a.Value;
-        while (i + 1 < t.Count)
-        {
-            string op = t[i++];
-            var b = ResolveToken(t[i++]);
-            if (b == null) return null;
-            if (op is not ("+" or "-" or "*" or "/")) return null;
-            acc = (int)IntegerArithmetic.Apply(op, acc, b.Value);
-        }
-        return i == t.Count ? acc : null;
-    }
-
-    /// <summary>
-    /// Resolves a single token to an integer: literal → parse; identifier →
-    /// look up in <see cref="PackageRegistry"/>. Returns null on miss.
-    /// </summary>
-    private int? ResolveToken(string token)
-    {
-        string s = token.Replace("_", string.Empty);
-        if (int.TryParse(s, out int lit)) return lit;
-
-        // Constants and generics already declared in this scope (`constant W`,
-        // `generic (WIDTH …)`) before package constants.
-        var local = Variables.FirstOrDefault(v => v.IsConstant && v.Name.Equals(token, StringComparison.OrdinalIgnoreCase))
-                    ?? _comparator.FirstOrDefault(v => v.IsConstant && v.Name.Equals(token, StringComparison.OrdinalIgnoreCase));
-        if (local is not null && int.TryParse(local.Value?.ToString(), out int lc)) return lc;
-
-        var c = PackageRegistry.Instance.GetConstant(token);
-        if (c?.Value is int ci) return ci;
-        if (c?.Value is string cs && int.TryParse(cs, out int cp)) return cp;
-        return null;
-    }
+    private int? FoldSimpleExpr(List<string> tokens) =>
+        // One static evaluator for every bound (precedence, `**`, `mod`, parentheses; G97:
+        // `0 to 2**4-1` folded to nothing); names resolve as constants of this scope.
+        StaticExpression.TryEvaluate(string.Join(" ", tokens), ConstantLookup(), out long value)
+            ? (int)value
+            : null;
 
     /// <summary>
     /// F-G-02 helper (session 8, 2026-07-09): coerce a <see cref="GetVariableValue"/>

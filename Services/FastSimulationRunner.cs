@@ -153,7 +153,8 @@ public class FastSimulationRunner : IDisposable, ISimulationRunner
             // settling live there), then jump to each subsequent event tick.
             int visited = 0;
             ulong? endTick = null;
-            for (ulong tick = 0; tick < totalTicks; )
+            // The window is 0..totalTicks inclusive (see SimulationRunner).
+            for (ulong tick = 0; tick <= totalTicks; )
             {
                 if (_cts.IsCancellationRequested)
                 {
@@ -209,7 +210,7 @@ public class FastSimulationRunner : IDisposable, ISimulationRunner
 
                 // Progress by sim-time position (event ticks are sparse, so the
                 // bar advances in jumps — fine for a headless "fast" run).
-                double percent = (double)(tick + 1) / totalTicks * 100.0;
+                double percent = (double)(tick + 1) / (totalTicks + 1) * 100.0;
                 double rounded = Math.Floor(percent);
                 if (rounded > lastReportedPercent)
                 {
@@ -224,9 +225,9 @@ public class FastSimulationRunner : IDisposable, ISimulationRunner
                 VisitedTicks = visited;
 
                 // Compute the next interesting tick strictly greater than the
-                // current one; break when nothing remains before totalTicks.
+                // current one; break when nothing remains up to totalTicks.
                 ulong? next = NextEventTick(tick, config, stimTicks, ref stimIdx);
-                if (next is null || next.Value >= totalTicks)
+                if (next is null || next.Value > totalTicks)
                     break;
                 tick = next.Value;
             }

@@ -68,15 +68,14 @@ public class ParameterDefinition
     /// </summary>
     public int Size { get; set; } = 0;
 
-    /// <summary>
-    /// Gets or sets the vector high bound (for range types).
-    /// </summary>
-    public int HighBound { get; set; } = 0;
+    /// <summary>The index constraint as written (<c>(7 downto 0)</c> → (7, 0, true)); null when none could be folded.</summary>
+    public (int Left, int Right, bool IsDownto)? Range { get; set; }
 
     /// <summary>
-    /// Gets or sets the vector low bound (for range types).
+    /// A vector formal written without an index constraint (<c>s : std_logic_vector</c>):
+    /// it takes its actual's shape at each call (G101).
     /// </summary>
-    public int LowBound { get; set; } = 0;
+    public bool IsUnconstrained { get; set; }
 
     /// <summary>
     /// Gets or sets the optional default value for the parameter.
@@ -88,7 +87,7 @@ public class ParameterDefinition
     /// </summary>
     /// <param name="value">The value to assign to the variable.</param>
     /// <returns>A new Variable instance.</returns>
-    public Variable CreateVariable(object? value = null)
+    public Variable CreateVariable(object? value = null, Variable? actual = null)
     {
         var variable = new Variable(Name, value?.ToString() ?? "", Type)
         {
@@ -96,13 +95,30 @@ public class ParameterDefinition
             TypeMark = TypeMark,
         };
 
-        if (Type == Constants.DATATYPES.STD_LOGIC_VECTOR)
-        {
-            variable.Size = Size > 0 ? Size : (HighBound - LowBound + 1);
-        }
+        if (Type != Constants.DATATYPES.STD_LOGIC_VECTOR) return variable;
 
+        // Set once: the Size setter fits the value to it.
+        if (!IsUnconstrained)
+        {
+            variable.Size = Math.Max(Size, 1);
+            if (Range is var (left, right, downto)) variable.SetDeclaredRange(left, right, downto);
+        }
+        else if (actual is { Size: > 0 })
+        {
+            variable.Size = actual.Size;
+            if (actual.HasDeclaredRange)
+                variable.SetDeclaredRange(actual.LeftBound!.Value, actual.RightBound!.Value, actual.IsDownto);
+        }
+        else
+        {
+            // A value without its object (a literal actual): (length-1 downto 0).
+            variable.Size = value is string bits && bits.Length > 0 && StdLogic.IsVector(bits) ? bits.Length : 1;
+        }
         return variable;
     }
+
+    /// <summary>The shape of the formal <see cref="CreateVariable"/> makes for this call: what a body synthesised for it depends on.</summary>
+    public static string ShapeKey(Variable formal) => $"{formal.Size}:{formal.LeftBound}:{formal.RightBound}:{formal.IsDownto}";
 
     /// <summary>
     /// Returns a string representation of the parameter.

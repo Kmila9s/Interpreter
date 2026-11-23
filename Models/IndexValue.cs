@@ -48,6 +48,10 @@ public sealed class IndexValue
     {
         text = text.Trim();
         if (int.TryParse(text, out int literal)) return Literal(literal);
+        // A static expression (`4-1` after generic substitution, a constant `C`, `W-2`) is a
+        // fixed index (G98: it was run-time, so its driver covered the whole signal).
+        if (StaticExpression.TryEvaluate(text, StaticExpression.ConstantsIn(scope), out long folded))
+            return Literal((int)folded);
         var named = scope.FirstOrDefault(v => v is not null && string.Equals(v.Name, text, StringComparison.OrdinalIgnoreCase));
         return named is not null ? Of(named) : Of(text, scope);
     }

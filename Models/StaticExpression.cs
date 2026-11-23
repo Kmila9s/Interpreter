@@ -16,6 +16,15 @@ public static partial class StaticExpression
     private static partial Regex Lexeme();
 
     /// <summary>
+    /// The lookup most callers pass: the value text of the first constant (or
+    /// generic) of that name in <paramref name="scopes"/>, in order, then of a
+    /// package constant. Signals and variables are never static.
+    /// </summary>
+    public static Func<string, string?> ConstantsIn(params IEnumerable<Parser.Models.Variable>[] scopes) => name =>
+        scopes.SelectMany(s => s).FirstOrDefault(v => v is { IsConstant: true } && v.Name.Equals(name, StringComparison.OrdinalIgnoreCase))?.Value?.ToString()
+        ?? Services.PackageRegistry.Instance.GetConstant(name)?.Value?.ToString();
+
+    /// <summary>
     /// Evaluates <paramref name="text"/>; names are resolved by
     /// <paramref name="lookup"/> (returning the name's value text, evaluated
     /// recursively up to depth 8).

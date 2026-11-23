@@ -107,8 +107,9 @@ public class DeferredUserFunction
         {
             var argOp = new Operation(ArgExpressions[i], Variables);
             var argResult = argOp.Execute();
+            // The actual itself (not only its value), so an unconstrained formal takes its shape (G101).
             argValues[i] = argResult is Variable av
-                ? (av.Value ?? "0")
+                ? (av.Value is null ? "0" : av)
                 : (argResult ?? "0");
         }
 

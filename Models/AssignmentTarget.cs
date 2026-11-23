@@ -142,19 +142,19 @@ public sealed partial class AssignmentTarget
 
     /// <summary>
     /// Splits an index text at a top-level <c>to</c>/<c>downto</c>:
-    /// <c>("3", "2")</c> for <c>3 downto 2</c>, <c>("i", null)</c> for a single index.
+    /// <c>("3", "2", true)</c> for <c>3 downto 2</c>, <c>("i", null, false)</c> for a single index.
     /// </summary>
-    internal static (string Left, string? Right) SplitRange(string index)
+    internal static (string Left, string? Right, bool IsDownto) SplitRange(string index)
     {
         var m = RangeKeyword().Match(index);
         while (m.Success)
         {
             string before = index[..m.Index];
             if (before.Count(c => c == '(') == before.Count(c => c == ')'))
-                return (before, index[(m.Index + m.Length)..]);
+                return (before, index[(m.Index + m.Length)..], m.Groups[1].Value.Equals("downto", StringComparison.OrdinalIgnoreCase));
             m = m.NextMatch();
         }
-        return (index, null);
+        return (index, null, false);
     }
 
     [GeneratedRegex(@"\s(downto|to)\s", RegexOptions.IgnoreCase)]

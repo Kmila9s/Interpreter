@@ -259,6 +259,10 @@ public sealed partial class SourceElaborator
             // An `inout` formal is its actual (G53): the child reads the resolved
             // value and its drivers join the actual's, with no copy in either
             // direction (two copies of a resolved signal would latch each other).
+            // Whole formals → their actual text (`a => x`; `a(0) => x` is a partial association).
+            var actualOf = portMappings.Where(kv => string.Equals(kv.Key, FormalBase(kv.Key), StringComparison.OrdinalIgnoreCase))
+                .GroupBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First().Value.Trim(), StringComparer.OrdinalIgnoreCase);
             var inoutActuals = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var kv in portMappings)
             {
@@ -320,8 +324,13 @@ public sealed partial class SourceElaborator
                             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                                 { [gv.Key] = gv.Value });
                     }
-                    string init = unassociated.Contains(formal) && info.Default is { } d
-                        ? $" := {d}" : "";
+                    // An unassociated port starts at its default; an input associated with a
+                    // plain signal is that signal (one object in the LRM), so its alias starts
+                    // at the actual's value, not at 'U' for the first delta (G88).
+                    string init = unassociated.Contains(formal) && info.Default is { } d ? $" := {d}"
+                        : !info.IsOutput && actualOf.TryGetValue(formal, out var actual)
+                          && System.Text.RegularExpressions.Regex.IsMatch(actual, global::Parser.Models.Constants.IDENTIFIERS) ? $" := {actual}"
+                        : "";
                     declSb.AppendLine($"  signal {aliasName} : {typeText}{init};");
                 }
                 else

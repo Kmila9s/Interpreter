@@ -13,7 +13,8 @@ public class SimulationConfig
     public required Services.Entity Entity { get; init; }
 
     /// <summary>
-    /// Total number of simulation ticks to run.
+    /// The last tick of the run (the stop time): ticks 0..TotalTicks are simulated,
+    /// events at the stop time included, as GHDL's <c>--stop-time</c>.
     /// </summary>
     public ulong TotalTicks { get; init; }
 

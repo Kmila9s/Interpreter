@@ -75,14 +75,13 @@ public class FunctionDefinition
     public List<Variable> LocalVariables { get; set; } = new();
 
     /// <summary>
-    /// Bench bug #19 perf follow-up: cached per-function-definition scope
-    /// used by ExecuteFunctionBody. SynthesizeFunctionBody binds the body's
-    /// Operations to the Variable instances in this scope; subsequent calls
-    /// update those Variables' .Value in place rather than re-synthesising
-    /// against a fresh scope (which was 20× slower on P22/P3). Null until
-    /// the first call synthesises the body.
+    /// Bench bug #19 perf follow-up: the synthesised body and the scope its
+    /// Operations are bound to, one per shape of the unconstrained formals
+    /// (<see cref="ParameterDefinition.ShapeKey"/>; G101: a body synthesised for an
+    /// 8-bit actual must not serve a 16-bit one). Later calls of the same shape
+    /// update the formals' values in place instead of re-synthesising (20× slower).
     /// </summary>
-    public HashSet<Variable>? CachedScope { get; set; } = null;
+    public Dictionary<string, (HashSet<Variable> Scope, List<object> Body)> ShapeCache { get; } = new();
 
     /// <summary>
     /// Phase 3 (Session 26, 2026-07-22): per-call-site cached bound
