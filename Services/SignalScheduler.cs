@@ -6,8 +6,8 @@ namespace Interpreter.Services;
 /// <summary>Delay mechanism of a signal assignment (<c>transport</c> or <c>[reject t] inertial</c>, the default).</summary>
 public enum DelayMechanism { Inertial, Transport }
 
-/// <summary>One element of a waveform: <c>value after t</c> (<paramref name="AfterNs"/> = 0: the next delta).</summary>
-public readonly record struct WaveformElement(object Value, long AfterNs);
+/// <summary>One element of a waveform: <c>value after t</c>, the delay in femtoseconds (<paramref name="AfterFs"/> = 0: the next delta).</summary>
+public readonly record struct WaveformElement(object Value, long AfterFs);
 
 /// <summary>
 /// The signal update machinery of the delta-cycle engine, with VHDL's driver
@@ -76,7 +76,7 @@ public class SignalScheduler
     private long _seq;
     private int _pendingNow;
     private ulong _currentTick;
-    private int _tickResolutionNs = 10;
+    private long _tickFs = PhysicalTime.DefaultTickFs;
 
     /// <summary>
     /// The process or concurrent statement whose assignments are being executed:
@@ -101,13 +101,13 @@ public class SignalScheduler
     }
 
     /// <summary>
-    /// Tick resolution in nanoseconds used to convert delays into future ticks
-    /// (minimum 1 ns).
+    /// Length of a tick in femtoseconds, used to convert delays into future ticks
+    /// (minimum 1 fs).
     /// </summary>
-    public int TickResolutionNs
+    public long TickFs
     {
-        get { lock (_lock) return _tickResolutionNs; }
-        set { lock (_lock) _tickResolutionNs = Math.Max(1, value); }
+        get { lock (_lock) return _tickFs; }
+        set { lock (_lock) _tickFs = Math.Max(1, value); }
     }
 
     private readonly Dictionary<Variable, int> _changedScratch = [];
@@ -130,11 +130,11 @@ public class SignalScheduler
     /// its projected waveform as the LRM does: transactions at or after the
     /// first new one are deleted; with <see cref="DelayMechanism.Inertial"/>,
     /// the older ones inside the pulse-rejection window
-    /// (<paramref name="rejectNs"/>, or the first delay when negative) are
+    /// (<paramref name="rejectFs"/>, or the first delay when negative) are
     /// deleted too unless they lead, with the new value, up to it.
     /// </summary>
     public void ScheduleWaveform(Variable target, IReadOnlyList<WaveformElement> elements, int sourceLine,
-        (int Start, int Width)? span, bool wholeDriver, DelayMechanism mechanism, long rejectNs)
+        (int Start, int Width)? span, bool wholeDriver, DelayMechanism mechanism, long rejectFs)
     {
         if (elements.Count == 0) return;
         lock (_lock)
@@ -146,14 +146,14 @@ public class SignalScheduler
                 var e = elements[i];
                 var t = new Transaction
                 {
-                    Now = e.AfterNs <= 0,
-                    Tick = e.AfterNs <= 0 ? _currentTick : _currentTick + DelayTicks(e.AfterNs),
+                    Now = e.AfterFs <= 0,
+                    Tick = e.AfterFs <= 0 ? _currentTick : _currentTick + DelayTicks(e.AfterFs),
                     Span = span,
                     Value = e.Value,
                     Line = sourceLine,
                     Seq = ++_seq,
                 };
-                if (i == 0) Preempt(driver, t, mechanism, rejectNs < 0 ? e.AfterNs : rejectNs);
+                if (i == 0) Preempt(driver, t, mechanism, rejectFs < 0 ? e.AfterFs : rejectFs);
                 Insert(driver, t);
                 if (t.Now)
                 {
@@ -188,12 +188,9 @@ public class SignalScheduler
         }
     }
 
-    /// <summary>Delay in ticks of <paramref name="delayNs"/>, rounded up and at least <paramref name="min"/>.</summary>
-    private ulong DelayTicks(long delayNs, long min = 1)
-    {
-        int res = Math.Max(1, _tickResolutionNs);
-        return (ulong)Math.Max(min, (delayNs + res - 1) / res);
-    }
+    /// <summary>Delay in ticks of <paramref name="delayFs"/>, rounded up and at least <paramref name="min"/> (the one fs → tick conversion of delays).</summary>
+    internal ulong DelayTicks(long delayFs, long min = 1) =>
+        (ulong)Math.Max(min, (delayFs + _tickFs - 1) / _tickFs);
 
     private SignalDrivers SignalOf(Variable target)
     {
@@ -242,7 +239,7 @@ public class SignalScheduler
     /// [<c>t − reject</c>, <c>t</c>) unless a run of them with <paramref name="t"/>'s
     /// value immediately precedes it.
     /// </summary>
-    private void Preempt(Driver driver, Transaction t, DelayMechanism mechanism, long rejectNs)
+    private void Preempt(Driver driver, Transaction t, DelayMechanism mechanism, long rejectFs)
     {
         var w = driver.Waveform;
         if (w.Count == 0) return;
@@ -254,7 +251,7 @@ public class SignalScheduler
             w.RemoveAt(i);
         }
         if (mechanism != DelayMechanism.Inertial || t.Now) return;
-        ulong windowStart = rejectNs <= 0 ? t.Tick : t.Tick - Math.Min(t.Tick, DelayTicks(rejectNs, min: 0));
+        ulong windowStart = rejectFs <= 0 ? t.Tick : t.Tick - Math.Min(t.Tick, DelayTicks(rejectFs, min: 0));
         bool keep = true;
         for (int i = w.Count - 1; i >= 0; i--)
         {

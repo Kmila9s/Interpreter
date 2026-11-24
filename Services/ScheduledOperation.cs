@@ -56,9 +56,9 @@ public class ScheduledOperation
         var waveform = operation.WaveformValues(computedValue);
         var mechanism = operation.Waveform?.Mechanism ?? DelayMechanism.Inertial;
         if (operation.AggregateTarget is { } aggregate)
-            aggregate.Schedule(scheduler, waveform, operation.SourceLine, mechanism, operation.RejectNs);
+            aggregate.Schedule(scheduler, waveform, operation.SourceLine, mechanism, operation.RejectFs);
         else if (operation.Target is { } target)
-            target.Schedule(scheduler, waveform, operation.SourceLine, mechanism, operation.RejectNs);
+            target.Schedule(scheduler, waveform, operation.SourceLine, mechanism, operation.RejectFs);
         else
             throw new InvalidOperationException($"signal assignment without a target at Line {operation.SourceLine}");
     }

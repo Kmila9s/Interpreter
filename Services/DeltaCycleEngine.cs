@@ -128,7 +128,7 @@ public partial class DeltaCycleEngine : IDisposable
     /// Read-only: the earliest tick at which a wait-driven process is queued to
     /// wake, or <c>null</c> when none are pending. Mirrors
     /// <see cref="SignalScheduler.NextScheduledTick"/> so an event-driven driver
-    /// (e.g. the fast runner) can jump straight to the next interesting tick
+    /// (<see cref="SimulationRunner"/>) can jump straight to the next interesting tick
     /// without skipping a <c>wait for</c>. Pure accessor — advances nothing and
     /// changes no simulation state, so engine behaviour/output is unaffected.
     /// </summary>
@@ -373,20 +373,20 @@ public partial class DeltaCycleEngine : IDisposable
     public SignalScheduler SignalScheduler => _signalScheduler;
 
     /// <summary>
-    /// Tick resolution in nanoseconds. Forwarded to `SignalScheduler` so
-    /// `after N ns` assignments convert to the right future-tick offset.
-    /// Default 10 (`TimeClock.NS_PER_TICK`); the runners set it from
-    /// <see cref="Models.SimulationConfig.TickResNs"/> when they create the engine.
+    /// Length of a tick in femtoseconds. Forwarded to `SignalScheduler` so
+    /// `after T` assignments convert to the right future-tick offset.
+    /// Default <see cref="Models.PhysicalTime.DefaultTickFs"/>; the runner sets it from
+    /// <see cref="Models.SimulationConfig.TickFs"/> when it creates the engine.
     /// </summary>
-    public int TickResolutionNs
+    public long TickFs
     {
-        get => _signalScheduler.TickResolutionNs;
+        get => _signalScheduler.TickFs;
         set
         {
-            _signalScheduler.TickResolutionNs = value;
-            // Keep the attribute handler's copy in step so `'stable(T ns)`
-            // scales correctly regardless of when the caller sets tickRes.
-            SignalAttributeHandler.Instance.TickResolutionNs = value;
+            _signalScheduler.TickFs = value;
+            // Keep the attribute handler's copy in step so `'stable(T)` and `now`
+            // scale correctly regardless of when the caller sets the tick.
+            SignalAttributeHandler.Instance.TickFs = value;
         }
     }
 
@@ -470,9 +470,8 @@ public partial class DeltaCycleEngine : IDisposable
 
         // Register all signals with the attribute handler
         var handler = SignalAttributeHandler.Instance;
-        // Tier 4.1 close-out: propagate tick resolution so `'stable(T ns)`
-        // scales correctly at non-1 ns tickResNs (bench default is 10 ns).
-        handler.TickResolutionNs = _signalScheduler.TickResolutionNs;
+        // The handler's tick follows the engine's, so `'stable(T)` and `now` scale correctly.
+        handler.TickFs = _signalScheduler.TickFs;
         foreach (var signal in signals)
         {
             handler.RegisterSignal(signal);
@@ -1062,8 +1061,7 @@ public partial class DeltaCycleEngine : IDisposable
         }
         if (waitStmt.IsTimed)
         {
-            int tickResNs = _signalScheduler.TickResolutionNs;
-            ulong delayTicks = (ulong)Math.Max(1L, waitStmt.DelayNs / Math.Max(1, tickResNs));
+            ulong delayTicks = _signalScheduler.DelayTicks(waitStmt.DelayFs);
             ScheduleProcessWake(process, _currentTick + delayTicks);
             process.TimeoutTick = _currentTick + delayTicks;
         }

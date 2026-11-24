@@ -13,13 +13,24 @@ public static class PhysicalTime
     /// <summary>The type mark of time values.</summary>
     public const string TypeMark = "time";
 
-    /// <summary>Femtoseconds in a nanosecond (the engine's tick resolution unit).</summary>
+    /// <summary>Femtoseconds in a nanosecond.</summary>
     public const long FsPerNs = 1_000_000;
+
+    /// <summary>Femtoseconds in a picosecond.</summary>
+    public const long FsPerPs = 1_000;
+
+    /// <summary>
+    /// The tick a run asks for when it names none (10 ns). The engine counts time in
+    /// ticks of a whole number of femtoseconds; a run narrows this to the greatest
+    /// common divisor with the design's static delays (<c>StaticDelays.TickFs</c>), so
+    /// every <c>wait for</c>/<c>after</c> lands exactly, down to 1 fs (G103).
+    /// </summary>
+    public const long DefaultTickFs = TimeMachine.Models.TimeClock.NS_PER_TICK * FsPerNs;
 
     /// <summary>Time units in femtoseconds.</summary>
     public static readonly IReadOnlyDictionary<string, long> UnitFs = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase)
     {
-        ["fs"] = 1, ["ps"] = 1_000, ["ns"] = FsPerNs, ["us"] = 1_000_000_000, ["ms"] = 1_000_000_000_000,
+        ["fs"] = 1, ["ps"] = FsPerPs, ["ns"] = FsPerNs, ["us"] = 1_000_000_000, ["ms"] = 1_000_000_000_000,
         ["sec"] = 1_000_000_000_000_000, ["min"] = 60_000_000_000_000_000, ["hr"] = 3_600_000_000_000_000_000,
     };
 

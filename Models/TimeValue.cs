@@ -6,23 +6,28 @@ using Parser.Models;
 namespace Interpreter.Models;
 
 /// <summary>
-/// Evaluates a VHDL time expression to nanoseconds: physical literals
+/// Evaluates a VHDL time expression to femtoseconds (the resolution of VHDL time
+/// and of the engine, G103): physical literals
 /// (<c>10 ns</c>, <c>10ns</c>), numbers, time constants (also ones initialised by
 /// an expression, <c>constant T2 : time := (3*PERIOD/4)</c>), parentheses and
-/// <c>+ - * /</c>. Used by <c>wait for</c>.
+/// <c>+ - * /</c>. Used by <c>wait for</c> and <c>after</c>.
 /// </summary>
 public static partial class TimeValue
 {
-    /// <summary>Nanoseconds per femtosecond (time values are femtoseconds, <see cref="PhysicalTime"/>).</summary>
-    private const double NsPerFs = 1.0 / PhysicalTime.FsPerNs;
-
     [GeneratedRegex(@"\d[\d_]*(?:\.[\d_]+)?(?:[eE][+-]?\d+)?|[A-Za-z_]\w*|[()*/+-]")]
     private static partial Regex Lexeme();
 
     /// <summary>Evaluates <paramref name="text"/> against <paramref name="scope"/>.</summary>
     /// <returns>False when the expression is not a time (no unit) or cannot be evaluated.</returns>
-    public static bool TryEvaluateNs(string text, HashSet<Variable>? scope, out double ns) =>
-        TryEvaluate(text, scope, depth: 0, out ns, out bool isTime) & isTime;
+    /// <param name="text">The time expression.</param>
+    /// <param name="scope">Objects visible to it (null: literals and package constants only).</param>
+    /// <param name="fs">The value in femtoseconds, rounded to the nearest one (as GHDL converts a real time).</param>
+    public static bool TryEvaluateFs(string text, HashSet<Variable>? scope, out long fs)
+    {
+        bool ok = TryEvaluate(text, scope, depth: 0, out double value, out bool isTime) & isTime;
+        fs = ok ? (long)Math.Round(value, MidpointRounding.AwayFromZero) : 0;
+        return ok;
+    }
 
     private static bool TryEvaluate(string text, HashSet<Variable>? scope, int depth, out double value, out bool isTime)
     {
@@ -79,7 +84,7 @@ public static partial class TimeValue
                 value = double.Parse(t.Replace("_", ""), CultureInfo.InvariantCulture);
                 if (pos < tokens.Count && PhysicalTime.UnitFs.TryGetValue(tokens[pos], out long unitFs))
                 {
-                    value *= unitFs * NsPerFs; isTime = true; pos++;
+                    value *= unitFs; isTime = true; pos++;
                 }
                 return true;
             }
@@ -93,14 +98,14 @@ public static partial class TimeValue
             if (depth > 8) return false;
             if (name.Equals("now", StringComparison.OrdinalIgnoreCase))
             {
-                value = SignalAttributeHandler.Instance.NowFs * NsPerFs; isTime = true; return true;
+                value = SignalAttributeHandler.Instance.NowFs; isTime = true; return true;
             }
             var obj = (scope is not null && scope.TryGetValue(new Variable { Name = name }, out var found) ? found : null)
                 ?? PackageRegistry.Instance.GetConstant(name);
             // A time object holds femtoseconds; anything else is re-read from its value text.
             if (obj is not null && PhysicalTime.IsTime(obj) && PhysicalTime.TryFs(obj.Value, out long fs))
             {
-                value = fs * NsPerFs; isTime = true; return true;
+                value = fs; isTime = true; return true;
             }
             object? raw = obj?.Value;
             return raw is not null && TryEvaluate(raw.ToString() ?? string.Empty, scope, depth + 1, out value, out isTime);

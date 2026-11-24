@@ -374,7 +374,7 @@ class Program
 
             // Export to VCD
             Console.WriteLine($"\nExporting waveform to: {vcdOutput}");
-            engine.History.SaveToVcd(vcdOutput, entity.Name, timescaleNs: 10);
+            engine.History.SaveToVcd(vcdOutput, entity.Name, engine.TickFs);
 
             Console.WriteLine("Simulation complete!");
             Console.WriteLine($"\nTo view waveforms:");

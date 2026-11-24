@@ -100,8 +100,8 @@ internal static class ConcurrentAssignSynthesizer
                         // can label the cell `stable(T ns)` when present.
                         var srcNet = NetForVariable(da.Signal, ctx);
                         var stOut = ctx.NewInternal(width: 1, sourceLine: sourceLine);
-                        var attrs = da.TimeArgNs is long ns
-                            ? new Dictionary<string, string> { ["TimeNs"] = ns.ToString() }
+                        var attrs = da.TimeArgFs is long fs
+                            ? new Dictionary<string, string> { ["TimeNs"] = (fs / (double)PhysicalTime.FsPerNs).ToString(System.Globalization.CultureInfo.InvariantCulture) }
                             : null;
                         ctx.AddCell(
                             kind:    CellKind.STABLE,

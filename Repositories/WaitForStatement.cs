@@ -14,7 +14,7 @@ namespace Interpreter.Repositories;
 /// Supported forms:
 /// <list type="bullet">
 /// <item><description><c>wait for X fs|ps|ns|us|ms|sec;</c> — F-G-13. Set
-/// <see cref="DelayNs"/> from the source, <see cref="IsTimed"/> = true,
+/// <see cref="DelayFs"/> from the source, <see cref="IsTimed"/> = true,
 /// <see cref="IsTerminal"/> = false. Engine reschedules the process at
 /// <c>current_tick + DelayTicks</c>.</description></item>
 /// <item><description>bare <c>wait;</c> — <see cref="IsTerminal"/> = true,
@@ -44,8 +44,8 @@ public sealed class WaitForStatement : ISControl
     private int _line;
 
 
-    /// <summary>Delay in nanoseconds parsed from the source; 0 for bare wait.</summary>
-    public long DelayNs { get; private set; } = 0;
+    /// <summary>Delay in femtoseconds parsed from the source; 0 for bare wait.</summary>
+    public long DelayFs { get; private set; } = 0;
 
     /// <summary>True when this is <c>wait for X unit;</c> — schedule a resume.</summary>
     public bool IsTimed { get; private set; } = false;
@@ -151,10 +151,10 @@ public sealed class WaitForStatement : ISControl
     private void SetDelay(List<Token> tokens)
     {
         string text = string.Join(' ', tokens.Select(t => t.Value));
-        if (!Interpreter.Models.TimeValue.TryEvaluateNs(text, _variables, out double ns))
+        if (!Interpreter.Models.TimeValue.TryEvaluateFs(text, _variables, out long fs))
             throw new ParserException($"time expression '{text}' is not supported in a wait statement yet", tokens[0]);
-        DelayNs = (long)Math.Round(ns, MidpointRounding.AwayFromZero);
-        IsTimed = DelayNs > 0;
+        DelayFs = fs;
+        IsTimed = DelayFs > 0;
         IsTerminal = !IsTimed;
     }
 

@@ -52,6 +52,8 @@ public class ConditionalAssignment : ISControl, IConcurrentStatement
 {
     /// <summary>The variables in scope during condition and value evaluation.</summary>
     private readonly HashSet<Variable> _variables;
+    /// <summary>The objects in scope (what its delays may read: generics and constants among them).</summary>
+    internal HashSet<Variable> Scope => _variables;
     /// <summary>1-based source line of the statement (errors in its condition/selector report it).</summary>
     private int _line;
 

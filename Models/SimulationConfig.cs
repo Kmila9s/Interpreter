@@ -19,10 +19,11 @@ public class SimulationConfig
     public ulong TotalTicks { get; init; }
 
     /// <summary>
-    /// Nanoseconds per tick: what every tick count in this configuration is in,
-    /// and what the engine converts <c>after</c>/<c>wait for</c> delays with.
+    /// Femtoseconds per tick: what every tick count in this configuration is in,
+    /// and what the engine converts <c>after</c>/<c>wait for</c> delays with
+    /// (<see cref="Services.StaticDelays.TickFs"/> picks one that lands every static delay).
     /// </summary>
-    public int TickResNs { get; init; } = TimeMachine.Models.TimeClock.NS_PER_TICK;
+    public long TickFs { get; init; } = PhysicalTime.DefaultTickFs;
 
     /// <summary>
     /// Clock signal configurations (auto-toggling clocks).

@@ -29,13 +29,13 @@ public class DeferredAttribute
     /// <summary>Result data type. BOOLEAN for event/stable; signal.Type for last_value.</summary>
     public DATATYPES ResultType { get; }
     /// <summary>
-    /// Time argument for `'stable(T)`, in raw ns. Scaling to the
+    /// Time argument for `'stable(T)`, in femtoseconds. Scaling to the
     /// tick*1000+delta units used by <see cref="SignalHistory"/> and
     /// <see cref="SignalAttributeHandler.OnDeltaCommit"/> happens inside
     /// <see cref="SignalAttributeHandler.GetStable(Variable, long)"/> using
-    /// the engine's registered tick resolution. Null for no-arg forms.
+    /// the engine's tick (<c>TickFs</c>). Null for no-arg forms.
     /// </summary>
-    public long? TimeArgNs { get; }
+    public long? TimeArgFs { get; }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="DeferredAttribute"/> class.
@@ -43,13 +43,13 @@ public class DeferredAttribute
     /// <param name="signal">The signal the attribute is evaluated against.</param>
     /// <param name="attributeName">The attribute name (e.g. event, last_value, stable).</param>
     /// <param name="resultType">The data type of the attribute result.</param>
-    /// <param name="timeArgNs">Optional time argument for 'stable(T), in raw ns; null for no-arg forms.</param>
-    public DeferredAttribute(Variable signal, string attributeName, DATATYPES resultType, long? timeArgNs = null)
+    /// <param name="timeArgFs">Optional time argument for 'stable(T), in fs; null for no-arg forms.</param>
+    public DeferredAttribute(Variable signal, string attributeName, DATATYPES resultType, long? timeArgFs = null)
     {
         Signal = signal;
         AttributeName = attributeName.ToLower();
         ResultType = resultType;
-        TimeArgNs = timeArgNs;
+        TimeArgFs = timeArgFs;
     }
 
     /// <summary>
@@ -63,7 +63,7 @@ public class DeferredAttribute
         {
             "event"      => h.GetEvent(Signal),
             "last_value" => h.GetLastValue(Signal),
-            "stable"     => TimeArgNs is long ns ? h.GetStable(Signal, ns) : h.GetStable(Signal),
+            "stable"     => TimeArgFs is long fs ? h.GetStable(Signal, fs) : h.GetStable(Signal),
             "active"     => h.GetActive(Signal),
             _            => false
         };
