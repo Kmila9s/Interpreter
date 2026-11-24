@@ -210,18 +210,14 @@ Synthesis Namespace (Interpreter.Synthesis) - behavioral → structural lowering
 └── Layout/LayeredLayout         - Sugiyama-style placement → LaidOutNetlist (rects + wire paths)
 
 Façade
-├── ISimulationRunner            - Shared surface of the two interchangeable run drivers
-│                                  (Engine, IsRunning/IsPaused, Pause/Resume/Stop, the
-│                                  OnProgressChanged/OnSimulationEnded/OnError/OnEngineReady/
-│                                  OnReport events). Lets callers (e.g. ProgramBuilder) pick a
-│                                  runner at run time without branching on the concrete type.
-├── SimulationRunner             - "Visual/Slow mode" IDisposable runner: visits every tick
-│                                  0..totalTicks. RunAsync(SimulationConfig), Pause/Resume/Stop.
-└── FastSimulationRunner         - "Fast mode" sibling: drives the SAME DeltaCycleEngine but
-                                   jumps straight to the next tick where something can happen
-                                   (clock edge / stimulus / scheduled update / process wake),
-                                   skipping idle ticks. Same public surface as SimulationRunner;
-                                   verified byte-identical to it by VCD diff across a corpus.
+└── SimulationRunner             - The run driver (IDisposable): RunAsync(SimulationConfig),
+                                   Pause/Resume/Stop, OnProgressChanged/OnSimulationEnded/
+                                   OnError/OnEngineReady/OnReport. Event-driven: jumps straight
+                                   to the next tick where something can happen (clock edge /
+                                   stimulus / scheduled update / process wake), so a run costs
+                                   its events, not its length. A tick is a whole number of fs
+                                   (SimulationConfig.TickFs, narrowed by StaticDelays.TickFs).
+                                   v3.2.0 removed FastSimulationRunner and ISimulationRunner.
 
 Placeholder
 └── Services/DataStructure       - Reserved for future complex data-structure ops
@@ -1090,7 +1086,6 @@ describe the suites as they were moved.
 | `LibraryCompilerTests` | Cross-module LibraryCompiler resolution/build |
 | `PortStrictnessTests` | Port direction / connectivity strictness |
 
-> The `FastSimulationRunner` ↔ `SimulationRunner` byte-for-byte equivalence is covered by VCD-diff / equivalence tests (see the `Fast mode` notes in §2).
 
 #### 7.2. Console corpus (`test*.vhdl`, driven by `Program.cs`) — smoke/exploration
 
@@ -2227,7 +2222,7 @@ sequenceDiagram
     participant Map as signalIds (Dict)
     participant FS as Filesystem
 
-    SR->>SH: ExportToVcd(moduleName, timescaleNs)
+    SR->>SH: ExportToVcd(moduleName, tickFs)
     SH->>SH: Escribir $date / $version / $timescale
     SH->>Map: idCounter = 0
     loop Por cada Senal ordenada por nombre
@@ -2239,7 +2234,7 @@ sequenceDiagram
     end
     SH->>SH: Escribir $dumpvars (valor inicial por senal)
     loop Por cada tiempo unico en el historial
-        SH->>SH: Emitir #tiempo (en timescaleNs)
+        SH->>SH: Emitir #tiempo (1ps, o 1fs si algún instante no es un ps entero)
         loop Senales con cambio en este tiempo
             SH->>Map: Lookup id por senal
             Map-->>SH: id
@@ -2258,7 +2253,7 @@ classDiagram
 
     class ConfigSimulacion {
         +Int totalTicks
-        +Int timescaleNs
+        +Long tickFs
         +List clocks
         +List stimuli
     }
@@ -2285,7 +2280,7 @@ classDiagram
     }
     class ArchivoVCD {
         +String contenido
-        +Int timescaleNs
+        +Long tickFs
     }
 
     ConfigSimulacion "1" --> "0..1" DispositivoFPGA : se calcula sobre
@@ -2928,7 +2923,7 @@ If you're wiring the Interpreter into a host, the integration guide is at [`../D
 
 Implications for this module:
 
-- `SignalHistory.RawHistory` and `WaveformData.FromSignalHistory(history, timescaleNs)` are now load-bearing for the App's pedagogical playback, not just the Practice grader / VCD export / Runs persistence. Any future changes that drop transitions, reorder them, or change the `WaveformTransition.Label` semantics will visibly degrade the replay.
+- `SignalHistory.RawHistory` and `WaveformData.FromSignalHistory(history, tickFs)` are now load-bearing for the App's pedagogical playback, not just the Practice grader / VCD export / Runs persistence. Any future changes that drop transitions, reorder them, or change the `WaveformTransition.Label` semantics will visibly degrade the replay.
 - Phase B (line-highlight metadata per executed statement) will require instrumenting `DeltaCycleEngine` to emit a frame log alongside `SignalHistory`. Same `ExecutionTimelineDoc` consumer; the contract is fixed in `App/Kmila/Kmila.Shared/Models/ExecutionTimeline.cs` (`TimelineStep` shape with `T`, `HighlightLines`, `Signals`, `Note`). No App-side changes needed when Phase B lands — only Interpreter-side instrumentation.
 - See `Documentacion/CHANGELOG_concepts_module_2026-05-17.md` (Task 5 section) for the full pipeline diagram and the design-decisions table.
 

@@ -506,12 +506,24 @@ public class SignalHistory
     /// Exports history to VCD (Value Change Dump) format for GTKWave visualization.
     /// </summary>
     /// <param name="moduleName">The name of the module/entity.</param>
-    /// <param name="timescaleNs">The timescale in nanoseconds (default 1ns).</param>
+    /// <param name="tickFs">The run's tick in femtoseconds (what the internal tick counter is in).</param>
     /// <returns>VCD formatted string.</returns>
-    public string ExportToVcd(string moduleName = "top", int timescaleNs = 1)
+    public string ExportToVcd(string moduleName, long tickFs)
     {
         lock (_lock)
         {
+            // One sample per real instant: the value settled after its last delta
+            // (internal time is tick*1000 + delta), like GHDL's dump.
+            var allTimes = _history.Values
+                .SelectMany(h => h.Select(e => SettledMoment(e.Item1 / 1000)))
+                .Distinct()
+                .OrderBy(t => t)
+                .ToList();
+            // 1ps when every instant lands on a whole picosecond, else 1fs (G103): the
+            // unit follows the instants, not the tick, so a finer tick alone changes nothing.
+            bool wholePs = allTimes.All(t => t / 1000 * tickFs % PhysicalTime.FsPerPs == 0);
+            var (unit, fsPerUnit) = wholePs ? ("1ps", PhysicalTime.FsPerPs) : ("1fs", 1L);
+
             var sb = new System.Text.StringBuilder();
 
             // VCD Header
@@ -522,12 +534,7 @@ public class SignalHistory
             sb.AppendLine("   VHDL Interpreter v0.17.0");
             sb.AppendLine("$end");
             sb.AppendLine("$timescale");
-            // Body times are emitted as `time * timescaleNs` where `time`
-            // is the engine's `tick * 1000 + delta` counter, so each
-            // `vcdTime` unit is one picosecond regardless of `timescaleNs`.
-            // The earlier `{timescaleNs}ns` header was 1000× off and made
-            // GHDL-vs-Kmila diffs nonsensical (bench Phase D).
-            sb.AppendLine("   1ps");
+            sb.AppendLine($"   {unit}");
             sb.AppendLine("$end");
 
             // Variable definitions. Constants (`constant X : integer := ...;`)
@@ -548,14 +555,6 @@ public class SignalHistory
 
             sb.AppendLine("$upscope $end");
             sb.AppendLine("$enddefinitions $end");
-
-            // One sample per real instant: the value settled after its last delta
-            // (internal time is tick*1000 + delta), like GHDL's dump.
-            var allTimes = _history.Values
-                .SelectMany(h => h.Select(e => SettledMoment(e.Item1 / 1000)))
-                .Distinct()
-                .OrderBy(t => t)
-                .ToList();
 
             if (allTimes.Count == 0)
             {
@@ -601,10 +600,8 @@ public class SignalHistory
                     {
                         if (!hasChanges)
                         {
-                            // Convert internal time to VCD time
-                            // Our time format: tick * 1000 + delta
-                            // VCD time: in units of timescale
-                            long vcdTime = time / 1000 * 1000 * timescaleNs;
+                            // Internal time is tick * 1000 + delta; the VCD shows the instant in its unit.
+                            long vcdTime = time / 1000 * tickFs / fsPerUnit;
                             sb.AppendLine($"#{vcdTime}");
                             hasChanges = true;
                         }
@@ -787,10 +784,10 @@ public class SignalHistory
     /// </summary>
     /// <param name="filePath">The path to save the VCD file.</param>
     /// <param name="moduleName">The name of the module/entity.</param>
-    /// <param name="timescaleNs">The timescale in nanoseconds.</param>
-    public void SaveToVcd(string filePath, string moduleName = "top", int timescaleNs = 1)
+    /// <param name="tickFs">The run's tick in femtoseconds.</param>
+    public void SaveToVcd(string filePath, string moduleName, long tickFs)
     {
-        string vcdContent = ExportToVcd(moduleName, timescaleNs);
+        string vcdContent = ExportToVcd(moduleName, tickFs);
         System.IO.File.WriteAllText(filePath, vcdContent);
     }
 }

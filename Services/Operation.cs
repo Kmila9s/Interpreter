@@ -130,14 +130,14 @@ public class Operation : IOperation, IConcurrentStatement {
         if (Waveform is not { } w) return [new WaveformElement(first, 0)];
         if (w.IsPlain) return [new WaveformElement(first, 0)];
         var result = new WaveformElement[w.Elements.Count];
-        result[0] = new(first, w.ElementDelayNs(0, Variables, SourceLine));
+        result[0] = new(first, w.ElementDelayFs(0, Variables, SourceLine));
         for (int i = 1; i < result.Length; i++)
-            result[i] = new(_laterElements![i - 1].Evaluate(), w.ElementDelayNs(i, Variables, SourceLine));
+            result[i] = new(_laterElements![i - 1].Evaluate(), w.ElementDelayFs(i, Variables, SourceLine));
         return result;
     }
 
-    /// <summary>The pulse-rejection limit in ns (negative = the first delay).</summary>
-    public long RejectNs => Waveform?.Reject is { } r ? Models.Waveform.DelayNs(r, Variables, SourceLine) : -1;
+    /// <summary>The pulse-rejection limit in fs (negative = the first delay).</summary>
+    public long RejectFs => Waveform?.Reject is { } r ? Models.Waveform.DelayFs(r, Variables, SourceLine) : -1;
 
     /// <summary>
     /// True for variable assignments (<c>:=</c>) inside a process body.
@@ -880,12 +880,10 @@ public class Operation : IOperation, IConcurrentStatement {
 
     /// <summary>
     /// Tier 4.1: peek at tokens following a `'stable` attribute and consume
-    /// `(T)` if present, returning T as raw ns. The scale conversion into
+    /// `(T)` if present, returning T in femtoseconds. The scale conversion into
     /// the tick*1000+delta units used by <see cref="SignalHistory"/> and
     /// <see cref="SignalAttributeHandler.OnDeltaCommit"/> happens inside
-    /// <c>SignalAttributeHandler.GetStable(sig, ns)</c> using the engine's
-    /// currently-registered <c>TickResolutionNs</c> (Tier 4.1 close-out —
-    /// non-1 ns bench resolutions were previously off by that factor).
+    /// <c>SignalAttributeHandler.GetStable(sig, fs)</c> using the engine's tick.
     /// </summary>
     private long? TryConsumeStableTimeArg()
     {
@@ -899,14 +897,14 @@ public class Operation : IOperation, IConcurrentStatement {
         // Body between paren: expect `<number>` `<unit>` (2 tokens) or a
         // single integer token. Anything else — abort and don't consume.
         int bodyLen = close - nextIdx - 1;
-        long ns;
-        if (bodyLen == 2 && PhysicalTime.TryLiteral(_data[nextIdx + 1], _data[nextIdx + 2], out long fs))
+        long fs;
+        if (bodyLen == 2 && PhysicalTime.TryLiteral(_data[nextIdx + 1], _data[nextIdx + 2], out long literalFs))
         {
-            ns = fs / PhysicalTime.FsPerNs;
+            fs = literalFs;
         }
         else if (bodyLen == 1 && long.TryParse(_data[nextIdx + 1], out var raw))
         {
-            ns = raw;  // bare integer — treated as ns
+            fs = raw * PhysicalTime.FsPerNs;  // bare integer — treated as ns
         }
         else
         {
@@ -917,9 +915,8 @@ public class Operation : IOperation, IConcurrentStatement {
         // attribute token itself, so we need to skip (bodyLen + 2) more.
         _currentSyntetizeIndex += bodyLen + 2;
 
-        // Return raw ns; scale to tick*1000+delta happens inside
-        // SignalAttributeHandler.GetStable using the engine's tick resolution.
-        return ns;
+        // The scale to tick*1000+delta happens inside SignalAttributeHandler.GetStable.
+        return fs;
     }
 
     /// <summary>

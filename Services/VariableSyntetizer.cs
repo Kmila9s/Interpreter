@@ -1230,8 +1230,7 @@ public class VariableSyntetizer : ISControl
         string text = string.Join(" ", tokens);
         // Generics (`PERIOD`) and the objects declared so far; an expression over
         // signals is kept as text and evaluated where it is used (`wait for`, `after`).
-        if (!TimeValue.TryEvaluateNs(text, [.. _comparator, .. Variables], out double ns)) return text;
-        return (long)Math.Round(ns * PhysicalTime.FsPerNs);
+        return TimeValue.TryEvaluateFs(text, [.. _comparator, .. Variables], out long fs) ? fs : text;
     }
 
     /// <summary>

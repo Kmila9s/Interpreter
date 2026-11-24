@@ -22,7 +22,7 @@ public sealed partial class Waveform
     /// <summary>Each element's value expression and delay expression (null = no <c>after</c>).</summary>
     public IReadOnlyList<(string Value, string? After)> Elements { get; private init; } = [];
 
-    /// <summary>Each element's delay in ns when it is a literal (<c>after 5 ns</c>), folded once; null when it reads objects.</summary>
+    /// <summary>Each element's delay in fs when it is known before the run (a literal, or over constants once <see cref="StaticDelaysFs"/> folded it); null when it reads objects.</summary>
     private long?[] _folded = [];
 
     /// <summary>The value expression of the first element (what the assignment's operation evaluates).</summary>
@@ -50,7 +50,7 @@ public sealed partial class Waveform
             int after = TopLevelAfter(part);
             elements.Add(after < 0 ? (part.Trim(), null) : (part[..after].Trim(), part[(after + 5)..].Trim()));
         }
-        long?[] folded = [.. elements.Select(e => e.After is null ? 0L : TimeValue.TryEvaluateNs(e.After, null, out double ns) ? (long?)Math.Round(ns) : null)];
+        long?[] folded = [.. elements.Select(e => e.After is null ? 0L : TimeValue.TryEvaluateFs(e.After, null, out long fs) ? (long?)fs : null)];
         return new Waveform { Mechanism = mechanism, Reject = reject, Elements = elements, _folded = folded };
     }
 
@@ -81,21 +81,38 @@ public sealed partial class Waveform
 
     private static bool IsWordChar(char c) => char.IsLetterOrDigit(c) || c == '_';
 
-    /// <summary>The literal (parse-time) delays of the elements, in ns; delays that need the run-time scope are left out.</summary>
-    public IEnumerable<long> StaticDelaysNs => _folded.OfType<long>();
+    /// <summary>
+    /// The delays of the elements known before the run, in fs: literals, and time
+    /// expressions over constants of <paramref name="scope"/> or of a package
+    /// (<c>after HALF</c>, <c>after PERIOD/2</c>). Delays reading signals are left out.
+    /// </summary>
+    public IEnumerable<long> StaticDelaysFs(HashSet<Variable>? scope)
+    {
+        HashSet<Variable>? constants = null;
+        for (int i = 0; i < Elements.Count; i++)
+        {
+            if (_folded[i] is null)
+            {
+                constants ??= scope is null ? [] : [.. scope.Where(v => v.IsConstant)];
+                // Over constants the value is fixed: keep it, so the run reads it instead of re-evaluating.
+                if (TimeValue.TryEvaluateFs(Elements[i].After!, constants, out long fs)) _folded[i] = fs;
+            }
+            if (_folded[i] is long delay) yield return delay;
+        }
+    }
 
-    /// <summary>The delay in ns of element <paramref name="index"/>: folded when literal, else evaluated now against <paramref name="scope"/>.</summary>
-    public long ElementDelayNs(int index, HashSet<Variable> scope, int line) =>
-        _folded[index] ?? DelayNs(Elements[index].After, scope, line);
+    /// <summary>The delay in fs of element <paramref name="index"/>: folded when literal, else evaluated now against <paramref name="scope"/>.</summary>
+    public long ElementDelayFs(int index, HashSet<Variable> scope, int line) =>
+        _folded[index] ?? DelayFs(Elements[index].After, scope, line);
 
     /// <summary>
-    /// The delay in nanoseconds of the time expression <paramref name="after"/>
+    /// The delay in femtoseconds of the time expression <paramref name="after"/>
     /// (0 when null), evaluated now against <paramref name="scope"/>.
     /// </summary>
-    public static long DelayNs(string? after, HashSet<Variable> scope, int line)
+    public static long DelayFs(string? after, HashSet<Variable> scope, int line)
     {
         if (after is null) return 0;
-        if (TimeValue.TryEvaluateNs(after, scope, out double ns)) return (long)Math.Round(ns);
+        if (TimeValue.TryEvaluateFs(after, scope, out long fs)) return fs;
         throw new ParserException($"cannot evaluate the time expression \"{after}\"", line, 0);
     }
 

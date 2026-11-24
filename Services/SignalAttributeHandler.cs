@@ -49,24 +49,23 @@ public class SignalAttributeHandler
     /// <summary>Shadow of each signal's last-known value — updated in OnValueChange so we can
     /// recover the pre-transition value even for stimulus writes that bypass SignalScheduler.</summary>
     private readonly Dictionary<Variable, object> _shadowValues = new();
-    /// <summary>Tick resolution (ns per tick) used by <see cref="GetStable(Variable, long)"/> to
-    /// scale a caller-supplied ns duration into the tick*1000+delta scale used internally.
-    /// Set by <c>DeltaCycleEngine.SetContext</c>; defaults to 1 so unit-tests that don't
-    /// touch a full engine still round-trip 1 ns per tick.</summary>
-    private int _tickResolutionNs = 1;
-    /// <summary>Tick resolution (ns per tick) used to scale caller-supplied ns
-    /// durations into the internal tick scale. Clamped to a minimum of 1.</summary>
-    public int TickResolutionNs
+    /// <summary>Length of a tick in femtoseconds, used by <see cref="GetStable(Variable, long)"/> to
+    /// scale a caller-supplied duration into the tick*1000+delta scale used internally and by
+    /// <see cref="EnterTime"/> for <see cref="NowFs"/>. Set by the engine; defaults to 1 ns so
+    /// unit tests that don't touch a full engine still round-trip 1 ns per tick.</summary>
+    private long _tickFs = PhysicalTime.FsPerNs;
+    /// <summary>Length of a tick in femtoseconds (minimum 1).</summary>
+    public long TickFs
     {
-        get => _tickResolutionNs;
-        set => _tickResolutionNs = Math.Max(1, value);
+        get => _tickFs;
+        set => _tickFs = Math.Max(1, value);
     }
 
     /// <summary>The current simulation time in femtoseconds (VHDL <c>now</c>), set by the engine at each time step.</summary>
     public long NowFs { get; private set; }
 
     /// <summary>Enters time step <paramref name="tick"/> (<see cref="NowFs"/> = tick × resolution).</summary>
-    public void EnterTime(ulong tick) => NowFs = (long)tick * _tickResolutionNs * PhysicalTime.FsPerNs;
+    public void EnterTime(ulong tick) => NowFs = (long)tick * _tickFs;
 
     private static SignalAttributeHandler? _instance;
     /// <summary>Lazily-created process-wide singleton instance.</summary>
@@ -226,16 +225,14 @@ public class SignalAttributeHandler
 
     /// <summary>
     /// Tier 4.1: signal'stable(T) — true iff the signal has NOT changed for
-    /// at least <paramref name="elapsedNs"/> ns. The comparison happens in the
-    /// tick*1000+delta scale used by <see cref="OnDeltaCommit"/>, so the ns
-    /// argument is scaled by <see cref="TickResolutionNs"/> here — Tier 4.1
-    /// close-out (non-1 ns bench resolutions were previously off by that
-    /// factor because callers pre-scaled with a `ns == tick` assumption).
+    /// at least <paramref name="elapsedFs"/> femtoseconds. The comparison happens in
+    /// the tick*1000+delta scale used by <see cref="OnDeltaCommit"/>, so the
+    /// argument is scaled by <see cref="TickFs"/> here.
     /// </summary>
-    public bool GetStable(Variable signal, long elapsedNs)
+    public bool GetStable(Variable signal, long elapsedFs)
     {
         long last = _lastChangeMoments.GetValueOrDefault(signal, 0L);
-        long elapsedRawUnits = (elapsedNs * 1000L) / Math.Max(1, _tickResolutionNs);
+        long elapsedRawUnits = elapsedFs * 1000L / _tickFs;
         return (_currentTimeMoment - last) >= elapsedRawUnits;
     }
 
@@ -271,6 +268,6 @@ public class SignalAttributeHandler
         _byName.Clear();
         _currentTimeMoment = 0;
         NowFs = 0;
-        _tickResolutionNs = 1;
+        _tickFs = PhysicalTime.FsPerNs;
     }
 }

@@ -91,7 +91,7 @@ public sealed class AggregateTarget
 
     /// <summary>Schedules the waveform <paramref name="elements"/> over the elements, left to right.</summary>
     public void Schedule(SignalScheduler scheduler, IReadOnlyList<WaveformElement> elements, int sourceLine,
-        DelayMechanism mechanism, long rejectNs)
+        DelayMechanism mechanism, long rejectFs)
     {
         var (widths, total) = Widths();
         var bits = elements.Select(e => VectorIndexing.Fit(FieldCodec.LogicBits(e.Value, total), total)).ToArray();
@@ -99,7 +99,7 @@ public sealed class AggregateTarget
         {
             int from = at, width = widths[i];
             Elements[i].Schedule(scheduler, [.. elements.Select((e, k) => e with { Value = bits[k].Substring(from, width) })],
-                sourceLine, mechanism, rejectNs);
+                sourceLine, mechanism, rejectFs);
         }
     }
 }

@@ -69,7 +69,7 @@ public sealed partial class AssignmentTarget
     /// resolved now; a dynamic index makes the driver cover the whole object).
     /// </summary>
     public void Schedule(SignalScheduler scheduler, IReadOnlyList<WaveformElement> elements, int sourceLine,
-        DelayMechanism mechanism, long rejectNs)
+        DelayMechanism mechanism, long rejectFs)
     {
         (int Start, int Width)? span = null;
         var encoded = new WaveformElement[elements.Count];
@@ -83,7 +83,7 @@ public sealed partial class AssignmentTarget
             }
         }
         catch (SimulationRuntimeException e) { throw e.At(sourceLine); }
-        scheduler.ScheduleWaveform(Base, encoded, sourceLine, span, wholeDriver: IsPartial && !Path.IsStatic, mechanism, rejectNs);
+        scheduler.ScheduleWaveform(Base, encoded, sourceLine, span, wholeDriver: IsPartial && !Path.IsStatic, mechanism, rejectFs);
     }
 
     /// <summary>Drives <paramref name="value"/> from outside the design (the stimulus of an <c>inout</c> port, see <see cref="SignalScheduler.DriveExternal"/>).</summary>
