@@ -19,7 +19,7 @@ namespace Interpreter.Services;
 /// <item>Only then does simulation time advance</item>
 /// </list>
 /// </remarks>
-public partial class DeltaCycleEngine : IDisposable
+public class DeltaCycleEngine : IDisposable
 {
     /// <summary>
     /// Signal update scheduling.
@@ -425,32 +425,18 @@ public partial class DeltaCycleEngine : IDisposable
     }
 
     /// <summary>
-    /// The implicit sensitivity of a concurrent statement (LRM §11.6): the signals
-    /// named in its text, never those read inside a function it calls (G62). Null
-    /// when its value can change without an event on them (implicit signals
-    /// <c>'stable</c>/<c>'quiet</c>/<c>'delayed</c>/<c>'transaction</c>, <c>now</c>).
+    /// Initializes the engine with <paramref name="design"/>: its objects (ports and body
+    /// signals) and its concurrent units, in declaration order.
     /// </summary>
-    private static HashSet<Variable>? SensitivityOf(IConcurrentStatement statement, HashSet<Variable> scope)
+    public void Initialize(Ir.IrDesign design)
     {
-        var texts = statement.ReadTexts.ToList();
-        if (texts.Any(t => TimeDependent().IsMatch(t))) return null;
-        return [.. ImplicitSensitivity.SignalsIn(texts, scope)];
-    }
-
-    [System.Text.RegularExpressions.GeneratedRegex(@"'\s*(stable|quiet|delayed|transaction)\b|\bnow\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase)]
-    private static partial System.Text.RegularExpressions.Regex TimeDependent();
-
-    /// <summary>The concurrent tasks with every (nested) generate replaced by its statements.</summary>
-    private static List<object> FlattenGenerates(List<object> tasks)
-    {
-        if (!tasks.Any(t => t is GenerateBlock)) return tasks;
-        var flat = new List<object>();
-        foreach (var task in tasks)
-        {
-            if (task is GenerateBlock generate) flat.AddRange(FlattenGenerates(generate.Tasks));
-            else flat.Add(task);
-        }
-        return flat;
+        // Each concurrent statement runs on the sensitivity the front-end lowered (null: every delta).
+        var sensitivity = new Dictionary<object, HashSet<Variable>?>(ReferenceEqualityComparer.Instance);
+        foreach (var unit in design.Processes.Where(p => p.Body is IConcurrentStatement))
+            sensitivity[unit.Body] = unit.SensitivityKind == Ir.IrSensitivityKind.EveryDelta
+                ? null
+                : [.. unit.Sensitivity.Select(design.Binding.Cell)];
+        Initialize(design.Binding.Objects, [.. design.Processes.Select(p => p.Body)], sensitivity);
     }
 
     /// <summary>
@@ -458,14 +444,19 @@ public partial class DeltaCycleEngine : IDisposable
     /// </summary>
     /// <param name="signals">All signals in the design.</param>
     /// <param name="tasks">All concurrent tasks (processes, assignments).</param>
-    public void Initialize(HashSet<Variable> signals, List<object> tasks)
+    /// <param name="statementSensitivity">
+    /// The sensitivity of each concurrent statement (null value: every delta), as the IR lowered it;
+    /// null to compute it here from the statements' text (hand-built task lists).
+    /// </param>
+    internal void Initialize(HashSet<Variable> signals, List<object> tasks,
+        IReadOnlyDictionary<object, HashSet<Variable>?>? statementSensitivity = null)
     {
         _allSignals = signals;
         // A generate is elaboration-time structure: its unrolled statements are
         // ordinary concurrent statements (processes registered with the scheduler,
         // assignments scheduled like any other). The design's own task list is kept
         // intact for synthesis.
-        tasks = FlattenGenerates(tasks);
+        tasks = GenerateBlock.Flatten(tasks);
         _concurrentTasks = tasks;
 
         // Register all signals with the attribute handler
@@ -534,7 +525,9 @@ public partial class DeltaCycleEngine : IDisposable
         foreach (var task in tasks)
         {
             if (task is not IConcurrentStatement statement) continue;
-            var inputs = SensitivityOf(statement, signals);
+            var inputs = statementSensitivity is not null
+                ? statementSensitivity[task]
+                : ImplicitSensitivity.OfStatement(statement, signals);
             if (inputs == null)
             {
                 _alwaysRunStatements.Add(task);
@@ -1899,28 +1892,6 @@ public partial class DeltaCycleEngine : IDisposable
     }
 
     /// <summary>
-    /// Connects to TimeMachine for time-driven simulation.
-    /// </summary>
-    public void ConnectToTimeMachine()
-    {
-        // Subscribe to timer events
-        TimeMachine.Repositories.Timer.OnPaused += OnPaused;
-    }
-
-    /// <summary>
-    /// Handles pause/resume events from TimeMachine.
-    /// </summary>
-    private void OnPaused(bool isPaused)
-    {
-        _isRunning = !isPaused;
-        if (_isRunning)
-        {
-            _pauseCts.Cancel();
-            _pauseCts = new CancellationTokenSource();
-        }
-    }
-
-    /// <summary>
     /// Waits for simulation to resume after pause.
     /// </summary>
     private async Task WaitForResumeAsync()
@@ -2045,8 +2016,6 @@ public partial class DeltaCycleEngine : IDisposable
     public void Dispose()
     {
         Stop();
-
-        TimeMachine.Repositories.Timer.OnPaused -= OnPaused;
 
         _cts.Dispose();
         _pauseCts.Dispose();

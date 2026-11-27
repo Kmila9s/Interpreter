@@ -65,7 +65,7 @@ This specific module, the **VHDL Interpreter**, is the execution engine of the s
 *   **Supported VHDL Features:** Entities, architectures, processes, signals, variables, ports, generics, if/elsif/else, case/when, for/while/simple loops, exit/next/null/return, functions, procedures, IEEE standard functions, custom type definitions (enum / array / record / subtype), packages, generate blocks, conditional and selected concurrent assignments, component instantiations.
 *   **Simulation engine:** Full delta-cycle scheduler (`DeltaCycleEngine` + `SignalScheduler` + `ProcessScheduler`), signal history recording (`SignalHistory`) with VCD / CSV / Text export, `after` clause support, sensitivity-list driven process activation, IEEE attribute tracking (`'event` / `'last_value` / `'stable` / `'active`).
 *   **Synthesis pass (`Synthesis/` namespace):** Behavioral VHDL is lowered to a structural netlist (`Netlist`, `Net`, `Cell`, `Pin`, `PortPin`) by per-construct synthesizers and laid out via `LayeredLayout` for the schematic view in the Editor. This is independent from the simulation pipeline and feeds the Schematic component.
-*   **Run-loop façade (`SimulationRunner` + `SimulationConfig`):** Single entry point used by the Editor page to run a `SimulationConfig` (entity + total ticks + auto-toggling `ClockConfig` list + `StimulusEvent` list), with `Pause` / `Resume` / `Stop`, `OnProgressChanged`, `OnSimulationEnded`, and `OnError` events.
+*   **Run-loop façade (`SimulationRunner` + `SimulationConfig`):** Single entry point used by the Editor page to run a `SimulationConfig` (design in IR form + total ticks + auto-toggling `ClockConfig` list + `StimulusEvent` list), with `Pause` / `Resume` / `Stop`, `OnProgressChanged`, `OnSimulationEnded`, and `OnError` events.
 *   **Custom types:** `TypeDefinition` + `TypeRegistry` cover enumerations, arrays, records, and subtypes. `TypeRegistry` is consulted by `VariableSyntetizer`, `Operation`, `FunctionExecutor`, and `Resources`.
 *   **FPGA resource estimation:** `Resources` produces flip-flop, LUT, DSP, BRAM, I/O, and clock-domain estimates per entity; consumed by the FPGA fit chip in the Editor's status bar.
 *   **Progress / cancellation:** `ProgressReporter` (singleton, event-based) drives Editor build-status UI; `CancellationToken` is threaded through the synthesis and run pipeline.
@@ -187,10 +187,24 @@ Models
 ├── LoopFrame               - Frame for an in-flight for/while/loop iteration
 ├── ProcedureFrame          - Frame for an in-flight procedure call
 ├── ControlExceptions       - ExitException, NextException, ReturnException
-├── SimulationConfig        - Entity + ticks + clocks + stimuli (input to SimulationRunner)
-├── ClockConfig             - Auto-toggling clock spec (signal + half-period + initial state)
-├── StimulusEvent           - "set Signal to Value at Tick" stimulus record
+├── SimulationConfig        - IrDesign + ticks + clocks + stimuli (input to SimulationRunner)
+├── ClockConfig             - Auto-toggling clock spec (IrSignal port + half-period + initial state)
+├── StimulusEvent           - "set port (or Part of it) to Value at Tick" stimulus record
 └── Constansts              - Operator precedence enums, operation regex (sic — historical typo)
+
+IR Namespace (Interpreter.Ir) - the language-neutral design the engine runs (Fase 2, v3.2.1)
+├── IrDesign                - Name, Ports, Generics, Signals (body signals/constants), Processes,
+│                             LineMap; Objects (ports ∪ body objects); ResolvePort("v(3)")
+├── IrSignal                - One object as data: Name, Kind (port/generic/signal/constant/variable),
+│                             PortMode, Type (logic, vector, bit, boolean, integer, enum, record,
+│                             array, character, string), Width, Range, Signed, Layout, EnumLiterals
+├── IrProcess               - One concurrent unit (written process or equivalent process of a
+│                             concurrent statement), generates unrolled: Label, SourceLine, Origin,
+│                             SensitivityKind (explicit/all/implicit/wait/every delta), Sensitivity,
+│                             Variables; its statements stay parsed objects until v3.2.2/v3.2.3
+├── IrBinding               - Transitional IrSignal → Variable cell table (removed in v3.2.3)
+└── Vhdl/VhdlDesignAdapter  - Lowers an Entity + architecture to IrDesign (the VHDL front-end's
+                              Lower; Kmila.Frontend exposes it as ParsedUnit.IrOf / DesignResult.Ir)
 
 Synthesis Namespace (Interpreter.Synthesis) - behavioral → structural lowering
 ├── Synthesizer                  - Static façade: Synthesize(Entity) → Netlist
@@ -284,7 +298,7 @@ Placeholder
 *   **`DeferredFunction.cs`**: Represents function calls deferred to execution time (e.g., rising_edge)
 *   **`ControlExceptions.cs`**: ExitException, NextException, ReturnException for control flow
 *   **`Constansts.cs`**: Operator precedence enums and operation regex patterns (the file name keeps the historical typo)
-*   **`SimulationConfig.cs`**: Composition of `required Entity Entity`, `ulong TotalTicks`, `List<ClockConfig> Clocks`, `List<StimulusEvent> Stimuli`. Plus the auxiliary `ClockConfig` (`Signal`, `HalfPeriodTicks`, `InitialHigh`) and `StimulusEvent` (`Tick`, `Signal`, `Value`) types.
+*   **`SimulationConfig.cs`**: Composition of `required IrDesign Design` (v3.2.1; before, `Entity Entity`), `ulong TotalTicks`, `long TickFs`, `List<ClockConfig> Clocks`, `List<StimulusEvent> Stimuli`, `List<StimulusEvent> PortInitials`, `InitialValues`. Plus the auxiliary `ClockConfig` (`IrSignal Signal`, `HalfPeriodTicks`, `InitialHigh`) and `StimulusEvent` (`Tick`, `IrSignal Signal`, `Value`, `Part`) types; the run binds each stimulus to the object that holds its port's value (`BoundStimulus`, until v3.2.3). The elaborated line map (G82) travels in `Design.LineMap`.
 
 **Run-loop Façade:**
 *   **`SimulationRunner.cs`** *(`Services/`)*: `IDisposable` façade with `RunAsync(SimulationConfig)`, `Pause()`, `Resume()`, `Stop()`, plus the `OnProgressChanged(double)`, `OnSimulationEnded(bool)`, and `OnError(string)` events. It is the entry point used by `Kmila.Shared.Services.SimulationCoordinator` (no other call site re-implements the pipeline).
@@ -2082,7 +2096,7 @@ classDiagram
     }
 
     class SimulationConfig {
-        +Entity Entity
+        +IrDesign Design
         +int TotalTicks
         +List Clocks
         +List Stimuli

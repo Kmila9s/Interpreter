@@ -26,7 +26,7 @@ namespace Interpreter.Services;
 /// <item>Added SkipComponentInstantiation() for structural VHDL constructs</item>
 /// </list>
 /// </remarks>
-public class Architecture : ISControl
+public class Architecture
 {
     /// <summary>
     /// Gets the name of the architecture.
@@ -67,11 +67,6 @@ public class Architecture : ISControl
 
     private Tokenizer _tokenizer = new();
     private TokenStream _streamer = default!;
-
-    /// <summary>
-    /// Delta cycle engine for proper VHDL simulation semantics.
-    /// </summary>
-    private DeltaCycleEngine? _deltaEngine;
 
     /// <summary>
     /// Guard contexts for the enclosing <c>block</c> statements currently being
@@ -121,51 +116,12 @@ public class Architecture : ISControl
     }
 
     /// <summary>
-    /// Executes the architecture asynchronously using delta cycle simulation.
-    /// </summary>
-    /// <returns>A task representing the asynchronous operation.</returns>
-    public async Task ExecuteAsync()
-    {
-        InitializeDeltaEngine();
-
-        // Connect to TimeMachine for time-driven simulation
-        _deltaEngine!.ConnectToTimeMachine();
-
-        // Run simulation (driven by TimeMachine ticks)
-        // For now, run a single time step to maintain backward compatibility
-        await _deltaEngine.RunTimeStepAsync();
-    }
-
-    /// <summary>
-    /// Creates and initializes the delta cycle engine without connecting to TimeMachine.
-    /// Used by SimulationRunner for direct engine control.
-    /// </summary>
-    /// <returns>The initialized DeltaCycleEngine.</returns>
-    public DeltaCycleEngine InitializeDeltaEngine()
-    {
-        _deltaEngine = new DeltaCycleEngine();
-        HashSet<Variable> allSignals = GetAllSignals();
-        _deltaEngine.Initialize(allSignals, Tasks);
-        return _deltaEngine;
-    }
-
-    /// <summary>
     /// Returns all signals in this architecture: ports, generics, and internal signals.
     /// </summary>
     public HashSet<Variable> GetAllSignals()
     {
         return [.. _ports, .. _generics, .. _signals];
     }
-
-    /// <summary>
-    /// Gets the delta cycle engine for external control.
-    /// </summary>
-    public DeltaCycleEngine? DeltaEngine => _deltaEngine;
-
-    /// <summary>
-    /// Synthesizes the architecture.
-    /// </summary>
-    public void Syntetize() => throw new NotImplementedException();
 
     /// <summary>
     /// Synthesizes the architecture from raw data.

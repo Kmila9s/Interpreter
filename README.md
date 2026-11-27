@@ -12,6 +12,8 @@
 
 The simulation core of Kmila: a delta-cycle engine with signal drivers and IEEE 1164 resolution, waveform (VCD) output, and the synthesis of VHDL into a netlist that powers the schematic view.
 
+The engine runs a language-neutral design (`Interpreter.Ir`: `IrDesign`, `IrSignal`, `IrProcess`) that each HDL front-end lowers its parse tree to; `Ir.Vhdl.VhdlDesignAdapter` is the VHDL one.
+
 <p align="center"><img src="docs/assets/screenshot.png" alt="" width="90%"></p>
 
 ## Quick start
