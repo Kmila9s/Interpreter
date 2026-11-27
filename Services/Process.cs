@@ -77,8 +77,8 @@ public partial class Process : ISControl
     /// <summary>True for the equivalent process of a concurrent statement (assertion, procedure call).</summary>
     public bool IsEquivalent { get; private set; }
 
-    /// <summary>True for VHDL-2008 <c>process (all)</c>: sensitive to every signal its statement part reads.</summary>
-    private bool _sensitiveToAll;
+    /// <summary>True for VHDL-2008 <c>process (all)</c>: sensitive to every signal its statement part reads (<see cref="SensitiveList"/> is filled from it).</summary>
+    internal bool SensitiveToAll { get; private set; }
 
     /// <summary>
     /// F-G-13d (Phase 2, 2026-07-22): tracks whether the process has
@@ -338,7 +338,7 @@ public partial class Process : ISControl
             HasSensitivityList = true;
             if (string.Equals(_streamer.Current?.Value, "all", StringComparison.OrdinalIgnoreCase))
             {
-                _sensitiveToAll = true;   // VHDL-2008: filled from the statement part
+                SensitiveToAll = true;   // VHDL-2008: filled from the statement part
                 _streamer.MoveNext();
             }
             while (_streamer.Current?.Value != ")")
@@ -377,7 +377,7 @@ public partial class Process : ISControl
             .ReadUntil(Tasks, "end");
         // process (all): the signals the statement part reads (GHDL: not those read
         // only inside the subprograms it calls).
-        if (_sensitiveToAll)
+        if (SensitiveToAll)
             SensitiveList.UnionWith(ImplicitSensitivity.SignalsIn(
                 [ImplicitSensitivity.ReadText(_streamer.Slice(start, _streamer.Position))], SignalsPorts));
         EndClause.Consume(_streamer, "process", Label, allowPostponed: true);

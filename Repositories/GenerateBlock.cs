@@ -92,6 +92,23 @@ public class GenerateBlock : ISControl
     public List<object> Tasks { get; private set; } = new();
 
     /// <summary>
+    /// <paramref name="tasks"/> with every (nested) generate replaced by its statements: a
+    /// generate is elaboration-time structure, its unrolled statements are ordinary
+    /// concurrent statements. Returns <paramref name="tasks"/> itself when it has none.
+    /// </summary>
+    public static List<object> Flatten(List<object> tasks)
+    {
+        if (!tasks.Any(t => t is GenerateBlock)) return tasks;
+        var flat = new List<object>();
+        foreach (var task in tasks)
+        {
+            if (task is GenerateBlock generate) flat.AddRange(Flatten(generate.Tasks));
+            else flat.Add(task);
+        }
+        return flat;
+    }
+
+    /// <summary>
     /// Initializes a new instance of the <see cref="GenerateBlock"/> class.
     /// </summary>
     /// <param name="variables">The variables in scope.</param>

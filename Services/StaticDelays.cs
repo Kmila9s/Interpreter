@@ -4,26 +4,25 @@ namespace Interpreter.Services;
 
 /// <summary>
 /// The static delays a design writes (<c>wait for T</c>, literal <c>after T</c>),
-/// read from the parsed entity that is about to run, so the run picks a tick that
+/// read from the design that is about to run, so the run picks a tick that
 /// lands every one of them exactly: the greatest common divisor, in femtoseconds, of
 /// the requested tick and those delays. A <c>wait for 500 ps</c> or a half period of
 /// <c>5.26315789474 ns</c> under the default 10 ns tick would otherwise round to a
-/// whole tick and run at the wrong time (G103). Pure: it reads only the given entity
+/// whole tick and run at the wrong time (G103). Pure: it reads only the given design
 /// (no process-global state, so concurrent loads cannot mix).
 /// </summary>
 public static class StaticDelays
 {
     /// <summary>
-    /// The tick in femtoseconds a run of <paramref name="entity"/> should use:
+    /// The tick in femtoseconds a run of <paramref name="design"/> should use:
     /// <paramref name="requestedFs"/> narrowed to the greatest common divisor with
     /// the design's static delays (1 fs at least).
     /// </summary>
-    public static long TickFs(Entity entity, long requestedFs)
+    public static long TickFs(Ir.IrDesign design, long requestedFs)
     {
         long tick = Math.Max(1, requestedFs);
-        if (entity.Architecture?.Tasks is { } tasks)
-            foreach (long delay in Of(tasks))
-                tick = Gcd(tick, delay);
+        foreach (long delay in Of(design.Processes.Select(p => p.Body)))
+            tick = Gcd(tick, delay);
         return tick;
     }
 

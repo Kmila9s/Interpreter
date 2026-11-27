@@ -319,19 +319,20 @@ class Program
             Console.WriteLine($"Signals: {entity.Architecture!.Signals.Count}");
             Console.WriteLine();
 
-            // Collect all signals for simulation
-            HashSet<Variable> allSignals = [.. entity.Ports, .. entity.Architecture.Signals];
+            // The design in its neutral form; its objects are what the run settles and traces.
+            var design = Interpreter.Ir.Vhdl.VhdlDesignAdapter.From(entity);
+            var allSignals = design.Binding.Objects;
 
             // This developer runner has no stimulus: inputs start at 0 (didactic policy).
-            InitialValueSeeder.Apply(InitialValuePolicy.Didactic, InitialValueSeeder.ObjectsOf(entity), new HashSet<Variable>());
+            InitialValueSeeder.Apply(InitialValuePolicy.Didactic, InitialValueSeeder.ObjectsOf(design), new HashSet<Variable>());
             Console.WriteLine("Setting up input signals:");
-            foreach (var signal in allSignals.Where(s => s.PortType == Parser.Models.Constants.PortType.IN))
-                Console.WriteLine($"  {signal.Name} = {signal.Value}");
+            foreach (var input in design.Ports.Where(p => p.PortMode == Interpreter.Ir.IrPortMode.In))
+                Console.WriteLine($"  {input.Name} = {design.Binding.Cell(input).Value}");
             Console.WriteLine();
 
             // Create delta cycle engine
             var engine = new DeltaCycleEngine();
-            engine.Initialize(allSignals, entity.Architecture.Tasks);
+            engine.Initialize(design);
 
             Console.WriteLine("Running simulation...");
 

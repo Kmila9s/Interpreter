@@ -7,10 +7,8 @@ namespace Interpreter.Models;
 /// </summary>
 public class SimulationConfig
 {
-    /// <summary>
-    /// The entity to simulate (must have an architecture).
-    /// </summary>
-    public required Services.Entity Entity { get; init; }
+    /// <summary>The design to simulate, in its language-neutral form (<see cref="Ir.IrDesign"/>).</summary>
+    public required Ir.IrDesign Design { get; init; }
 
     /// <summary>
     /// The last tick of the run (the stop time): ticks 0..TotalTicks are simulated,
@@ -41,9 +39,6 @@ public class SimulationConfig
     /// </summary>
     public List<StimulusEvent> PortInitials { get; init; } = new();
 
-    /// <summary>Where the lines of an elaborated design come from, so run-time errors name the user's file and line (G82); null for a design as written.</summary>
-    public Services.ElaborationLineMap? LineMap { get; init; }
-
     /// <summary>How objects declared without <c>:=</c> start (LRM by default).</summary>
     public InitialValuePolicy InitialValues { get; init; } = InitialValuePolicy.Lrm;
 }
@@ -65,10 +60,8 @@ public enum InitialValuePolicy
 /// </summary>
 public class ClockConfig
 {
-    /// <summary>
-    /// The clock signal variable.
-    /// </summary>
-    public required Variable Signal { get; init; }
+    /// <summary>The clock port.</summary>
+    public required Ir.IrSignal Signal { get; init; }
 
     /// <summary>
     /// Number of ticks per half-period (e.g., 1 means toggle every tick).
@@ -91,10 +84,8 @@ public class StimulusEvent
     /// </summary>
     public ulong Tick { get; init; }
 
-    /// <summary>
-    /// The signal to change.
-    /// </summary>
-    public required Variable Signal { get; init; }
+    /// <summary>The port to change.</summary>
+    public required Ir.IrSignal Signal { get; init; }
 
     /// <summary>
     /// The value to set (as string, matching VHDL signal assignment format).
@@ -102,23 +93,38 @@ public class StimulusEvent
     public required string Value { get; init; }
 
     /// <summary>
-    /// Part of <see cref="Signal"/> driven (<c>p.lo</c>, <c>v(3)</c>), or null for the whole port.
+    /// The part of <see cref="Signal"/> driven, as written (<c>p.lo</c>, <c>v(3)</c>; see
+    /// <see cref="Ir.IrDesign.ResolvePort"/>), or null for the whole port.
     /// </summary>
-    public AssignmentTarget? Target { get; init; }
+    public string? Part { get; init; }
 
+    /// <summary>This stimulus on the objects that hold <paramref name="design"/>'s values during a run.</summary>
+    internal BoundStimulus Bind(Ir.IrDesign design) => new(
+        design.Binding.Cell(Signal),
+        Part is null ? null : design.Binding.ResolvePort(Part)?.Target,
+        Value,
+        Signal.PortMode);
+}
+
+/// <summary>
+/// A <see cref="StimulusEvent"/> resolved to the object that holds its port's value
+/// (transitional, until the engine drives ports by <see cref="Ir.IrSignal"/> in v3.2.3).
+/// </summary>
+internal sealed record BoundStimulus(Variable Cell, AssignmentTarget? Target, string Value, Ir.IrPortMode? Mode)
+{
     /// <summary>
-    /// Applies the stimulus to its signal (or to the selected part of it). An
+    /// Applies the stimulus to its port (or to the selected part of it). An
     /// <c>inout</c> port is driven through <paramref name="scheduler"/>'s external
     /// driver, so its value is the resolution with the design's own drivers.
     /// </summary>
     public void Apply(Interpreter.Services.SignalScheduler? scheduler = null)
     {
-        if (scheduler is not null && Signal.PortType == Constants.PortType.INOUT)
+        if (scheduler is not null && Mode == Ir.IrPortMode.InOut)
         {
             if (Target is { } p) p.DriveExternal(scheduler, Value);
-            else scheduler.DriveExternal(Signal, Value);
+            else scheduler.DriveExternal(Cell, Value);
         }
         else if (Target is { } part) part.WriteNow(Value);
-        else Signal.Value = Value;
+        else Cell.Value = Value;
     }
 }

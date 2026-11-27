@@ -12,6 +12,8 @@
 
 El núcleo de simulación de Kmila: un motor por ciclos delta con drivers y resolución IEEE 1164, salida de formas de onda (VCD) y la síntesis de VHDL a netlist que alimenta la vista de esquemático.
 
+El motor ejecuta un diseño neutral respecto al lenguaje (`Interpreter.Ir`: `IrDesign`, `IrSignal`, `IrProcess`) al que cada front-end de HDL baja su árbol de análisis; `Ir.Vhdl.VhdlDesignAdapter` es el de VHDL.
+
 <p align="center"><img src="docs/assets/screenshot.png" alt="" width="90%"></p>
 
 ## Inicio rápido

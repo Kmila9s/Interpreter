@@ -21,27 +21,6 @@ namespace Interpreter.Services;
 /// </remarks>
 public class FunctionExecutor
 {
-    private static FunctionExecutor? _instance;
-    private static readonly object _lock = new();
-
-    /// <summary>
-    /// Gets the singleton instance of the FunctionExecutor.
-    /// </summary>
-    public static FunctionExecutor Instance
-    {
-        get
-        {
-            if (_instance == null)
-            {
-                lock (_lock)
-                {
-                    _instance ??= new FunctionExecutor();
-                }
-            }
-            return _instance;
-        }
-    }
-
     /// <summary>
     /// Stack to track recursive function calls.
     /// </summary>
@@ -511,17 +490,6 @@ public class FunctionExecutor
                     argVar.Value = localVar.Value;
                 }
             }
-        }
-    }
-
-    /// <summary>
-    /// Resets the singleton instance (for testing).
-    /// </summary>
-    public static void Reset()
-    {
-        lock (_lock)
-        {
-            _instance = null;
         }
     }
 

@@ -9,7 +9,7 @@ namespace Interpreter.Services;
 /// <summary>
 /// Represents a VHDL entity.
 /// </summary>
-public class Entity : ISControl{
+public class Entity {
     /// <summary>
     /// Gets the name of the entity.
     /// </summary>
@@ -68,22 +68,7 @@ public class Entity : ISControl{
     /// <param name="Name">The name of the entity.</param>
     public Entity(string Name) { this.Name = Name; }
 
-    /// <summary>
-    /// Executes the entity asynchronously.
-    /// </summary>
-    /// <returns>A task representing the asynchronous operation.</returns>
-    public async Task ExecuteAsync() {
-        if(Architecture != null){
-            await Architecture.ExecuteAsync();
-        }
-    }
 
-    /// <summary>
-    /// Synthesizes the entity.
-    /// </summary>
-    public void Syntetize(){
-        
-    }
 
     /// <summary>
     /// Sets the architecture of the entity and calculates resource usage.

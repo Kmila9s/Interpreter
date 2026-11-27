@@ -115,18 +115,20 @@ public class SimulationRunner : IDisposable
 
         try
         {
-            var entity = config.Entity;
-            var arch = entity.Architecture
-                ?? throw new InvalidOperationException($"Entity '{entity.Name}' has no architecture.");
-
-            HashSet<Variable> allSignals = [.. entity.Ports, .. arch.Signals];
+            var design = config.Design;
+            var allSignals = design.Binding.Objects;
+            // The objects that hold the driven ports' values during the run.
+            var clocks = config.Clocks.Select(c => (Cell: design.Binding.Cell(c.Signal), c.HalfPeriodTicks)).ToList();
+            var stimuliByTick = config.Stimuli
+                .GroupBy(s => s.Tick)
+                .ToDictionary(g => g.Key, g => g.Select(s => s.Bind(design)).ToList());
 
             InitialValueSeeder.Prepare(config);
 
             // Register signals before applying clock initial states / tick-0 stimuli, so
             // the U→initial transition is seen (rising_edge(clk) at tick 0, bug #15).
             _engine = new DeltaCycleEngine { TickFs = config.TickFs };
-            _engine.Initialize(allSignals, arch.Tasks);
+            _engine.Initialize(design);
 
             // The runner's cancel also breaks a long delta-cycle loop inside the engine.
             _cts.Token.Register(() => _engine?.Stop());
@@ -134,10 +136,10 @@ public class SimulationRunner : IDisposable
             // Clock initial states (observed as a real transition).
             foreach (var clk in config.Clocks)
             {
-                clk.Signal.Value = clk.InitialHigh ? "1" : "0";
+                design.Binding.Cell(clk.Signal).Value = clk.InitialHigh ? "1" : "0";
             }
 
-            foreach (var stim in config.Stimuli.Where(s => s.Tick == 0))
+            foreach (var stim in stimuliByTick.GetValueOrDefault(0UL) ?? [])
             {
                 stim.Apply(_engine?.SignalScheduler);
             }
@@ -146,10 +148,6 @@ public class SimulationRunner : IDisposable
 
             var totalTicks = config.TotalTicks;
             double lastReportedPercent = -1;
-
-            var stimuliByTick = config.Stimuli
-                .GroupBy(s => s.Tick)
-                .ToDictionary(g => g.Key, g => g.ToList());
 
             // Distinct stimulus ticks in ascending order, walked by a forward pointer
             // since the visited tick only ever increases.
@@ -184,16 +182,16 @@ public class SimulationRunner : IDisposable
 
                 directlyChanged.Clear();
 
-                foreach (var clk in config.Clocks)
+                foreach (var (cell, halfPeriodTicks) in clocks)
                 {
-                    if (tick > 0 && clk.HalfPeriodTicks > 0 && tick % clk.HalfPeriodTicks == 0)
+                    if (tick > 0 && halfPeriodTicks > 0 && tick % halfPeriodTicks == 0)
                     {
-                        clk.Signal.Value = clk.Signal.Value?.ToString() == "1" ? "0" : "1";
-                        directlyChanged.Add(clk.Signal);
+                        cell.Value = cell.Value?.ToString() == "1" ? "0" : "1";
+                        directlyChanged.Add(cell);
                     }
                     else if (tick == 0)
                     {
-                        directlyChanged.Add(clk.Signal); // its initial level, set before the loop
+                        directlyChanged.Add(cell); // its initial level, set before the loop
                     }
                 }
 
@@ -202,7 +200,7 @@ public class SimulationRunner : IDisposable
                     foreach (var stim in events)
                     {
                         stim.Apply(_engine?.SignalScheduler);
-                        directlyChanged.Add(stim.Signal);
+                        directlyChanged.Add(stim.Cell);
                     }
                 }
 
@@ -248,7 +246,7 @@ public class SimulationRunner : IDisposable
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            Error = DescribeFailure(ex, config.LineMap);
+            Error = DescribeFailure(ex, config.Design.LineMap);
             OnError?.Invoke(Error);
             OnSimulationEnded?.Invoke(false);
         }

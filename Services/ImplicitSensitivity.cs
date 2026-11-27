@@ -15,6 +15,23 @@ namespace Interpreter.Services;
 public static partial class ImplicitSensitivity
 {
     /// <summary>
+    /// The implicit sensitivity of a concurrent statement (LRM §11.6): the signals
+    /// named in its text, never those read inside a function it calls (G62). Null
+    /// when its value can change without an event on them (implicit signals
+    /// <c>'stable</c>/<c>'quiet</c>/<c>'delayed</c>/<c>'transaction</c>, <c>now</c>):
+    /// it then runs every delta cycle.
+    /// </summary>
+    public static HashSet<Variable>? OfStatement(Interfaces.IConcurrentStatement statement, HashSet<Variable> scope)
+    {
+        var texts = statement.ReadTexts.ToList();
+        if (texts.Any(t => TimeDependent().IsMatch(t))) return null;
+        return [.. SignalsIn(texts, scope)];
+    }
+
+    [GeneratedRegex(@"'\s*(stable|quiet|delayed|transaction)\b|\bnow\b", RegexOptions.IgnoreCase)]
+    private static partial Regex TimeDependent();
+
+    /// <summary>
     /// Every signal of <paramref name="scope"/> named in <paramref name="texts"/>.
     /// String and character literals and field selectors are not names;
     /// constants are not signals.

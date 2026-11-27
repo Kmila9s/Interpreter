@@ -27,20 +27,20 @@ public static class InitialValueSeeder
     }
 
     /// <summary>
-    /// Before a run: applies <paramref name="config"/>'s policy to its entity (clocks and stimulated
+    /// Before a run: applies <paramref name="config"/>'s policy to its design (clocks and stimulated
     /// ports are left to their driver), then sets the port initial values.
     /// </summary>
     public static void Prepare(SimulationConfig config)
     {
-        var driven = new HashSet<Variable>(config.Clocks.Select(c => c.Signal).Concat(config.Stimuli.Select(s => s.Signal)));
-        Apply(config.InitialValues, ObjectsOf(config.Entity), driven);
-        foreach (var initial in config.PortInitials) initial.Apply();
+        var design = config.Design;
+        var driven = new HashSet<Variable>(config.Clocks.Select(c => c.Signal).Concat(config.Stimuli.Select(s => s.Signal)).Select(design.Binding.Cell));
+        Apply(config.InitialValues, ObjectsOf(design), driven);
+        foreach (var initial in config.PortInitials) initial.Bind(design).Apply();
     }
 
-    /// <summary>The objects of <paramref name="entity"/>: ports, architecture signals and process variables.</summary>
-    public static IEnumerable<Variable> ObjectsOf(Entity entity) =>
-        entity.Ports.Concat(entity.Architecture?.Signals ?? [])
-            .Concat(entity.Architecture?.Tasks.OfType<Process>().SelectMany(p => p.Variables) ?? []);
+    /// <summary>The objects of <paramref name="design"/> a policy seeds: ports, body objects and process variables.</summary>
+    public static IEnumerable<Variable> ObjectsOf(Ir.IrDesign design) =>
+        design.Objects.Concat(design.Processes.SelectMany(p => p.Variables)).Select(design.Binding.Cell);
 
     /// <summary>The didactic start value of <paramref name="v"/>, or null to keep its declared one.</summary>
     private static object? DidacticValue(Variable v)
